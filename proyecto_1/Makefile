@@ -1,71 +1,148 @@
-# Tools
-CC = gcc
+# ============================================================
+# TOOLS
+# ============================================================
 
-# Flags
-CFLAGS := -Wall -Wextra -std=c17 -MMD -MP -Iinclude
-OPTS   ?= -O0
+CC := gcc
 
-# Directories
-SRC   := src
-OUT   := output
-BUILD := build
+# ============================================================
+# BUILD MODE
+# ============================================================
 
-# Targets
-TARGET ?= main
+MODE ?= debug
 
-# Files
-SOURCE := $(shell find ${SRC} -name '*.c')
-OBJS   := $(patsubst ${SRC}/%.c,${BUILD}/%.o,${SOURCE})
-DEPS   := $(OBJS:.o=.d)
+# ============================================================
+# DIRECTORIES
+# ============================================================
 
+SRC_DIR := src
 
-# ---------------------------------------------------------------
-.PHONY: all clean 
+BUILD_DIR := build/$(MODE)
 
-all: run
+OUT_DIR := output/$(MODE)
 
-run:
-	@echo "Running program:$(OUT)/$(TARGET)..."
-	./$(OUT)/$(TARGET)
-	@echo "[SUCCESS]"
+# ============================================================
+# TARGET
+# ============================================================
 
-# [RULE: make necessary directories]
-dirs:
-	@echo "Creating $(OUT)/ and $(BUILD)/ directories..."
-	mkdir -p $(OUT) $(BUILD)
-	@echo "[COMPLETED]"
+TARGET := $(OUT_DIR)/host
 
-# [RULE: compile dev build]
-build: dirs $(OBJS)
-	@echo ""
-	@echo "Compiling program:$(OUT)/$(TARGET)..."
-	$(CC) $(CFLAGS) \
-	-o $(OUT)/$(TARGET) \
-	$(OBJS)
-	@echo "[COMPLETED]"
-	@echo ""
+# ============================================================
+# COMPILER FLAGS
+# ============================================================
 
-# [RULE: compile debug build]
-debug: dirs $(OBJS)
-	@echo ""
-	@echo "Compiling program:$(OUT)/$(TARGET) in debug mode..."
-	$(CC) $(CFLAGS) -g \
-	-o $(OUT)/$(TARGET) \
-	$(OBJS)
-	@echo "[COMPLETED]"
-	@echo ""
+CFLAGS := -Wall -Wextra -Wpedantic \
+          -std=c17 \
+          -D_POSIX_C_SOURCE=200809L \
+          -MMD -MP \
+          -Iinclude
 
-# [RULE: generic rule]
-$(BUILD)/%.o: $(SRC)/%.c
-	@echo "> Compiling program dependency: $@..."
+ifeq ($(MODE),release)
+    CFLAGS += -O2
+else
+    CFLAGS += -O0 -g3
+endif
+
+# ============================================================
+# LINKER
+# ============================================================
+
+LDLIBS := -pthread -lm
+
+# ============================================================
+# SOURCE FILES
+# ============================================================
+
+SOURCES := $(shell find \
+    $(wildcard $(SRC_DIR)/host $(SRC_DIR)/common) \
+    -type f -name '*.c')
+
+OBJS := $(patsubst \
+    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+
+DEPS := $(OBJS:.o=.d)
+
+# ============================================================
+# TEST TARGET
+# ============================================================
+
+TEST_TARGET := $(OUT_DIR)/test_foundation
+
+# ============================================================
+# PHONY TARGETS
+# ============================================================
+
+.PHONY: all run debug release test clean
+
+# ============================================================
+# DEFAULT BUILD
+# ============================================================
+
+all: $(TARGET)
+
+# ============================================================
+# LINK
+# ============================================================
+
+$(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(OPTS) -c $< -o $@
-	@echo "[DONE]"
+	$(CC) $(OBJS) -o $@ $(LDLIBS)
 
-# [RULE: clean output directories]
+# ============================================================
+# COMPILE
+# ============================================================
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ============================================================
+# FOUNDATION TEST
+# ============================================================
+
+$(TEST_TARGET): tests/test_foundation.c \
+                src/common/protocol.c \
+                include/common/task.h \
+                include/common/events.h \
+                include/common/protocol.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) \
+	    tests/test_foundation.c \
+	    src/common/protocol.c \
+	    -o $@ $(LDLIBS)
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
+
+# ============================================================
+# RUN
+# ============================================================
+
+run: $(TARGET)
+	./$(TARGET)
+
+# ============================================================
+# DEBUG BUILD
+# ============================================================
+
+debug:
+	$(MAKE) MODE=debug all
+
+# ============================================================
+# RELEASE BUILD
+# ============================================================
+
+release:
+	$(MAKE) MODE=release all
+
+# ============================================================
+# CLEAN
+# ============================================================
+
 clean:
-	@echo "Cleaning $(OUT)/ and $(BUILD)/ directories..."
-	rm -rf $(OUT) $(BUILD)
-	@echo "[COMPLETED]"
+	rm -rf build output
+
+# ============================================================
+# DEPENDENCIES
+# ============================================================
 
 -include $(DEPS)
