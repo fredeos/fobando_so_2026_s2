@@ -1,13 +1,8 @@
 # ============================================================
-# TOOLS
+# TOOLS AND BUILD MODE
 # ============================================================
 
 CC := gcc
-
-# ============================================================
-# BUILD MODE
-# ============================================================
-
 MODE ?= debug
 
 # ============================================================
@@ -15,19 +10,20 @@ MODE ?= debug
 # ============================================================
 
 SRC_DIR := src
-
 BUILD_DIR := build/$(MODE)
-
 OUT_DIR := output/$(MODE)
 
 # ============================================================
-# TARGET
+# TARGETS
 # ============================================================
 
 TARGET := $(OUT_DIR)/host
 
+FOUNDATION_TEST := $(OUT_DIR)/test_foundation
+PLANNER_TEST := $(OUT_DIR)/test_planner
+
 # ============================================================
-# COMPILER FLAGS
+# COMPILER AND LINKER FLAGS
 # ============================================================
 
 CFLAGS := -Wall -Wextra -Wpedantic \
@@ -42,30 +38,44 @@ else
     CFLAGS += -O0 -g3
 endif
 
-# ============================================================
-# LINKER
-# ============================================================
-
 LDLIBS := -pthread -lm
 
 # ============================================================
 # SOURCE FILES
 # ============================================================
 
-SOURCES := $(shell find \
-    $(wildcard $(SRC_DIR)/host $(SRC_DIR)/common) \
-    -type f -name '*.c')
+# Compile Host and common modules only
+SOURCE_DIRS := $(wildcard $(SRC_DIR)/host $(SRC_DIR)/common)
 
-OBJS := $(patsubst \
-    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+SOURCES := $(foreach dir,$(SOURCE_DIRS),$(shell find $(dir) -type f -name '*.c'))
 
-DEPS := $(OBJS:.o=.d)
+OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 
 # ============================================================
-# TEST TARGET
+# PLANNER TEST DEPENDENCIES
 # ============================================================
 
-TEST_TARGET := $(OUT_DIR)/test_foundation
+PLANNER_SOURCES := \
+    $(SRC_DIR)/host/planner/node.c \
+    $(SRC_DIR)/host/planner/admission.c \
+    $(SRC_DIR)/host/planner/planner.c
+
+PLANNER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(PLANNER_SOURCES))
+
+# ============================================================
+# TEST OBJECTS
+# ============================================================
+
+FOUNDATION_TEST_OBJ := $(BUILD_DIR)/tests/test_foundation.o
+PLANNER_TEST_OBJ := $(BUILD_DIR)/tests/test_planner.o
+
+# ============================================================
+# AUTOMATIC DEPENDENCIES
+# ============================================================
+
+DEPS := $(OBJS:.o=.d) \
+        $(FOUNDATION_TEST_OBJ:.o=.d) \
+        $(PLANNER_TEST_OBJ:.o=.d)
 
 # ============================================================
 # PHONY TARGETS
@@ -80,7 +90,7 @@ TEST_TARGET := $(OUT_DIR)/test_foundation
 all: $(TARGET)
 
 # ============================================================
-# LINK
+# LINK HOST
 # ============================================================
 
 $(TARGET): $(OBJS)
@@ -88,7 +98,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDLIBS)
 
 # ============================================================
-# COMPILE
+# COMPILE HOST AND COMMON SOURCES
 # ============================================================
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
@@ -96,25 +106,40 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ============================================================
+# COMPILE TEST SOURCES
+# ============================================================
+
+$(BUILD_DIR)/tests/%.o: tests/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ============================================================
 # FOUNDATION TEST
 # ============================================================
 
-$(TEST_TARGET): tests/test_foundation.c \
-                src/common/protocol.c \
-                include/common/task.h \
-                include/common/events.h \
-                include/common/protocol.h
+$(FOUNDATION_TEST): $(FOUNDATION_TEST_OBJ) \
+                    $(BUILD_DIR)/common/protocol.o
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) \
-	    tests/test_foundation.c \
-	    src/common/protocol.c \
-	    -o $@ $(LDLIBS)
-
-test: $(TEST_TARGET)
-	./$(TEST_TARGET)
+	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
-# RUN
+# PLANNER TEST
+# ============================================================
+
+$(PLANNER_TEST): $(PLANNER_TEST_OBJ) $(PLANNER_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
+# RUN TESTS
+# ============================================================
+
+test: $(FOUNDATION_TEST) $(PLANNER_TEST)
+	./$(FOUNDATION_TEST)
+	./$(PLANNER_TEST)
+
+# ============================================================
+# RUN HOST
 # ============================================================
 
 run: $(TARGET)
@@ -142,7 +167,7 @@ clean:
 	rm -rf build output
 
 # ============================================================
-# DEPENDENCIES
+# INCLUDE AUTOMATIC DEPENDENCIES
 # ============================================================
 
 -include $(DEPS)
