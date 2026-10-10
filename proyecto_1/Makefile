@@ -23,6 +23,7 @@ FOUNDATION_TEST := $(OUT_DIR)/test_foundation
 PLANNER_TEST := $(OUT_DIR)/test_planner
 CONFIG_TEST := $(OUT_DIR)/test_config
 TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
+FAILOVER_TEST := $(OUT_DIR)/test_failover
 
 # ============================================================
 # COMPILER FLAGS
@@ -62,7 +63,7 @@ OBJS := $(patsubst \
     $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 
 # ============================================================
-# PLANNER TEST DEPENDENCIES
+# PLANNER DEPENDENCIES
 # ============================================================
 
 PLANNER_SOURCES := \
@@ -73,6 +74,8 @@ PLANNER_SOURCES := \
 PLANNER_OBJS := $(patsubst \
     $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(PLANNER_SOURCES))
 
+FAILOVER_OBJ := $(BUILD_DIR)/host/planner/failover.o
+
 # ============================================================
 # TEST OBJECTS
 # ============================================================
@@ -81,12 +84,14 @@ FOUNDATION_TEST_OBJ := $(BUILD_DIR)/tests/test_foundation.o
 PLANNER_TEST_OBJ := $(BUILD_DIR)/tests/test_planner.o
 CONFIG_TEST_OBJ := $(BUILD_DIR)/tests/test_config.o
 TASK_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_task_parser.o
+FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
     $(CONFIG_TEST_OBJ) \
-    $(TASK_PARSER_TEST_OBJ)
+    $(TASK_PARSER_TEST_OBJ) \
+    $(FAILOVER_TEST_OBJ)
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -168,15 +173,29 @@ $(TASK_PARSER_TEST): $(TASK_PARSER_TEST_OBJ) \
 	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
+# FAILOVER TEST
+# ============================================================
+
+$(FAILOVER_TEST): $(FAILOVER_TEST_OBJ) \
+                  $(PLANNER_OBJS) \
+                  $(FAILOVER_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
 # RUN ALL TESTS
 # ============================================================
 
-test: $(FOUNDATION_TEST) $(PLANNER_TEST) \
-      $(CONFIG_TEST) $(TASK_PARSER_TEST)
+test: $(FOUNDATION_TEST) \
+      $(PLANNER_TEST) \
+      $(CONFIG_TEST) \
+      $(TASK_PARSER_TEST) \
+      $(FAILOVER_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
 	./$(TASK_PARSER_TEST)
+	./$(FAILOVER_TEST)
 
 # ============================================================
 # RUN HOST
