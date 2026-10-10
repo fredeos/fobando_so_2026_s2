@@ -1,0 +1,6 @@
+# Task ID,Task Type,Duration,Start Time,End Time,Priority 
+# estos son de ejemplo, se pueden cambiar a lo que necesitemos
+1,P,40,20,20,2
+2,P,60,30,30,3
+3,S,20,50,50,5
+4,P,80,40,40,1

@@ -21,7 +21,7 @@ typedef enum {
 
 /*
  * Tarea asignada a un nodo.
- * Almacena su definición y costo calculado.
+ * Contiene la tarea y su costo en ticks.
  */
 typedef struct {
     Task task;
@@ -45,14 +45,14 @@ typedef struct {
     double utilization;
 } Node;
 
-/* Inicializa un nodo con una capacidad conocida */
+/* Inicializa un nodo con su capacidad calibrada */
 bool node_init(
     Node *node,
     uint32_t id,
     uint32_t ut_per_tick
 );
 
-/* Comprueba si una tarea pertenece al nodo */
+/* Comprueba si una tarea existe en el nodo */
 bool node_has_task(
     const Node *node,
     uint32_t task_id
@@ -63,6 +63,15 @@ bool node_add_task(
     Node *node,
     const Task *task,
     uint32_t cost_ticks
+);
+
+/*
+ * Elimina una tarea y actualiza la utilización.
+ * Se utilizará para cancelar asignaciones.
+ */
+bool node_remove_task(
+    Node *node,
+    uint32_t task_id
 );
 
 #endif
