@@ -24,6 +24,7 @@ PLANNER_TEST := $(OUT_DIR)/test_planner
 CONFIG_TEST := $(OUT_DIR)/test_config
 TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
+MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 
 # ============================================================
 # COMPILER FLAGS
@@ -51,7 +52,7 @@ LDLIBS := -pthread -lm
 # SOURCE FILES
 # ============================================================
 
-# Compile only Host and common modules
+# Compilar únicamente Host y módulos comunes
 SOURCE_DIRS := $(wildcard \
     $(SRC_DIR)/host \
     $(SRC_DIR)/common)
@@ -76,22 +77,31 @@ PLANNER_OBJS := $(patsubst \
 
 FAILOVER_OBJ := $(BUILD_DIR)/host/planner/failover.o
 
+MANUAL_OBJ := $(BUILD_DIR)/host/planner/manual_tasks.o
+
 # ============================================================
 # TEST OBJECTS
 # ============================================================
 
 FOUNDATION_TEST_OBJ := $(BUILD_DIR)/tests/test_foundation.o
+
 PLANNER_TEST_OBJ := $(BUILD_DIR)/tests/test_planner.o
+
 CONFIG_TEST_OBJ := $(BUILD_DIR)/tests/test_config.o
+
 TASK_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_task_parser.o
+
 FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
+
+MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
 
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
     $(CONFIG_TEST_OBJ) \
     $(TASK_PARSER_TEST_OBJ) \
-    $(FAILOVER_TEST_OBJ)
+    $(FAILOVER_TEST_OBJ) \
+    $(MANUAL_TEST_OBJ)
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -183,6 +193,16 @@ $(FAILOVER_TEST): $(FAILOVER_TEST_OBJ) \
 	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
+# MANUAL TASKS TEST
+# ============================================================
+
+$(MANUAL_TEST): $(MANUAL_TEST_OBJ) \
+                $(PLANNER_OBJS) \
+                $(MANUAL_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
 # RUN ALL TESTS
 # ============================================================
 
@@ -190,12 +210,14 @@ test: $(FOUNDATION_TEST) \
       $(PLANNER_TEST) \
       $(CONFIG_TEST) \
       $(TASK_PARSER_TEST) \
-      $(FAILOVER_TEST)
+      $(FAILOVER_TEST) \
+      $(MANUAL_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
 	./$(TASK_PARSER_TEST)
 	./$(FAILOVER_TEST)
+	./$(MANUAL_TEST)
 
 # ============================================================
 # RUN HOST
