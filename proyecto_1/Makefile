@@ -14,16 +14,18 @@ BUILD_DIR := build/$(MODE)
 OUT_DIR := output/$(MODE)
 
 # ============================================================
-# TARGETS
+# EXECUTABLE TARGETS
 # ============================================================
 
 TARGET := $(OUT_DIR)/host
 
 FOUNDATION_TEST := $(OUT_DIR)/test_foundation
 PLANNER_TEST := $(OUT_DIR)/test_planner
+CONFIG_TEST := $(OUT_DIR)/test_config
+TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 
 # ============================================================
-# COMPILER AND LINKER FLAGS
+# COMPILER FLAGS
 # ============================================================
 
 CFLAGS := -Wall -Wextra -Wpedantic \
@@ -38,18 +40,26 @@ else
     CFLAGS += -O0 -g3
 endif
 
+# ============================================================
+# LINKER
+# ============================================================
+
 LDLIBS := -pthread -lm
 
 # ============================================================
 # SOURCE FILES
 # ============================================================
 
-# Compile Host and common modules only
-SOURCE_DIRS := $(wildcard $(SRC_DIR)/host $(SRC_DIR)/common)
+# Compile only Host and common modules
+SOURCE_DIRS := $(wildcard \
+    $(SRC_DIR)/host \
+    $(SRC_DIR)/common)
 
-SOURCES := $(foreach dir,$(SOURCE_DIRS),$(shell find $(dir) -type f -name '*.c'))
+SOURCES := $(foreach dir,$(SOURCE_DIRS),\
+    $(shell find $(dir) -type f -name '*.c'))
 
-OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+OBJS := $(patsubst \
+    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 
 # ============================================================
 # PLANNER TEST DEPENDENCIES
@@ -60,7 +70,8 @@ PLANNER_SOURCES := \
     $(SRC_DIR)/host/planner/admission.c \
     $(SRC_DIR)/host/planner/planner.c
 
-PLANNER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(PLANNER_SOURCES))
+PLANNER_OBJS := $(patsubst \
+    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(PLANNER_SOURCES))
 
 # ============================================================
 # TEST OBJECTS
@@ -68,20 +79,28 @@ PLANNER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(PLANNER_SOURCES))
 
 FOUNDATION_TEST_OBJ := $(BUILD_DIR)/tests/test_foundation.o
 PLANNER_TEST_OBJ := $(BUILD_DIR)/tests/test_planner.o
+CONFIG_TEST_OBJ := $(BUILD_DIR)/tests/test_config.o
+TASK_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_task_parser.o
+
+TEST_OBJS := \
+    $(FOUNDATION_TEST_OBJ) \
+    $(PLANNER_TEST_OBJ) \
+    $(CONFIG_TEST_OBJ) \
+    $(TASK_PARSER_TEST_OBJ)
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
 # ============================================================
 
-DEPS := $(OBJS:.o=.d) \
-        $(FOUNDATION_TEST_OBJ:.o=.d) \
-        $(PLANNER_TEST_OBJ:.o=.d)
+DEPS := $(sort \
+    $(OBJS:.o=.d) \
+    $(TEST_OBJS:.o=.d))
 
 # ============================================================
 # PHONY TARGETS
 # ============================================================
 
-.PHONY: all run debug release test clean
+.PHONY: all run demo debug release test clean
 
 # ============================================================
 # DEFAULT BUILD
@@ -95,7 +114,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(OBJS) -o $@ $(LDLIBS)
+	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
 # COMPILE HOST AND COMMON SOURCES
@@ -131,12 +150,33 @@ $(PLANNER_TEST): $(PLANNER_TEST_OBJ) $(PLANNER_OBJS)
 	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
-# RUN TESTS
+# CONFIG TEST
 # ============================================================
 
-test: $(FOUNDATION_TEST) $(PLANNER_TEST)
+$(CONFIG_TEST): $(CONFIG_TEST_OBJ) \
+                $(BUILD_DIR)/host/config/config.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
+# TASK PARSER TEST
+# ============================================================
+
+$(TASK_PARSER_TEST): $(TASK_PARSER_TEST_OBJ) \
+                     $(BUILD_DIR)/host/config/task_parser.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
+# RUN ALL TESTS
+# ============================================================
+
+test: $(FOUNDATION_TEST) $(PLANNER_TEST) \
+      $(CONFIG_TEST) $(TASK_PARSER_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
+	./$(CONFIG_TEST)
+	./$(TASK_PARSER_TEST)
 
 # ============================================================
 # RUN HOST
@@ -144,6 +184,13 @@ test: $(FOUNDATION_TEST) $(PLANNER_TEST)
 
 run: $(TARGET)
 	./$(TARGET)
+
+# ============================================================
+# RUN PLANNER DEMO
+# ============================================================
+
+demo: $(TARGET)
+	./$(TARGET) --demo config/system.conf 100 40
 
 # ============================================================
 # DEBUG BUILD
