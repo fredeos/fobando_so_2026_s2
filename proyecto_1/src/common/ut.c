@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "common/ut.h"
 
 volatile uint32_t sink = 0;
 
