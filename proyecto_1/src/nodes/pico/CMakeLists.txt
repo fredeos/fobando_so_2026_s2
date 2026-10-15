@@ -28,11 +28,15 @@ project(pico C CXX ASM)
 pico_sdk_init()
 
 add_executable(pico
-    pico.c
+    main.c
 )
 
 target_link_libraries(pico
     pico_stdlib
 )
+
+# Use USB for serial I/O, not the UART pins.
+pico_enable_stdio_usb(pico 1)
+pico_enable_stdio_uart(pico 0)
 
 pico_add_extra_outputs(pico)

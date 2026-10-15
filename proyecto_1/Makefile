@@ -5,13 +5,35 @@
 CC := gcc
 MODE ?= debug
 
+ESP_IDF := idf.py
+CMAKE := cmake
+BASH := bash
+
 # ============================================================
 # DIRECTORIES
 # ============================================================
 
 SRC_DIR := src
-BUILD_DIR := build/$(MODE)
-OUT_DIR := output/$(MODE)
+BUILD_DIR := build
+OUT_DIR := output
+
+HOST_SRC_DIR   := $(SRC_DIR)/host
+COMMON_SRC_DIR := $(SRC_DIR)/common
+ESP_SRC_DIR    := $(SRC_DIR)/nodes/esp32
+PICO_SRC_DIR   := $(SRC_DIR)/nodes/pico
+
+HOST_BUILD_DIR  := $(BUILD_DIR)/host
+ESP_BUILD_DIR   := $(BUILD_DIR)/esp32
+PICO_BUILD_DIR  := $(BUILD_DIR)/pico
+
+
+# ============================================================
+# MAKE VARIABLES
+# ============================================================
+
+DEV ?= USB0
+IDF_ACTIVATE := $(HOME)/.espressif/tools/activate_idf_v6.1.sh
+export PICO_SDK_PATH := $(HOME)/pico-sdk
 
 # ============================================================
 # EXECUTABLE TARGETS
@@ -54,8 +76,8 @@ LDLIBS := -pthread -lm
 
 # Compilar únicamente Host y módulos comunes
 SOURCE_DIRS := $(wildcard \
-    $(SRC_DIR)/host \
-    $(SRC_DIR)/common)
+    $(HOST_SRC_DIR) \
+    $(COMMON_SRC_DIR))
 
 SOURCES := $(foreach dir,$(SOURCE_DIRS),\
     $(shell find $(dir) -type f -name '*.c'))
@@ -246,6 +268,55 @@ debug:
 
 release:
 	$(MAKE) MODE=release all
+
+# ============================================================
+# MCU CONFIGS
+# ============================================================
+
+mcu-config:
+	@mkdir -p $(BUILD_DIR)
+	@echo "Setting up PICO_SDK_PATH enviroment variable"
+	@echo "PICO_SDK_PATH=$$PICO_SDK_PATH"
+	@echo "Setting up ESP device..."
+	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) set-target esp32'
+	@echo ""
+
+# ============================================================
+# ESP: make rules
+# ============================================================
+
+esp-build:
+	@mkdir -p $(dir ${ESP_BUILD_DIR})
+	@echo "Building ESP32 project files..."
+	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) build'
+	@echo "[DONE]"
+	@echo ""
+
+esp-flash:
+	@echo "Flashing ESP32..."
+	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p /dev/tty$(DEV) flash'
+	@echo "[DONE]"
+	@echo ""
+
+# ============================================================
+# Pico: make rules
+# ============================================================
+
+pico-build:
+	@mkdir -p $(dir ${PICO_BUILD_DIR})
+	@echo "Building Pi Pico project files..."
+	cmake -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR) -G "Unix Makefiles" -DPICO_BOARD=pico
+	@echo "Generating Pi Pico binaries..."
+	cmake --build $(PICO_BUILD_DIR)
+	@echo "[DONE]"
+
+picow-build:
+	@mkdir -p $(dir ${PICO_BUILD_DIR})
+	@echo "Building Pi Pico project files..."
+	cmake -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR)_w -G "Unix Makefiles" -DPICO_BOARD=pico_w
+	@echo "Generating Pi Pico binaries..."
+	cmake --build $(PICO_BUILD_DIR)_w
+	@echo "[DONE]"
 
 # ============================================================
 # CLEAN
