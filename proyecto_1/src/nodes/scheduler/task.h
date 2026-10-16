@@ -13,20 +13,19 @@ typedef struct Task
     uint32_t W; // UT quantity
     uint32_t T; // period of time
     uint32_t D; // relative end time
-    uint32_t priority; // how important the task is
+    uint32_t criticality; // how important the task is
     uint32_t C; // tick equivalent
-};
+} Task;
 
 typedef struct Job
 {
     Task *task;
-    uint32_t task_id;
-    uint32_t release;
-    uint32_t deadline;
-    uint32_t ticks_remaining;
+    uint32_t release; // a partir de que tick empezò
+    uint32_t deadline; 
+    uint32_t ut_remaining; // cuantas uts le quedan
     bool active;
 
-};
+} Job;
 
 
 

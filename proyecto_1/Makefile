@@ -25,6 +25,7 @@ CONFIG_TEST := $(OUT_DIR)/test_config
 TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
+SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
 
 # ============================================================
 # COMPILER FLAGS
@@ -34,7 +35,8 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -std=c17 \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
-          -Iinclude
+          -Iinclude \
+          -Isrc/nodes/scheduler
 
 ifeq ($(MODE),release)
     CFLAGS += -O2
@@ -95,6 +97,10 @@ FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
 
+SCHEDULER_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_scheduler.o
+
+SCHEDULER_OBJ := $(BUILD_DIR)/nodes/scheduler/scheduler.o
+
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
@@ -109,13 +115,15 @@ TEST_OBJS := \
 
 DEPS := $(sort \
     $(OBJS:.o=.d) \
-    $(TEST_OBJS:.o=.d))
+    $(TEST_OBJS:.o=.d) \
+    $(SCHEDULER_TEST_OBJ:.o=.d) \
+    $(SCHEDULER_OBJ:.o=.d))
 
 # ============================================================
 # PHONY TARGETS
 # ============================================================
 
-.PHONY: all run demo debug release test clean
+.PHONY: all run demo debug release test test-scheduler clean
 
 # ============================================================
 # DEFAULT BUILD
@@ -203,6 +211,14 @@ $(MANUAL_TEST): $(MANUAL_TEST_OBJ) \
 	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
+# SCHEDULER TEST
+# ============================================================
+
+$(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
 # RUN ALL TESTS
 # ============================================================
 
@@ -211,13 +227,22 @@ test: $(FOUNDATION_TEST) \
       $(CONFIG_TEST) \
       $(TASK_PARSER_TEST) \
       $(FAILOVER_TEST) \
-      $(MANUAL_TEST)
+      $(MANUAL_TEST) \
+      $(SCHEDULER_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
 	./$(TASK_PARSER_TEST)
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
+	./$(SCHEDULER_TEST)
+
+# ============================================================
+# RUN SCHEDULER TEST
+# ============================================================
+
+test-scheduler: $(SCHEDULER_TEST)
+	./$(SCHEDULER_TEST)
 
 # ============================================================
 # RUN HOST
