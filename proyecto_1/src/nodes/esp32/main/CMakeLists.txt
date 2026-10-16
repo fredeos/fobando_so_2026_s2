@@ -1,6 +1,15 @@
-
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
-    REQUIRES esp_driver_uart
+    SRCS
+        "main.c"
+        "../src/calibrator.c"
+        "../../../common/ut.c"
+
+    INCLUDE_DIRS
+        "."
+        "../src"
+        "../../../../include"
+
+    REQUIRES
+        esp_driver_uart
+        esp_timer
 )

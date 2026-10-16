@@ -32,7 +32,7 @@ PICO_BUILD_DIR  := $(BUILD_DIR)/pico
 # ============================================================
 
 DEV ?= USB0
-IDF_ACTIVATE := $(HOME)/.espressif/tools/activate_idf_v6.1.sh
+IDF_ACTIVATE := $(HOME)/esp/esp-idf/export.sh
 export PICO_SDK_PATH := $(HOME)/pico-sdk
 
 # ============================================================
