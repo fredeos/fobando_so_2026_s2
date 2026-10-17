@@ -26,6 +26,7 @@ TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
+RMS_TEST := $(OUT_DIR)/test_rms
 
 # ============================================================
 # COMPILER FLAGS
@@ -101,6 +102,10 @@ SCHEDULER_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_scheduler.o
 
 SCHEDULER_OBJ := $(BUILD_DIR)/nodes/scheduler/scheduler.o
 
+RMS_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_rms.o
+
+RMS_OBJ := $(BUILD_DIR)/nodes/scheduler/rms.o
+
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
@@ -117,7 +122,9 @@ DEPS := $(sort \
     $(OBJS:.o=.d) \
     $(TEST_OBJS:.o=.d) \
     $(SCHEDULER_TEST_OBJ:.o=.d) \
-    $(SCHEDULER_OBJ:.o=.d))
+    $(SCHEDULER_OBJ:.o=.d) \
+    $(RMS_TEST_OBJ:.o=.d) \
+    $(RMS_OBJ:.o=.d))
 
 # ============================================================
 # PHONY TARGETS
@@ -219,6 +226,14 @@ $(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ)
 	$(CC) $^ -o $@ $(LDLIBS)
 
 # ============================================================
+# RMS TEST
+# ============================================================
+
+$(RMS_TEST): $(RMS_TEST_OBJ) $(RMS_OBJ) $(SCHEDULER_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
 # RUN ALL TESTS
 # ============================================================
 
@@ -236,6 +251,7 @@ test: $(FOUNDATION_TEST) \
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
 	./$(SCHEDULER_TEST)
+	./$(RMS_TEST)   
 
 # ============================================================
 # RUN SCHEDULER TEST
@@ -243,6 +259,15 @@ test: $(FOUNDATION_TEST) \
 
 test-scheduler: $(SCHEDULER_TEST)
 	./$(SCHEDULER_TEST)
+
+# ============================================================
+# RUN RMS TEST
+# ============================================================
+
+.PHONY: test-rms
+
+test-rms: $(RMS_TEST)
+	./$(RMS_TEST)
 
 # ============================================================
 # RUN HOST

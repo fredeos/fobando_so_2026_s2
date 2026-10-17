@@ -1,0 +1,278 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <assert.h>
+
+#include "scheduler.h"
+#include "rms.h"
+
+// ---------------------------------------------------------
+// TEST 1: Select Job with shortest period
+// ---------------------------------------------------------
+
+void test_rms_criticality(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    Task taskA = {
+        .id = 1,
+        .type = 'P',
+        .W = 200,
+        .T = 20,
+        .D = 20,
+        .criticality = 1,
+        .C = 2
+    };
+
+    Task taskB = {
+        .id = 2,
+        .type = 'P',
+        .W = 100,
+        .T = 10,
+        .D = 10,
+        .criticality = 2,
+        .C = 1
+    };
+
+    Task taskC = {
+        .id = 3,
+        .type = 'P',
+        .W = 300,
+        .T = 5,
+        .D = 5,
+        .criticality = 3,
+        .C = 3
+    };
+
+    assert(add_task(&taskA, &sc));
+    assert(add_task(&taskB, &sc));
+    assert(add_task(&taskC, &sc));
+
+    assert(release_job(&sc, 0));
+    assert(release_job(&sc, 1));
+    assert(release_job(&sc, 2));
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected >= 0);
+    assert(sc.jobs[selected].task->id == 3);
+
+    printf("[SUCCESS] RMS shortest period priority\n");
+}
+
+
+// ---------------------------------------------------------
+// TEST 2: Ignore inactive Jobs
+// ---------------------------------------------------------
+
+void test_rms_inactive_jobs(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    Task taskA = {
+        .id = 1,
+        .type = 'P',
+        .W = 100,
+        .T = 5,
+        .D = 5,
+        .criticality = 1,
+        .C = 1
+    };
+
+    Task taskB = {
+        .id = 2,
+        .type = 'P',
+        .W = 100,
+        .T = 10,
+        .D = 10,
+        .criticality = 2,
+        .C = 1
+    };
+
+    assert(add_task(&taskA, &sc));
+    assert(add_task(&taskB, &sc));
+
+    assert(release_job(&sc, 0));
+    assert(release_job(&sc, 1));
+
+    // First released Job occupies the last position
+    uint32_t indexA = MAX_JOBS - 1;
+
+    assert(free_job(&sc, indexA));
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected >= 0);
+    assert(sc.jobs[selected].task->id == 2);
+
+    printf("[SUCCESS] RMS ignores inactive Jobs\n");
+}
+
+
+// ---------------------------------------------------------
+// TEST 3: Tie by release time
+// ---------------------------------------------------------
+
+void test_rms_release_tie(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    Task task = {
+        .id = 1,
+        .type = 'P',
+        .W = 200,
+        .T = 10,
+        .D = 15,
+        .criticality = 1,
+        .C = 2
+    };
+
+    assert(add_task(&task, &sc));
+
+    // First Job: A1, released at tick 0
+    sc.current_tick = 0;
+    assert(release_job(&sc, 0));
+
+    // Second Job: A2, released at tick 10
+    sc.current_tick = 10;
+    assert(release_job(&sc, 0));
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected >= 0);
+    assert(sc.jobs[selected].release == 0);
+    assert(sc.jobs[selected].task->id == 1);
+
+    printf("[SUCCESS] RMS tie by oldest release\n");
+}
+
+
+// ---------------------------------------------------------
+// TEST 4: Tie by Task ID
+// ---------------------------------------------------------
+
+void test_rms_id_tie(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    Task taskA = {
+        .id = 10,
+        .type = 'P',
+        .W = 100,
+        .T = 10,
+        .D = 10,
+        .criticality = 1,
+        .C = 1
+    };
+
+    Task taskB = {
+        .id = 5,
+        .type = 'P',
+        .W = 100,
+        .T = 10,
+        .D = 10,
+        .criticality = 1,
+        .C = 1
+    };
+
+    assert(add_task(&taskA, &sc));
+    assert(add_task(&taskB, &sc));
+
+    sc.current_tick = 0;
+
+    assert(release_job(&sc, 0));
+    assert(release_job(&sc, 1));
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected >= 0);
+    assert(sc.jobs[selected].task->id == 5);
+
+    printf("[SUCCESS] RMS tie by lowest Task ID\n");
+}
+
+
+// ---------------------------------------------------------
+// TEST 5: Complete tie by array index
+// ---------------------------------------------------------
+
+void test_rms_index_tie(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    Task task = {
+        .id = 1,
+        .type = 'P',
+        .W = 100,
+        .T = 10,
+        .D = 15,
+        .criticality = 1,
+        .C = 1
+    };
+
+    assert(add_task(&task, &sc));
+
+    sc.current_tick = 0;
+
+    assert(release_job(&sc, 0));
+    assert(release_job(&sc, 0));
+
+    // Both Jobs have the same Task, period and release.
+    // The lower array index must win.
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected == MAX_JOBS - 2);
+
+    printf("[SUCCESS] RMS complete tie by array index\n");
+}
+
+
+// ---------------------------------------------------------
+// TEST 6: No active Jobs
+// ---------------------------------------------------------
+
+void test_rms_no_jobs(void) {
+
+    Scheduler sc;
+    init(&sc, 100, RMS);
+
+    int selected = rms_select_job(&sc);
+
+    assert(selected == -1);
+
+    // Also verify NULL pointer
+    assert(rms_select_job(NULL) == -1);
+
+    printf("[SUCCESS] RMS no active Jobs\n");
+}
+
+
+// ---------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------
+
+int main(void) {
+
+    printf("====================================\n");
+    printf("          RMS UNIT TESTS\n");
+    printf("====================================\n\n");
+
+    test_rms_criticality();
+    test_rms_inactive_jobs();
+    test_rms_release_tie();
+    test_rms_id_tie();
+    test_rms_index_tie();
+    test_rms_no_jobs();
+
+    printf("\n====================================\n");
+    printf("        ALL RMS TESTS PASSED\n");
+    printf("====================================\n");
+
+    return 0;
+}
