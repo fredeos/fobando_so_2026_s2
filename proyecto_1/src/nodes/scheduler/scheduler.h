@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "task.h"
 
+
 #define MAX_TASKS 20
 #define MAX_JOBS 40
 
@@ -48,5 +49,12 @@ bool free_job(Scheduler *sc, uint32_t index);
 bool release_job(Scheduler *sc, uint32_t task_index);
 
 uint32_t check_periodic_releases(Scheduler *sc);
+
+static void execute_uts(uint32_t amount);
+
+// Execute the selected Job during one tick
+bool execute_job_tick(Scheduler *sc, int job_index);
+
+
 
 #endif
