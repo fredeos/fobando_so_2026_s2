@@ -2,6 +2,7 @@
 #include "task.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include "ut.h"
 
 // rms initializer
 void init(Scheduler *sc, uint32_t sn, SchedulerType type){
@@ -124,4 +125,57 @@ uint32_t check_periodic_releases(Scheduler *sc) {
     }
 
     return released;
+}
+
+static void execute_uts(uint32_t amount) {
+
+    for (uint32_t i = 0; i < amount; i++) {
+        unidad_trabajo();
+    }
+}
+
+bool execute_job_tick(Scheduler *sc, int job_index) {
+
+    // Validate scheduler
+    if (sc == NULL) {
+        return false;
+    }
+
+    // Validate index
+    if (job_index < 0 || job_index >= MAX_JOBS) {
+        return false;
+    }
+
+    // Validate calibration
+    if (sc->sn == 0) {
+        return false;
+    }
+
+    Job *job = &sc->jobs[job_index];
+
+    // Validate Job
+    if (!job->active || job->task == NULL) {
+        return false;
+    }
+
+    // Determine how many UTs can be executed
+    uint32_t uts = job->ut_remaining;
+
+    if (uts > sc->sn) {
+        uts = sc->sn;
+    }
+
+    // Execute real workload
+    execute_uts(uts);
+
+    // Update remaining workload
+    job->ut_remaining -= uts;
+
+    // Job finished
+    if (job->ut_remaining == 0) {
+
+        free_job(sc, (uint32_t)job_index);
+    }
+
+    return true;
 }

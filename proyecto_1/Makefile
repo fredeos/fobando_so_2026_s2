@@ -128,6 +128,8 @@ RMS_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_rms.o
 
 RMS_OBJ := $(BUILD_DIR)/nodes/scheduler/rms.o
 
+UT_OBJ := $(BUILD_DIR)/nodes/scheduler/ut.o
+
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
@@ -243,7 +245,7 @@ $(MANUAL_TEST): $(MANUAL_TEST_OBJ) \
 # SCHEDULER TEST
 # ============================================================
 
-$(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ)
+$(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ) $(UT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -251,7 +253,7 @@ $(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ)
 # RMS TEST
 # ============================================================
 
-$(RMS_TEST): $(RMS_TEST_OBJ) $(RMS_OBJ) $(SCHEDULER_OBJ)
+$(RMS_TEST): $(RMS_TEST_OBJ) $(RMS_OBJ) $(SCHEDULER_OBJ) $(UT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
