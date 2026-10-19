@@ -36,6 +36,21 @@ typedef struct Scheduler {
     uint32_t deadline_miss_count;
     uint32_t last_missed_task_id;
     uint32_t last_missed_deadline;
+
+
+    // Sporadic task management
+    uint32_t sporadic_task_index;
+    uint32_t sporadic_last_release_tick;
+    uint32_t sporadic_rejected_count;
+    uint32_t sporadic_completed_count;
+    uint64_t sporadic_total_response_ticks;
+    bool sporadic_has_released;
+
+    // Sporadic task response-time statistics
+    uint32_t sporadic_last_response_ticks;
+    uint32_t sporadic_min_response_ticks;
+    uint32_t sporadic_max_response_ticks;
+
 } Scheduler;
 
 // funciones
@@ -66,6 +81,8 @@ int scheduler_select_job(Scheduler *sc);
 bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id);
 
 static void check_deadline_misses(Scheduler *sc);
+
+bool scheduler_register_sporadic_event(Scheduler *sc);
 
 
 #endif

@@ -28,28 +28,57 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
     sc->last_missed_task_id = UINT32_MAX;
     sc->last_missed_deadline = UINT32_MAX;
 
+    sc->sporadic_task_index = UINT32_MAX;
+    sc->sporadic_last_release_tick = 0;
+    sc->sporadic_rejected_count = 0;
+    sc->sporadic_completed_count = 0;
+    sc->sporadic_has_released = false;
+
+    sc->sporadic_total_response_ticks = 0;
+    sc->sporadic_last_response_ticks = 0;
+    sc->sporadic_min_response_ticks = UINT32_MAX;
+    sc->sporadic_max_response_ticks = 0;
+
     for (uint32_t i = 0; i < MAX_JOBS; i++){
         sc->free_index[i] = i;
         sc->jobs[i].active = false;
     }
 }
 
-bool add_task(Task *task, Scheduler *sc){
-    
+// ---------------------- add_task ----------------------
+
+bool add_task(Task *task, Scheduler *sc)
+{
     if (sc == NULL || task == NULL) {
         return false;
     }
 
-    if (sc->task_count >= MAX_TASKS){
+    if (sc->task_count >= MAX_TASKS) {
         return false;
     }
 
-    if (task->T == 0){
+    if (task->T == 0) {
+        return false;
+    }
+
+    if (task->type != 'P' && task->type != 'S') {
+        return false;
+    }
+
+    // Allow at most one sporadic task per scheduler.
+    if (task->type == 'S' &&
+        sc->sporadic_task_index != UINT32_MAX) {
         return false;
     }
 
     sc->tasks[sc->task_count] = *task;
+
+    if (task->type == 'S') {
+        sc->sporadic_task_index = sc->task_count;
+    }
+
     sc->task_count++;
+
     return true;
 }
 
@@ -178,11 +207,25 @@ bool execute_job_tick(Scheduler *sc, int job_index) {
     // Execute real workload
     execute_uts(uts);
 
-    // Update remaining workload
     job->ut_remaining -= uts;
 
-    // Job finished
     if (job->ut_remaining == 0) {
+        if (job->task->type == 'S') {
+            uint32_t response_ticks =
+                (sc->current_tick - job->release) + 1;
+
+            sc->sporadic_completed_count++;
+            sc->sporadic_total_response_ticks += response_ticks;
+            sc->sporadic_last_response_ticks = response_ticks;
+
+            if (response_ticks < sc->sporadic_min_response_ticks) {
+                sc->sporadic_min_response_ticks = response_ticks;
+            }
+
+            if (response_ticks > sc->sporadic_max_response_ticks) {
+                sc->sporadic_max_response_ticks = response_ticks;
+            }
+        }
 
         free_job(sc, (uint32_t)job_index);
     }
@@ -283,4 +326,41 @@ static void check_deadline_misses(Scheduler *sc)
         // Abort the job so it cannot be selected again.
         free_job(sc, i);
     }
+}
+
+// ---------------------- scheduler_register_sporadic_event ----------------------
+
+bool scheduler_register_sporadic_event(Scheduler *sc)
+{
+    if (sc == NULL) {
+        return false;
+    }
+
+    // A sporadic task must be registered first.
+    if (sc->sporadic_task_index == UINT32_MAX) {
+        return false;
+    }
+
+    uint32_t task_index = sc->sporadic_task_index;
+    Task *task = &sc->tasks[task_index];
+
+    // Reject events that arrive before the minimum inter-arrival interval.
+    if (sc->sporadic_has_released) {
+        uint32_t elapsed_ticks = sc->current_tick - sc->sporadic_last_release_tick;
+
+        if (elapsed_ticks < task->T) {
+            sc->sporadic_rejected_count++;
+            return false;
+        }
+    }
+
+    // Release a job for the accepted event.
+    if (!release_job(sc, task_index)) {
+        return false;
+    }
+
+    sc->sporadic_last_release_tick = sc->current_tick;
+    sc->sporadic_has_released = true;
+
+    return true;
 }

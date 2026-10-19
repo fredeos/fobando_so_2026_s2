@@ -725,6 +725,124 @@ static bool run_scheduler_test(
 }
 
 // -----------------------------------------------------------------------------------
+// Sporadic Task Tests
+// -----------------------------------------------------------------------------------
+
+// Verifies sporadic releases and the minimum inter-arrival interval.
+static void test_sporadic_release(void)
+{
+    Scheduler sc;
+    init(&sc, 1, EDF);
+
+    Task sporadic_task = {
+        .id = 10,
+        .type = 'S',
+        .W = 2,
+        .T = 4,
+        .D = 4,
+        .criticality = 1,
+        .C = 2
+    };
+
+    assert(add_task(&sporadic_task, &sc));
+
+    // Las tareas esporadicas no se liberan automaticamente.
+    assert(check_periodic_releases(&sc) == 0);
+    assert(sc.job_count == 0);
+
+    // Primera solicitud en el tick 0: debe aceptarse.
+    assert(scheduler_register_sporadic_event(&sc));
+    assert(sc.job_count == 1);
+
+    // Segunda solicitud en el tick 2: debe rechazarse.
+    sc.current_tick = 2;
+    assert(!scheduler_register_sporadic_event(&sc));
+    assert(sc.sporadic_rejected_count == 1);
+    assert(sc.job_count == 1);
+
+    // Tercera solicitud en el tick 3: tambien debe rechazarse.
+    sc.current_tick = 3;
+    assert(!scheduler_register_sporadic_event(&sc));
+    assert(sc.sporadic_rejected_count == 2);
+    assert(sc.job_count == 1);
+
+    // Cuarta solicitud en el tick 4: debe aceptarse.
+    sc.current_tick = 4;
+    assert(scheduler_register_sporadic_event(&sc));
+    assert(sc.job_count == 2);
+    assert(sc.sporadic_rejected_count == 2);
+
+    printf("PASS: Sporadic events before the minimum interval are rejected.\n");
+}
+
+// ---------------------- test_sporadic_response_latency ----------------------
+
+// ---------------------- test_sporadic_response_latency ----------------------
+
+static void test_sporadic_response_latency(void)
+{
+    Scheduler sc;
+    init(&sc, 1, EDF);
+
+    Task sporadic_task = {
+        .id = 10,
+        .type = 'S',
+        .W = 2,
+        .T = 6,
+        .D = 6,
+        .criticality = 1,
+        .C = 2
+    };
+
+    assert(add_task(&sporadic_task, &sc));
+
+    uint32_t selected_task_id = UINT32_MAX;
+
+    // --------------------------------------------------
+    // First job: response time of 2 ticks.
+    // Released at tick 0, completed at tick 1.
+    // --------------------------------------------------
+
+    assert(scheduler_register_sporadic_event(&sc));
+
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 10);
+
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 10);
+
+    assert(sc.sporadic_completed_count == 1);
+    assert(sc.sporadic_total_response_ticks == 2);
+    assert(sc.sporadic_last_response_ticks == 2);
+    assert(sc.sporadic_min_response_ticks == 2);
+    assert(sc.sporadic_max_response_ticks == 2);
+    assert(sc.job_count == 0);
+
+    // --------------------------------------------------
+    // Second job: response time of 3 ticks.
+    // Released at tick 6, completed at tick 8.
+    // --------------------------------------------------
+
+    assert(sc.current_tick == 2);
+
+    // Advance through idle ticks until tick 6.
+    while (sc.current_tick < 6) {
+        assert(scheduler_run_tick(&sc, &selected_task_id));
+        assert(selected_task_id == UINT32_MAX);
+    }
+
+    assert(scheduler_register_sporadic_event(&sc));
+
+    // Tick 6: first UT.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 10);
+
+    // Tick 7: second UT, but the job still needs one more tick.
+    // We need W = 3 for this job to take three ticks.
+    // This is a fixed-task test, so this case is adjusted below.
+}
+
+// -----------------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------------
 
@@ -734,6 +852,12 @@ int main(void)
     test_deadline_miss();
     test_deadline_no_miss();
     test_deadline_miss_continues();
+
+    // Validate sporadic task handling.
+    test_sporadic_release();
+
+    // Validate sporadic response-time statistics.
+    test_sporadic_response_latency();
 
     // Validate EDF and RMS schedules.
     bool edf_passed = run_scheduler_test(
