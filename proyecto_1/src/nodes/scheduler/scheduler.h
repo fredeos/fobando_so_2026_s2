@@ -29,6 +29,13 @@ typedef struct Scheduler {
 
     uint32_t current_tick;
     uint32_t sn; // capacity of uts per tick
+
+
+    // Deadline miss tracking
+    bool deadline_missed;
+    uint32_t deadline_miss_count;
+    uint32_t last_missed_task_id;
+    uint32_t last_missed_deadline;
 } Scheduler;
 
 // funciones
@@ -56,7 +63,9 @@ bool execute_job_tick(Scheduler *sc, int job_index);
 
 int scheduler_select_job(Scheduler *sc);
 
-bool scheduler_run_tick(Scheduler *sc);
+bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id);
+
+static void check_deadline_misses(Scheduler *sc);
 
 
 #endif

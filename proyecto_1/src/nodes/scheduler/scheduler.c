@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 // rms initializer
 void init(Scheduler *sc, uint32_t sn, SchedulerType type){
@@ -21,6 +22,11 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
     sc->current_tick = 0;
     sc->sn = sn;
     sc->free_count = MAX_JOBS;
+
+    sc->deadline_missed = false;
+    sc->deadline_miss_count = 0;
+    sc->last_missed_task_id = UINT32_MAX;
+    sc->last_missed_deadline = UINT32_MAX;
 
     for (uint32_t i = 0; i < MAX_JOBS; i++){
         sc->free_index[i] = i;
@@ -200,5 +206,81 @@ int scheduler_select_job(Scheduler *sc)
 
         default:
             return -1;
+    }
+}
+
+// Executes one scheduling tick and reports the selected task ID.
+bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
+{
+    if (sc == NULL || sc->sn == 0 || selected_task_id == NULL) {
+        return false;
+    }
+
+    *selected_task_id = UINT32_MAX;
+
+    // Release periodic jobs for the current tick.
+    check_periodic_releases(sc);
+
+    // Detect and abort jobs that have missed their deadlines.
+    check_deadline_misses(sc);
+
+
+    // Select the highest-priority remaining job.
+    int job_index = scheduler_select_job(sc);
+
+    if (job_index >= 0) {
+        Job *job = &sc->jobs[job_index];
+
+        if (job->task == NULL) {
+            return false;
+        }
+
+        *selected_task_id = job->task->id;
+
+        if (!execute_job_tick(sc, job_index)) {
+            return false;
+        }
+    }
+
+    sc->current_tick++;
+
+    return true;
+}
+
+// Detects, records, and aborts jobs that have missed their deadlines.
+static void check_deadline_misses(Scheduler *sc)
+{
+    if (sc == NULL) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < MAX_JOBS; i++) {
+
+        Job *job = &sc->jobs[i];
+
+        // Ignore inactive jobs and invalid task references.
+        if (!job->active || job->task == NULL) {
+            continue;
+        }
+
+        // The job has not missed its deadline yet.
+        if (sc->current_tick < job->deadline) {
+            continue;
+        }
+
+        // A job with no remaining work has completed successfully.
+        if (job->ut_remaining == 0) {
+            free_job(sc, i);
+            continue;
+        }
+
+        // Record the deadline miss.
+        sc->deadline_missed = true;
+        sc->deadline_miss_count++;
+        sc->last_missed_task_id = job->task->id;
+        sc->last_missed_deadline = job->deadline;
+
+        // Abort the job so it cannot be selected again.
+        free_job(sc, i);
     }
 }

@@ -63,28 +63,3 @@ int edf_select_job(Scheduler *sc) {
 }
 
 
-// Executes one scheduling tick.
-bool scheduler_run_tick(Scheduler *sc)
-{
-    if (sc == NULL || sc->sn == 0) {
-        return false;
-    }
-
-    // Release periodic jobs at the current tick.
-    check_periodic_releases(sc);
-
-    // Select the highest-priority active job.
-    int job_index = scheduler_select_job(sc);
-
-    // Execute one scheduling interval.
-    if (job_index >= 0) {
-        if (!execute_job_tick(sc, job_index)) {
-            return false;
-        }
-    }
-
-    // Advance the scheduling clock.
-    sc->current_tick++;
-
-    return true;
-}

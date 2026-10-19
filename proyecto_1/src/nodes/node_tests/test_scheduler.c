@@ -1,3 +1,4 @@
+/*
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -431,6 +432,330 @@ int main(void)
     printf("\n====================================\n");
     printf("       ALL TESTS PASSED\n");
     printf("====================================\n");
+
+    return 0;
+}
+*/
+#include "scheduler.h"
+
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+// -----------------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------------
+
+#define TEST_TICKS 24
+#define IDLE_TASK UINT32_MAX
+
+// -----------------------------------------------------------------------------------
+// Expected Schedules
+// -----------------------------------------------------------------------------------
+
+// Expected EDF schedule for the first 24 ticks.
+static const uint32_t expected_edf_schedule[TEST_TICKS] = {
+    2, 2, 1, 1, 1, 2,
+    2, 3, 1, 1, 1, 2,
+    2, 1, 1, 1, 2, 2,
+    3, 1, 1, 1, 2, 2
+};
+
+// Expected RMS schedule for the first 24 ticks.
+static const uint32_t expected_rms_schedule[TEST_TICKS] = {
+    2, 2, 1, 1, 1, 2,
+    2, 1, 1, 1, 2, 2,
+    1, 1, 1, 2, 2, 3,
+    1, 1, 2, 2, 1, IDLE_TASK
+};
+
+// -----------------------------------------------------------------------------------
+// Deadline Tests
+// -----------------------------------------------------------------------------------
+
+// Verifies that unfinished jobs are aborted when their deadlines expire.
+static void test_deadline_miss(void)
+{
+    Scheduler sc;
+    init(&sc, 1, EDF);
+
+    Task task = {
+        .id = 1,
+        .type = 'P',
+        .W = 3,
+        .T = 10,
+        .D = 2,
+        .criticality = 1,
+        .C = 3
+    };
+
+    assert(add_task(&task, &sc));
+
+    uint32_t selected_task_id;
+
+    // Tick 0: execute one unit of work.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 1: execute another unit of work.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 2: abort the unfinished job.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == IDLE_TASK);
+
+    assert(sc.deadline_missed);
+    assert(sc.deadline_miss_count == 1);
+    assert(sc.last_missed_task_id == 1);
+    assert(sc.last_missed_deadline == 2);
+    assert(sc.job_count == 0);
+
+    printf("PASS: Deadline miss detected and job aborted.\n");
+}
+
+// Verifies that jobs completed before their deadlines do not trigger errors.
+static void test_deadline_no_miss(void)
+{
+    Scheduler sc;
+    init(&sc, 1, EDF);
+
+    Task task = {
+        .id = 1,
+        .type = 'P',
+        .W = 2,
+        .T = 10,
+        .D = 2,
+        .criticality = 1,
+        .C = 2
+    };
+
+    assert(add_task(&task, &sc));
+
+    uint32_t selected_task_id;
+
+    // Tick 0: execute the first unit of work.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 1: finish the job before its deadline.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 2: verify that no deadline miss was recorded.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == IDLE_TASK);
+
+    assert(!sc.deadline_missed);
+    assert(sc.deadline_miss_count == 0);
+    assert(sc.job_count == 0);
+
+    printf("PASS: Completed jobs do not trigger deadline misses.\n");
+}
+
+// Verifies that the scheduler continues executing other jobs after a deadline miss.
+static void test_deadline_miss_continues(void)
+{
+    Scheduler sc;
+    init(&sc, 1, EDF);
+
+    Task task_a = {
+        .id = 1,
+        .type = 'P',
+        .W = 3,
+        .T = 10,
+        .D = 2,
+        .criticality = 1,
+        .C = 3
+    };
+
+    Task task_b = {
+        .id = 2,
+        .type = 'P',
+        .W = 1,
+        .T = 5,
+        .D = 5,
+        .criticality = 1,
+        .C = 1
+    };
+
+    assert(add_task(&task_a, &sc));
+    assert(add_task(&task_b, &sc));
+
+    uint32_t selected_task_id;
+
+    // Tick 0: task A has the earlier deadline.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 1: task A continues executing.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 1);
+    assert(sc.deadline_miss_count == 0);
+
+    // Tick 2: abort task A and execute task B.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == 2);
+
+    assert(sc.deadline_missed);
+    assert(sc.deadline_miss_count == 1);
+    assert(sc.last_missed_task_id == 1);
+    assert(sc.last_missed_deadline == 2);
+    assert(sc.job_count == 0);
+
+    // Tick 3: task B has finished, so the scheduler should be idle.
+    assert(scheduler_run_tick(&sc, &selected_task_id));
+    assert(selected_task_id == IDLE_TASK);
+
+    // The same missed deadline must not be counted again.
+    assert(sc.deadline_miss_count == 1);
+
+    printf("PASS: Scheduler continues executing jobs after a deadline miss.\n");
+}
+
+// -----------------------------------------------------------------------------------
+// Scheduler Tests
+// -----------------------------------------------------------------------------------
+
+// Runs a scheduler and validates its execution timeline and context switches.
+static bool run_scheduler_test(
+    SchedulerType type,
+    const char *name,
+    const uint32_t expected_schedule[TEST_TICKS],
+    uint32_t expected_context_switches)
+{
+    Scheduler sc;
+    init(&sc, 1, type);
+
+    // Define periodic tasks A, B, and C.
+    Task tasks[] = {
+        {.id = 1, .type = 'P', .W = 3, .T = 6, .D = 6, .criticality = 1, .C = 3},
+        {.id = 2, .type = 'P', .W = 2, .T = 5, .D = 5, .criticality = 1, .C = 2},
+        {.id = 3, .type = 'P', .W = 1, .T = 12, .D = 12, .criticality = 1, .C = 1}
+    };
+
+    const uint32_t task_count = sizeof(tasks) / sizeof(tasks[0]);
+
+    // Register tasks.
+    for (uint32_t i = 0; i < task_count; i++) {
+        if (!add_task(&tasks[i], &sc)) {
+            fprintf(stderr,
+                    "FAIL [%s]: Could not register task %u\n",
+                    name,
+                    tasks[i].id);
+            return false;
+        }
+    }
+
+    uint32_t actual_schedule[TEST_TICKS];
+
+    // Execute the scheduler for the requested number of ticks.
+    for (uint32_t tick = 0; tick < TEST_TICKS; tick++) {
+        if (!scheduler_run_tick(&sc, &actual_schedule[tick])) {
+            fprintf(stderr,
+                    "FAIL [%s]: Scheduler error at tick %u\n",
+                    name,
+                    tick);
+            return false;
+        }
+    }
+
+    // Print the resulting timeline.
+    printf("\n%s schedule (%u ticks):\n", name, TEST_TICKS);
+
+    for (uint32_t tick = 0; tick < TEST_TICKS; tick++) {
+        if (actual_schedule[tick] == IDLE_TASK) {
+            printf(" - ");
+        } else {
+            printf(" %c ", (char)('A' + actual_schedule[tick] - 1));
+        }
+    }
+
+    printf("\n");
+
+    // Validate the schedule and count context switches.
+    uint32_t context_switches = 0;
+    uint32_t errors = 0;
+
+    for (uint32_t tick = 0; tick < TEST_TICKS; tick++) {
+        if (actual_schedule[tick] != expected_schedule[tick]) {
+            fprintf(stderr,
+                    "Mismatch [%s] at tick %u: expected task %u, got task %u\n",
+                    name,
+                    tick,
+                    expected_schedule[tick],
+                    actual_schedule[tick]);
+            errors++;
+        }
+
+        if (tick > 0 &&
+            actual_schedule[tick] != actual_schedule[tick - 1]) {
+            context_switches++;
+        }
+    }
+
+    printf("Context switches: %u\n", context_switches);
+
+    if (errors > 0) {
+        fprintf(stderr,
+                "FAIL [%s]: %u scheduling mismatches\n",
+                name,
+                errors);
+        return false;
+    }
+
+    if (context_switches != expected_context_switches) {
+        fprintf(stderr,
+                "FAIL [%s]: Expected %u context switches, got %u\n",
+                name,
+                expected_context_switches,
+                context_switches);
+        return false;
+    }
+
+    printf("PASS: %s schedule matches the expected timeline.\n", name);
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------------
+
+int main(void)
+{
+    // Validate deadline handling.
+    test_deadline_miss();
+    test_deadline_no_miss();
+    test_deadline_miss_continues();
+
+    // Validate EDF and RMS schedules.
+    bool edf_passed = run_scheduler_test(
+        EDF,
+        "EDF",
+        expected_edf_schedule,
+        10
+    );
+
+    bool rms_passed = run_scheduler_test(
+        RMS,
+        "RMS",
+        expected_rms_schedule,
+        11
+    );
+
+    if (!edf_passed || !rms_passed) {
+        fprintf(stderr, "\nFAIL: One or more scheduler tests failed.\n");
+        return 1;
+    }
+
+    printf("\nPASS: All scheduler tests passed.\n");
 
     return 0;
 }
