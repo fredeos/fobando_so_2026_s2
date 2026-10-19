@@ -50,11 +50,13 @@ bool release_job(Scheduler *sc, uint32_t task_index);
 
 uint32_t check_periodic_releases(Scheduler *sc);
 
-static void execute_uts(uint32_t amount);
 
 // Execute the selected Job during one tick
 bool execute_job_tick(Scheduler *sc, int job_index);
 
+int scheduler_select_job(Scheduler *sc);
+
+bool scheduler_run_tick(Scheduler *sc);
 
 
 #endif

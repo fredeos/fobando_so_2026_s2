@@ -1,8 +1,12 @@
 #include "scheduler.h"
 #include "task.h"
+#include "ut.h"
+#include "rms.h"
+#include "edf.h"
+
 #include <stdbool.h>
 #include <stddef.h>
-#include "ut.h"
+#include <stdint.h>
 
 // rms initializer
 void init(Scheduler *sc, uint32_t sn, SchedulerType type){
@@ -74,7 +78,7 @@ bool free_job(Scheduler *sc, uint32_t index) {
 bool release_job(Scheduler *sc, uint32_t task_index) {
 
     // Validate scheduler and task index
-    if (task_index >= sc->task_count) {
+    if (sc == NULL || task_index >= sc->task_count) {
         return false;
     }
 
@@ -178,4 +182,23 @@ bool execute_job_tick(Scheduler *sc, int job_index) {
     }
 
     return true;
+}
+
+// Selects a job using the configured scheduling algorithm.
+int scheduler_select_job(Scheduler *sc)
+{
+    if (sc == NULL) {
+        return -1;
+    }
+
+    switch (sc->type) {
+        case RMS:
+            return rms_select_job(sc);
+
+        case EDF:
+            return edf_select_job(sc);
+
+        default:
+            return -1;
+    }
 }

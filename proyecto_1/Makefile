@@ -49,6 +49,7 @@ FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
 RMS_TEST := $(OUT_DIR)/test_rms
+EDF_TEST := $(OUT_DIR)/test_edf
 
 # ============================================================
 # COMPILER FLAGS
@@ -130,6 +131,10 @@ RMS_OBJ := $(BUILD_DIR)/nodes/scheduler/rms.o
 
 UT_OBJ := $(BUILD_DIR)/nodes/scheduler/ut.o
 
+EDF_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_edf.o
+
+EDF_OBJ := $(BUILD_DIR)/nodes/scheduler/edf.o
+
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
     $(PLANNER_TEST_OBJ) \
@@ -137,6 +142,7 @@ TEST_OBJS := \
     $(TASK_PARSER_TEST_OBJ) \
     $(FAILOVER_TEST_OBJ) \
     $(MANUAL_TEST_OBJ)
+	
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -148,13 +154,15 @@ DEPS := $(sort \
     $(SCHEDULER_TEST_OBJ:.o=.d) \
     $(SCHEDULER_OBJ:.o=.d) \
     $(RMS_TEST_OBJ:.o=.d) \
-    $(RMS_OBJ:.o=.d))
+    $(RMS_OBJ:.o=.d) \
+    $(EDF_TEST_OBJ:.o=.d) \
+    $(EDF_OBJ:.o=.d))
 
 # ============================================================
 # PHONY TARGETS
 # ============================================================
 
-.PHONY: all run demo debug release test test-scheduler clean
+.PHONY: all run demo debug release test test-scheduler test-rms test-edf clean
 
 # ============================================================
 # DEFAULT BUILD
@@ -245,7 +253,11 @@ $(MANUAL_TEST): $(MANUAL_TEST_OBJ) \
 # SCHEDULER TEST
 # ============================================================
 
-$(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ) $(UT_OBJ)
+$(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) \
+                   $(SCHEDULER_OBJ) \
+                   $(RMS_OBJ) \
+                   $(EDF_OBJ) \
+                   $(UT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -253,7 +265,23 @@ $(SCHEDULER_TEST): $(SCHEDULER_TEST_OBJ) $(SCHEDULER_OBJ) $(UT_OBJ)
 # RMS TEST
 # ============================================================
 
-$(RMS_TEST): $(RMS_TEST_OBJ) $(RMS_OBJ) $(SCHEDULER_OBJ) $(UT_OBJ)
+$(RMS_TEST): $(RMS_TEST_OBJ) \
+             $(RMS_OBJ) \
+             $(SCHEDULER_OBJ) \
+             $(EDF_OBJ) \
+             $(UT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# ============================================================
+# EDF TEST
+# ============================================================
+
+$(EDF_TEST): $(EDF_TEST_OBJ) \
+             $(EDF_OBJ) \
+             $(SCHEDULER_OBJ) \
+             $(RMS_OBJ) \
+             $(UT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -267,7 +295,9 @@ test: $(FOUNDATION_TEST) \
       $(TASK_PARSER_TEST) \
       $(FAILOVER_TEST) \
       $(MANUAL_TEST) \
-      $(SCHEDULER_TEST)
+      $(SCHEDULER_TEST) \
+      $(RMS_TEST) \
+      $(EDF_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
@@ -275,7 +305,8 @@ test: $(FOUNDATION_TEST) \
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
 	./$(SCHEDULER_TEST)
-	./$(RMS_TEST)   
+	./$(RMS_TEST)
+	./$(EDF_TEST)
 
 # ============================================================
 # RUN SCHEDULER TEST
@@ -292,6 +323,13 @@ test-scheduler: $(SCHEDULER_TEST)
 
 test-rms: $(RMS_TEST)
 	./$(RMS_TEST)
+
+# ============================================================
+# RUN EDF TEST
+# ============================================================
+
+test-edf: $(EDF_TEST)
+	./$(EDF_TEST)
 
 # ============================================================
 # RUN HOST

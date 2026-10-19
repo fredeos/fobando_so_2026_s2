@@ -10,8 +10,8 @@
 // TEST 1: Scheduler initialization
 // ---------------------------------------------------------
 
-void test_init(void) {
-
+void test_init(void)
+{
     Scheduler sc;
 
     init(&sc, 100, RMS);
@@ -28,6 +28,16 @@ void test_init(void) {
         assert(sc.jobs[i].active == false);
     }
 
+    // Verify EDF initialization as well.
+    init(&sc, 50, EDF);
+
+    assert(sc.type == EDF);
+    assert(sc.task_count == 0);
+    assert(sc.job_count == 0);
+    assert(sc.current_tick == 0);
+    assert(sc.sn == 50);
+    assert(sc.free_count == MAX_JOBS);
+
     printf("[SUCCESS] Scheduler initialization\n");
 }
 
@@ -36,8 +46,8 @@ void test_init(void) {
 // TEST 2: Add tasks
 // ---------------------------------------------------------
 
-void test_add_task(void) {
-
+void test_add_task(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -61,8 +71,8 @@ void test_add_task(void) {
         .C = 4
     };
 
-    assert(add_task(&task1, &sc) == true);
-    assert(add_task(&task2, &sc) == true);
+    assert(add_task(&task1, &sc));
+    assert(add_task(&task2, &sc));
 
     assert(sc.task_count == 2);
 
@@ -74,7 +84,7 @@ void test_add_task(void) {
     assert(sc.tasks[1].W == 400);
     assert(sc.tasks[1].T == 20);
 
-    // Invalid task: T = 0
+    // Reject tasks with invalid periods.
     Task invalid_task = {
         .id = 3,
         .type = 'P',
@@ -85,12 +95,12 @@ void test_add_task(void) {
         .C = 1
     };
 
-    assert(add_task(&invalid_task, &sc) == false);
+    assert(!add_task(&invalid_task, &sc));
     assert(sc.task_count == 2);
 
-    // Null pointers
-    assert(add_task(NULL, &sc) == false);
-    assert(add_task(&task1, NULL) == false);
+    // Reject null pointers.
+    assert(!add_task(NULL, &sc));
+    assert(!add_task(&task1, NULL));
 
     printf("[SUCCESS] Task registration\n");
 }
@@ -100,13 +110,12 @@ void test_add_task(void) {
 // TEST 3: Maximum task capacity
 // ---------------------------------------------------------
 
-void test_max_tasks(void) {
-
+void test_max_tasks(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
     for (uint32_t i = 0; i < MAX_TASKS; i++) {
-
         Task task = {
             .id = i + 1,
             .type = 'P',
@@ -117,13 +126,13 @@ void test_max_tasks(void) {
             .C = 1
         };
 
-        assert(add_task(&task, &sc) == true);
+        assert(add_task(&task, &sc));
     }
 
     assert(sc.task_count == MAX_TASKS);
 
     Task extra = {
-        .id = 100,
+        .id = MAX_TASKS + 1,
         .type = 'P',
         .W = 100,
         .T = 10,
@@ -132,7 +141,7 @@ void test_max_tasks(void) {
         .C = 1
     };
 
-    assert(add_task(&extra, &sc) == false);
+    assert(!add_task(&extra, &sc));
     assert(sc.task_count == MAX_TASKS);
 
     printf("[SUCCESS] Maximum task capacity\n");
@@ -143,8 +152,8 @@ void test_max_tasks(void) {
 // TEST 4: Free index management
 // ---------------------------------------------------------
 
-void test_free_indices(void) {
-
+void test_free_indices(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -162,6 +171,14 @@ void test_free_indices(void) {
 
     assert(sc.free_count == MAX_JOBS - 3);
 
+    // Exhaust the free-index pool.
+    for (uint32_t i = 3; i < MAX_JOBS; i++) {
+        assert(get_free_index(&sc) >= 0);
+    }
+
+    assert(sc.free_count == 0);
+    assert(get_free_index(&sc) == -1);
+
     printf("[SUCCESS] Free index allocation\n");
 }
 
@@ -170,8 +187,8 @@ void test_free_indices(void) {
 // TEST 5: Release a Job
 // ---------------------------------------------------------
 
-void test_release_job(void) {
-
+void test_release_job(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -185,31 +202,31 @@ void test_release_job(void) {
         .C = 3
     };
 
-    assert(add_task(&task, &sc) == true);
+    assert(add_task(&task, &sc));
 
     sc.current_tick = 5;
 
-    assert(release_job(&sc, 0) == true);
+    assert(release_job(&sc, 0));
 
     assert(sc.job_count == 1);
     assert(sc.free_count == MAX_JOBS - 1);
 
-    // First allocated index
     uint32_t index = MAX_JOBS - 1;
-
     Job *job = &sc.jobs[index];
 
-    assert(job->active == true);
-
-    // Job must point to the Task stored in Scheduler
+    assert(job->active);
     assert(job->task == &sc.tasks[0]);
-
     assert(job->task->id == 1);
 
     assert(job->release == 5);
     assert(job->deadline == 15);
-
     assert(job->ut_remaining == 250);
+
+    // Reject invalid task indices.
+    assert(!release_job(&sc, sc.task_count));
+
+    // Reject null scheduler pointers.
+    assert(!release_job(NULL, 0));
 
     printf("[SUCCESS] Job release\n");
 }
@@ -219,8 +236,8 @@ void test_release_job(void) {
 // TEST 6: Free a Job and reuse its position
 // ---------------------------------------------------------
 
-void test_free_job(void) {
-
+void test_free_job(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -234,29 +251,29 @@ void test_free_job(void) {
         .C = 1
     };
 
-    assert(add_task(&task, &sc) == true);
-
-    assert(release_job(&sc, 0) == true);
+    assert(add_task(&task, &sc));
+    assert(release_job(&sc, 0));
 
     uint32_t index = MAX_JOBS - 1;
 
-    assert(sc.jobs[index].active == true);
+    assert(sc.jobs[index].active);
     assert(sc.job_count == 1);
 
-    // Free the Job
-    assert(free_job(&sc, index) == true);
+    // Free the Job.
+    assert(free_job(&sc, index));
 
-    assert(sc.jobs[index].active == false);
+    assert(!sc.jobs[index].active);
     assert(sc.job_count == 0);
     assert(sc.free_count == MAX_JOBS);
 
-    // Cannot free the same Job twice
-    assert(free_job(&sc, index) == false);
+    // Reject invalid and repeated deallocation.
+    assert(!free_job(&sc, index));
+    assert(!free_job(&sc, MAX_JOBS));
 
-    // Reuse the released position
-    assert(release_job(&sc, 0) == true);
+    // Reuse the released position.
+    assert(release_job(&sc, 0));
 
-    assert(sc.jobs[index].active == true);
+    assert(sc.jobs[index].active);
     assert(sc.job_count == 1);
     assert(sc.free_count == MAX_JOBS - 1);
 
@@ -268,8 +285,8 @@ void test_free_job(void) {
 // TEST 7: Periodic releases
 // ---------------------------------------------------------
 
-void test_periodic_releases(void) {
-
+void test_periodic_releases(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -303,39 +320,37 @@ void test_periodic_releases(void) {
         .C = 1
     };
 
-    assert(add_task(&taskA, &sc) == true);
-    assert(add_task(&taskB, &sc) == true);
-    assert(add_task(&taskS, &sc) == true);
+    assert(add_task(&taskA, &sc));
+    assert(add_task(&taskB, &sc));
+    assert(add_task(&taskS, &sc));
 
     printf("\nPeriodic release simulation:\n");
 
     for (uint32_t tick = 0; tick <= 20; tick++) {
-
         sc.current_tick = tick;
 
         uint32_t released = check_periodic_releases(&sc);
+        uint32_t expected = 0;
+
+        if (tick % taskA.T == 0) {
+            expected++;
+        }
+
+        if (tick % taskB.T == 0) {
+            expected++;
+        }
+
+        // Sporadic tasks must not be released automatically.
+        assert(released == expected);
 
         printf("Tick %2u: %u Jobs released\n",
                (unsigned)tick,
                (unsigned)released);
-
-        uint32_t expected = 0;
-
-        if (tick % 5 == 0) {
-            expected++;
-        }
-
-        if (tick % 10 == 0) {
-            expected++;
-        }
-
-        assert(released == expected);
     }
 
-    // A: ticks 0, 5, 10, 15, 20 = 5 Jobs
-    // B: ticks 0, 10, 20 = 3 Jobs
-    // S: no automatic releases
-
+    // Task A: ticks 0, 5, 10, 15, 20.
+    // Task B: ticks 0, 10, 20.
+    // Task S: no automatic releases.
     assert(sc.job_count == 8);
     assert(sc.free_count == MAX_JOBS - 8);
 
@@ -347,8 +362,8 @@ void test_periodic_releases(void) {
 // TEST 8: Job capacity exhaustion
 // ---------------------------------------------------------
 
-void test_max_jobs(void) {
-
+void test_max_jobs(void)
+{
     Scheduler sc;
     init(&sc, 100, RMS);
 
@@ -362,17 +377,17 @@ void test_max_jobs(void) {
         .C = 1
     };
 
-    assert(add_task(&task, &sc) == true);
+    assert(add_task(&task, &sc));
 
     for (uint32_t i = 0; i < MAX_JOBS; i++) {
-        assert(release_job(&sc, 0) == true);
+        assert(release_job(&sc, 0));
     }
 
     assert(sc.job_count == MAX_JOBS);
     assert(sc.free_count == 0);
 
-    // No more positions available
-    assert(release_job(&sc, 0) == false);
+    // No free positions remain.
+    assert(!release_job(&sc, 0));
 
     assert(sc.job_count == MAX_JOBS);
     assert(sc.free_count == 0);
@@ -385,20 +400,33 @@ void test_max_jobs(void) {
 // MAIN
 // ---------------------------------------------------------
 
-int main(void) {
+// ---------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------
 
+int main(void)
+{
     printf("====================================\n");
     printf("       SCHEDULER UNIT TESTS\n");
-    printf("====================================\n\n");
+    printf("====================================\n");
 
-    test_init();
-    test_add_task();
-    test_max_tasks();
-    test_free_indices();
-    test_release_job();
-    test_free_job();
-    test_periodic_releases();
-    test_max_jobs();
+    SchedulerType types[] = {RMS, EDF};
+    const char *names[] = {"RMS", "EDF"};
+
+    for (uint32_t i = 0; i < 2; i++) {
+        printf("\n====================================\n");
+        printf("       TESTING %s\n", names[i]);
+        printf("====================================\n\n");
+
+        test_init();
+        test_add_task();
+        test_max_tasks();
+        test_free_indices();
+        test_release_job();
+        test_free_job();
+        test_periodic_releases();
+        test_max_jobs();
+    }
 
     printf("\n====================================\n");
     printf("       ALL TESTS PASSED\n");
