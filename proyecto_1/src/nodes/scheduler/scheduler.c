@@ -9,7 +9,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// rms initializer
+// ---------------------- init ----------------------
+
+/*
+ * Initializes the scheduler, selects the scheduling algorithm, and sets the
+ * execution capacity for each tick. It also resets task and job counters,
+ * prepares the list of available job slots, and initializes deadline and
+ * sporadic task statistics.
+ */
 void init(Scheduler *sc, uint32_t sn, SchedulerType type){
 
     if (sc == NULL) {
@@ -39,6 +46,7 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
     sc->sporadic_min_response_ticks = UINT32_MAX;
     sc->sporadic_max_response_ticks = 0;
 
+    // Initialize all job slots as available for future executions.
     for (uint32_t i = 0; i < MAX_JOBS; i++){
         sc->free_index[i] = i;
         sc->jobs[i].active = false;
@@ -47,6 +55,11 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
 
 // ---------------------- add_task ----------------------
 
+/*
+ * Registers a periodic or sporadic task after validating its configuration
+ * and checking that the scheduler has enough space. Only one sporadic task
+ * is allowed per scheduler, so its index is stored for future event releases.
+ */
 bool add_task(Task *task, Scheduler *sc)
 {
     if (sc == NULL || task == NULL) {
@@ -73,6 +86,7 @@ bool add_task(Task *task, Scheduler *sc)
 
     sc->tasks[sc->task_count] = *task;
 
+    // Save the sporadic task index so external events can identify it.
     if (task->type == 'S') {
         sc->sporadic_task_index = sc->task_count;
     }
@@ -82,6 +96,13 @@ bool add_task(Task *task, Scheduler *sc)
     return true;
 }
 
+// ---------------------- get_free_index ----------------------
+
+/*
+ * Retrieves an available job slot and removes it from the free-slot list.
+ * Returns -1 when all slots are occupied, allowing the caller to handle
+ * the failure without accessing an invalid job position.
+ */
 int get_free_index(Scheduler *sc){
     if (sc->free_count == 0){
         return -1;
@@ -92,6 +113,13 @@ int get_free_index(Scheduler *sc){
     return sc->free_index[sc->free_count];
 }
 
+// ---------------------- free_job ----------------------
+
+/*
+ * Deactivates a completed or aborted job and returns its slot to the free
+ * list so it can be reused. The function also updates the number of active
+ * jobs and rejects invalid indices or slots that are already inactive.
+ */
 bool free_job(Scheduler *sc, uint32_t index) {
 
     if (sc == NULL || index >= MAX_JOBS || sc->job_count == 0) {
@@ -103,6 +131,8 @@ bool free_job(Scheduler *sc, uint32_t index) {
     }
 
     sc->jobs[index].active = false;
+
+    // Return the slot to the free list for future job releases.
     sc->free_index[sc->free_count] = index;
     sc->free_count++;
     sc->job_count--;
@@ -110,24 +140,29 @@ bool free_job(Scheduler *sc, uint32_t index) {
     return true;
 }
 
+// ---------------------- release_job ----------------------
+
+/*
+ * Creates a job from a registered task and stores it in an available slot.
+ * The job receives its release tick, absolute deadline, remaining workload,
+ * and active status so the scheduler can select it for execution.
+ */
 bool release_job(Scheduler *sc, uint32_t task_index) {
 
-    // Validate scheduler and task index
+    // Validate the scheduler and the index of the task to release.
     if (sc == NULL || task_index >= sc->task_count) {
         return false;
     }
 
-    // Get original task
     Task *task = &sc->tasks[task_index];
 
-    // Get available job position
+    // Reserve an available slot before creating the new job.
     int job_index = get_free_index(sc);
 
     if (job_index == -1) {
         return false;
     }
 
-    // Initialize new job
     Job *job = &sc->jobs[job_index];
     job->task = task;
     job->release = sc->current_tick;
@@ -139,6 +174,14 @@ bool release_job(Scheduler *sc, uint32_t task_index) {
     return true;
 }
 
+// ---------------------- check_periodic_releases ----------------------
+
+/*
+ * Checks all registered tasks and releases a new job whenever a periodic
+ * task's period matches the current tick. Sporadic tasks are skipped because
+ * their jobs are released by external events instead of periodic intervals.
+ * Returns the number of periodic jobs successfully released.
+ */
 uint32_t check_periodic_releases(Scheduler *sc) {
 
     if (sc == NULL) {
@@ -151,12 +194,13 @@ uint32_t check_periodic_releases(Scheduler *sc) {
 
         Task *current_task = &sc->tasks[i];
 
+        // Sporadic tasks are released only when an event is registered.
         if (current_task->type != 'P') {
             continue;
         }
 
+        // Release a periodic job whenever its period is reached.
         if (sc->current_tick % current_task->T == 0) {
-
             if (release_job(sc, i)) {
                 released++;
             }
@@ -166,6 +210,13 @@ uint32_t check_periodic_releases(Scheduler *sc) {
     return released;
 }
 
+// ---------------------- execute_uts ----------------------
+
+/*
+ * Executes the requested number of work units by repeatedly calling the
+ * workload function. The amount is limited by the caller to respect the
+ * scheduler's execution capacity for the current tick.
+ */
 static void execute_uts(uint32_t amount) {
 
     for (uint32_t i = 0; i < amount; i++) {
@@ -173,47 +224,56 @@ static void execute_uts(uint32_t amount) {
     }
 }
 
+// ---------------------- execute_job_tick ----------------------
+
+/*
+ * Executes part of a selected job according to the available work units
+ * per tick. Updates the remaining workload and, when a sporadic job finishes,
+ * records its response time before releasing the job's storage slot.
+ */
 bool execute_job_tick(Scheduler *sc, int job_index) {
 
-    // Validate scheduler
+    // Validate the scheduler, job index, and execution calibration.
     if (sc == NULL) {
         return false;
     }
 
-    // Validate index
     if (job_index < 0 || job_index >= MAX_JOBS) {
         return false;
     }
 
-    // Validate calibration
     if (sc->sn == 0) {
         return false;
     }
 
     Job *job = &sc->jobs[job_index];
 
-    // Validate Job
+    // Only active jobs with a valid task can be executed.
     if (!job->active || job->task == NULL) {
         return false;
     }
 
-    // Determine how many UTs can be executed
+    // Execute no more work units than the current tick allows.
     uint32_t uts = job->ut_remaining;
 
     if (uts > sc->sn) {
         uts = sc->sn;
     }
 
-    // Execute real workload
     execute_uts(uts);
 
+    // Update the remaining workload after executing the selected work units.
     job->ut_remaining -= uts;
 
     if (job->ut_remaining == 0) {
+
         if (job->task->type == 'S') {
+
+            // Include the release and completion ticks in the response time.
             uint32_t response_ticks =
                 (sc->current_tick - job->release) + 1;
 
+            // Update the number of completions and response-time statistics.
             sc->sporadic_completed_count++;
             sc->sporadic_total_response_ticks += response_ticks;
             sc->sporadic_last_response_ticks = response_ticks;
@@ -227,13 +287,21 @@ bool execute_job_tick(Scheduler *sc, int job_index) {
             }
         }
 
+        // Reuse the job slot after the workload has been completed.
         free_job(sc, (uint32_t)job_index);
     }
 
     return true;
 }
 
-// Selects a job using the configured scheduling algorithm.
+// ---------------------- scheduler_select_job ----------------------
+
+/*
+ * Selects the next active job using the scheduling algorithm configured
+ * during initialization. RMS selects according to fixed task priorities,
+ * while EDF selects according to absolute deadlines. Returns -1 if the
+ * scheduler is invalid or no supported algorithm is configured.
+ */
 int scheduler_select_job(Scheduler *sc)
 {
     if (sc == NULL) {
@@ -252,23 +320,31 @@ int scheduler_select_job(Scheduler *sc)
     }
 }
 
-// Executes one scheduling tick and reports the selected task ID.
+// ---------------------- scheduler_run_tick ----------------------
+
+/*
+ * Executes one scheduler tick by releasing periodic jobs, checking deadline
+ * misses, selecting the next job, and executing its allowed workload.
+ * Returns the selected task ID through the output parameter, or UINT32_MAX
+ * when no job is selected. The tick advances after processing is complete.
+ */
 bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
 {
+    // Validate the scheduler, execution capacity, and output parameter.
     if (sc == NULL || sc->sn == 0 || selected_task_id == NULL) {
         return false;
     }
 
+    // Use UINT32_MAX to indicate that no task has been selected yet.
     *selected_task_id = UINT32_MAX;
 
-    // Release periodic jobs for the current tick.
+    // Release periodic jobs that become ready at the current tick.
     check_periodic_releases(sc);
 
-    // Detect and abort jobs that have missed their deadlines.
+    // Abort jobs whose deadlines have been reached without completion.
     check_deadline_misses(sc);
 
-
-    // Select the highest-priority remaining job.
+    // Select a job according to RMS or EDF.
     int job_index = scheduler_select_job(sc);
 
     if (job_index >= 0) {
@@ -285,12 +361,20 @@ bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
         }
     }
 
+    // Advance the simulation after processing the current tick.
     sc->current_tick++;
 
     return true;
 }
 
-// Detects, records, and aborts jobs that have missed their deadlines.
+// ---------------------- check_deadline_misses ----------------------
+
+/*
+ * Checks all active jobs for deadline violations. When a job reaches its
+ * deadline with work remaining, the scheduler records the missed deadline
+ * and aborts the job so it cannot be selected again. Other active jobs
+ * remain available for subsequent scheduling ticks.
+ */
 static void check_deadline_misses(Scheduler *sc)
 {
     if (sc == NULL) {
@@ -301,42 +385,48 @@ static void check_deadline_misses(Scheduler *sc)
 
         Job *job = &sc->jobs[i];
 
-        // Ignore inactive jobs and invalid task references.
+        // Ignore inactive jobs and jobs without a valid task.
         if (!job->active || job->task == NULL) {
             continue;
         }
 
-        // The job has not missed its deadline yet.
+        // A deadline is not considered missed before its deadline tick.
         if (sc->current_tick < job->deadline) {
             continue;
         }
 
-        // A job with no remaining work has completed successfully.
+        // Release a completed job if it is still marked as active.
         if (job->ut_remaining == 0) {
             free_job(sc, i);
             continue;
         }
 
-        // Record the deadline miss.
+        // Store information about the latest missed deadline.
         sc->deadline_missed = true;
         sc->deadline_miss_count++;
         sc->last_missed_task_id = job->task->id;
         sc->last_missed_deadline = job->deadline;
 
-        // Abort the job so it cannot be selected again.
+        // Abort the job and return its slot to the free list.
         free_job(sc, i);
     }
 }
 
 // ---------------------- scheduler_register_sporadic_event ----------------------
 
+/*
+ * Registers an event for the scheduler's sporadic task and releases a new
+ * job if the minimum inter-arrival interval has elapsed. Events that arrive
+ * too early are rejected and counted. If no sporadic task is registered or
+ * no job slot is available, the function returns false.
+ */
 bool scheduler_register_sporadic_event(Scheduler *sc)
 {
     if (sc == NULL) {
         return false;
     }
 
-    // A sporadic task must be registered first.
+    // A sporadic task must be registered before its events can be accepted.
     if (sc->sporadic_task_index == UINT32_MAX) {
         return false;
     }
@@ -344,9 +434,10 @@ bool scheduler_register_sporadic_event(Scheduler *sc)
     uint32_t task_index = sc->sporadic_task_index;
     Task *task = &sc->tasks[task_index];
 
-    // Reject events that arrive before the minimum inter-arrival interval.
+    // Reject events that occur before the task's minimum inter-arrival time.
     if (sc->sporadic_has_released) {
-        uint32_t elapsed_ticks = sc->current_tick - sc->sporadic_last_release_tick;
+        uint32_t elapsed_ticks =
+            sc->current_tick - sc->sporadic_last_release_tick;
 
         if (elapsed_ticks < task->T) {
             sc->sporadic_rejected_count++;
@@ -354,7 +445,7 @@ bool scheduler_register_sporadic_event(Scheduler *sc)
         }
     }
 
-    // Release a job for the accepted event.
+    // Create a job for the event; update release information only on success.
     if (!release_job(sc, task_index)) {
         return false;
     }

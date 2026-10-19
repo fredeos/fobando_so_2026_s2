@@ -4,6 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// ---------------------- edf_select_job ----------------------
+
+/*
+ * Searches for the active job with the earliest absolute deadline.
+ * If deadlines are equal, prioritizes the oldest release, then the lowest task ID.
+ * Returns the selected job index, or -1 if no valid active job is available.
+ */
 int edf_select_job(Scheduler *sc) {
 
     if (sc == NULL) {
@@ -21,12 +28,12 @@ int edf_select_job(Scheduler *sc) {
             continue;
         }
 
-        // Ignore invalid task references
+        // Ignore jobs without a valid task reference
         if (current->task == NULL) {
             continue;
         }
 
-        // First active job
+        // Select the first valid active job
         if (selected == -1) {
             selected = (int)i;
             continue;
@@ -34,24 +41,23 @@ int edf_select_job(Scheduler *sc) {
 
         Job *best = &sc->jobs[selected];
 
-        // Calculate absolute deadlines
         uint32_t current_deadline = current->deadline;
         uint32_t best_deadline = best->deadline;
 
-        // EDF: earliest deadline has highest priority
+        // Prioritize the job with the earliest absolute deadline
         if (current_deadline < best_deadline) {
             selected = (int)i;
         }
 
-        // Tie: same deadline
+        // Resolve jobs with the same deadline
         else if (current_deadline == best_deadline) {
 
-            // Oldest release first
+            // Prioritize the job released first
             if (current->release < best->release) {
                 selected = (int)i;
             }
 
-            // Same release: lowest task ID
+            // If releases are equal, prioritize the lowest task ID
             else if (current->release == best->release &&
                      current->task->id < best->task->id) {
                 selected = (int)i;
@@ -61,5 +67,3 @@ int edf_select_job(Scheduler *sc) {
 
     return selected;
 }
-
-
