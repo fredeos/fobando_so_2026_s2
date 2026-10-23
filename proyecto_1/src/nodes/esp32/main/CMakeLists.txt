@@ -1,15 +1,19 @@
+file(GLOB COMMON_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c"
+)
+
 idf_component_register(
-    SRCS
+    SRCS 
         "main.c"
-        "../src/calibrator.c"
-        "../../../common/ut.c"
+        ${COMMON_SOURCES}
+        "gpio/gpio.c"
+        "serial/serial.c"
 
-    INCLUDE_DIRS
+    INCLUDE_DIRS 
         "."
-        "../src"
         "../../../../include"
-
-    REQUIRES
+    
+    REQUIRES 
         esp_driver_uart
-        esp_timer
+        esp_driver_gpio
 )
