@@ -9,7 +9,7 @@
  * 
 */
 int board_gpio_init(uint32_t _pin, gpio_direction_t _mode){
-    gpio_init(pin);
+    gpio_init(_pin);
 
     gpio_set_dir(
         _pin,

@@ -8,41 +8,29 @@
 #include "gpio/gpio.h"
 
 #define LED0 26
+#define LED1 25
+
 #define UART_PORT   UART_NUM_0
 #define BAUD_RATE   115200
 #define BUFFER_SIZE 128
 #define MESSAGE_LEN 64
 
-void app_main(void)
-{
-    // UART0 is commonly connected to the DevKit USB-UART bridge.
-    // GPIO pins are left at their existing UART assignments.
-    const uart_config_t config = {
-        .baud_rate = BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT
-    };
-
-    ESP_ERROR_CHECK(
-        uart_driver_install(UART_PORT, 1024, 0, 0, NULL, 0)
-    );
-
-    ESP_ERROR_CHECK(
-        uart_param_config(UART_PORT, &config)
-    );
-
-    uart_flush_input(UART_PORT);
-    // Keep application logs off the serial protocol channel.
-    esp_log_level_set("*", ESP_LOG_NONE);
-
+void app_main(void){
+    bool setup_fail = false;
     // << Setup ESP32 serial interface >>
-    esp32_uart_t uart = {
+    esp32_uart_t uart;
+    esp32_uart_configs_t uart_conf = {
         .port_num = UART_PORT,
-        .ticks = pdMS_TO_TICKS(100)
+        .baudrate = SERIAL_BAUDRATE,
+        .rx_buffer_size = 1024,
+        .tx_buffer_size = 0,
+        .tick_ms = 100
     };
+
+    serial_errno_t conf_errno = serial_configure(
+        &uart, &uart_conf
+    );
+    setup_fail = (conf_errno != SERIAL_OK);
 
     uint8_t in[BUFFER_SIZE];
     serial_packet_t input = {
@@ -61,6 +49,12 @@ void app_main(void)
         .complete =  false,
         .processed = 0
     };
+    // << Setup GPIO >>
+    board_gpio_init(LED0, GPIO_OUTPUT);
+    board_gpio_init(LED1, GPIO_OUTPUT);
+    
+    board_gpio_write(LED0, GPIO_LOW);
+    board_gpio_write(LED1, GPIO_LOW);
     // << Setup basic messages >>
     const char *pong = "PONG from ESP32";
     const char *heartbeat = "HEARTBEAT from ESP32";
@@ -71,7 +65,11 @@ void app_main(void)
     // << Procedure loop >>
     int send_events = 2;
     int recv_type = 0;
+
+    if (setup_fail) board_gpio_write(LED0, GPIO_HIGH);
+    else board_gpio_write(LED1, GPIO_HIGH);
     while (1) {
+        if (setup_fail) continue;
         // [Read from serial]
         // read bytes
         size_t rd = 0;

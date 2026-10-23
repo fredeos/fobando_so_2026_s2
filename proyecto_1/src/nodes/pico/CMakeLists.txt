@@ -27,8 +27,21 @@ project(pico C CXX ASM)
 
 pico_sdk_init()
 
+file(GLOB COMMON_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c"
+)
+
 add_executable(pico
     main.c
+
+    ${COMMON_SOURCES}
+
+    gpio/gpio.c
+    serial/serial.c
+)
+
+target_include_directories(pico PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../../../include
 )
 
 target_link_libraries(pico
