@@ -48,6 +48,9 @@ TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
+EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
+REPORT_TEST := $(OUT_DIR)/test_report
+REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
 
 # ============================================================
 # COMPILER FLAGS
@@ -123,6 +126,14 @@ FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
 MESSAGE_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_message_parser.o
+EVENT_QUEUE_TEST_OBJ := $(BUILD_DIR)/tests/test_event_queue.o
+REPORT_TEST_OBJ := $(BUILD_DIR)/tests/test_report.o
+REPORT_SESSION_TEST_OBJ := $(BUILD_DIR)/tests/test_report_session.o
+
+EVENT_QUEUE_OBJ := $(BUILD_DIR)/host/ipc/event_queue.o
+REPORT_OBJS := $(BUILD_DIR)/host/report/report.o \
+               $(BUILD_DIR)/host/report/statistics.o \
+               $(BUILD_DIR)/host/report/gantt.o
 
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
@@ -131,7 +142,10 @@ TEST_OBJS := \
     $(TASK_PARSER_TEST_OBJ) \
     $(FAILOVER_TEST_OBJ) \
     $(MANUAL_TEST_OBJ) \
-    $(MESSAGE_PARSER_TEST_OBJ)
+    $(MESSAGE_PARSER_TEST_OBJ) \
+    $(EVENT_QUEUE_TEST_OBJ) \
+    $(REPORT_TEST_OBJ) \
+    $(REPORT_SESSION_TEST_OBJ)
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -145,7 +159,7 @@ DEPS := $(sort \
 # PHONY TARGETS
 # ============================================================
 
-.PHONY: all run demo debug release test clean
+.PHONY: all run demo reports-demo debug release test clean
 
 # ============================================================
 # DEFAULT BUILD
@@ -247,13 +261,30 @@ $(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
+# Cola compartida, reconstrucción de reportes y coordinación de cierre
+$(EVENT_QUEUE_TEST): $(EVENT_QUEUE_TEST_OBJ) $(EVENT_QUEUE_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(REPORT_TEST): $(REPORT_TEST_OBJ) $(EVENT_QUEUE_OBJ) $(REPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(REPORT_SESSION_TEST): $(REPORT_SESSION_TEST_OBJ) $(EVENT_QUEUE_OBJ) \
+                        $(REPORT_OBJS) $(BUILD_DIR)/host/report/session.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
 test: $(FOUNDATION_TEST) \
       $(PLANNER_TEST) \
       $(CONFIG_TEST) \
       $(TASK_PARSER_TEST) \
       $(FAILOVER_TEST) \
       $(MANUAL_TEST) \
-      $(MESSAGE_PARSER_TEST)
+      $(MESSAGE_PARSER_TEST) \
+      $(EVENT_QUEUE_TEST) \
+      $(REPORT_TEST) \
+      $(REPORT_SESSION_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
@@ -261,6 +292,9 @@ test: $(FOUNDATION_TEST) \
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
 	./$(MESSAGE_PARSER_TEST)
+	./$(EVENT_QUEUE_TEST)
+	./$(REPORT_TEST)
+	./$(REPORT_SESSION_TEST)
 
 # ============================================================
 # RUN HOST
@@ -275,6 +309,10 @@ run: $(TARGET)
 
 demo: $(TARGET)
 	./$(TARGET) --demo config/system.conf 100 40
+
+# Dos productores simulados y un consumidor de reportes; q detiene la sesión
+reports-demo: $(TARGET)
+	./$(TARGET) --report-demo
 
 # ============================================================
 # DEBUG BUILD
