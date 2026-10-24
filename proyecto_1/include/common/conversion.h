@@ -15,6 +15,7 @@ void write_u16_be(
     uint8_t* dst,
     uint16_t value
 );
+
 void write_u32_be(
     uint8_t* dst,
     uint32_t value

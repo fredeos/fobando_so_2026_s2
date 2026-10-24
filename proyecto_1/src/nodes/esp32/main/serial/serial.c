@@ -77,15 +77,13 @@ serial_errno_t serial_write(
     );
     if (n < 0)
         return SERIAL_FAILURE;   // Error: failed to send data
-    if (n == 0)
-        return SERIAL_NO_DATA;   // Exit: no data read
     // << Detect if full packet sent >>
     size_t wd = (size_t) n;
     _packet->processed += wd;
     _packet->complete = (_packet->processed == _packet->length);
     // << Return >>
     *wd_bytes = wd;
-    return SERIAL_OK;
+    return (n == 0) ? SERIAL_NO_DATA : SERIAL_OK;
 }
 
 // ======================================================================================
@@ -120,15 +118,13 @@ serial_errno_t serial_read(
     );
     if (n < 0)
         return SERIAL_FAILURE;   // Error: failed to read data
-    if (n == 0)
-        return SERIAL_NO_DATA;   // Exit: no data read
     // << Detect if full packet received >>
     size_t rd = (size_t) n;
     _packet->processed += rd;
     _packet->complete = (_packet->processed == _packet->length);
     // << Return >>
     *rd_bytes = rd;
-    return SERIAL_OK;
+    return (n == 0) ? SERIAL_NO_DATA : SERIAL_OK;
 }
 
 // =====================================================================================
