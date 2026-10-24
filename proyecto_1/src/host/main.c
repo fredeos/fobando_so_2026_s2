@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "serial/serial.h"
+#include "serial/posix.h"
 
 #define BUFFER_LEN  128u
 #define MESSAGE_LEN 64u
@@ -19,43 +20,24 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s /dev/ttyUSB0\n", argv[0]);
         return 1;
     }
-    // << Configure serial port >>
-    int fd = open(argv[1], O_RDWR | O_NOCTTY);
-    if (fd < 0) {
-        perror("open");
-        return 1;
-    }
+    // << Configure serial interface >>
+    // [Configure]
+    bool setup_fail = false;
+    const char* dev = argv[1];
 
-    struct termios tty;
-    if (tcgetattr(fd, &tty) != 0) {
-        perror("tcgetattr");
-        close(fd);
-        return 1;
-    }
+    int fd;
+    posix_serial_config_t ser_conf = {
+        .device = dev,
+        .baudrate = SERIAL_BAUDRATE
+    };
 
-    cfmakeraw(&tty);
-    cfsetispeed(&tty, B115200);
-    cfsetospeed(&tty, B115200);
+    serial_errno_t conf_errno = serial_configure(
+        &fd,
+        &ser_conf
+    );
+    setup_fail = (conf_errno != SERIAL_OK);
 
-    tty.c_cflag |= CLOCAL | CREAD;
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CRTSCTS;
-    tty.c_cflag &= ~PARENB;
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;
-
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 10;  // 1-second read timeout
-
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        perror("tcsetattr");
-        close(fd);
-        return 1;
-    }
-
-    tcflush(fd, TCIOFLUSH);
-
-    // << Configure serial packets >>
+    // [Packets]
     uint8_t in[BUFFER_LEN];
     serial_packet_t input = {
         .mode   = SERIAL_IN,
@@ -83,7 +65,10 @@ int main(int argc, char *argv[])
     int recv_events = 0;
     int send_events = 0;
     int alt = false;
-    while (1){
+
+    if (setup_fail) printf("Something went wrong when setting serial communication!\n");
+    else printf("Starting procedure...\n");
+    while (!setup_fail){
         if (recv_events == 5)
             break;
         // [Read from serial]

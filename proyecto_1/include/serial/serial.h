@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define SERIAL_BAUDRATE 115200
+
 /* NOTE: this header file serves as base interface for different implementations for serial communication,
 for example a Linux device will use its own implementation while microntrollers will implement their own*/
 
@@ -47,6 +49,16 @@ typedef struct {
     size_t processed; // number of processed bytes
     bool complete;    // indicator for full packet processed
 } serial_packet_t;
+// ============================================================================================
+/*
+ * Load device specific configurations for serial communication interface
+ * 
+ * _obj: pointer to data or structure where configurations will be saved
+ * _config: point to data or structure to extract configurations
+ * 
+*/
+serial_errno_t serial_configure(void* _obj, void* _config);
+
 // ============================================================================================
 /* 
  * Write content via serial interface. Automatically returns if packet already complete.

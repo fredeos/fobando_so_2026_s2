@@ -27,29 +27,22 @@ project(pico C CXX ASM)
 
 pico_sdk_init()
 
-# -----------------------------------------------------------------------------------
-# Executable
-# -----------------------------------------------------------------------------------
-
-add_executable(pico
-    src/main.c
-    src/calibrator.c
-    ../../common/ut.c
+file(GLOB COMMON_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c"
 )
 
+add_executable(pico
+    main.c
 
-# -----------------------------------------------------------------------------------
-# Include directories
-# -----------------------------------------------------------------------------------
+    ${COMMON_SOURCES}
+
+    gpio/gpio.c
+    serial/serial.c
+)
 
 target_include_directories(pico PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../../include
-    ${CMAKE_CURRENT_LIST_DIR}/src
 )
-
-# -----------------------------------------------------------------------------------
-# Libraries
-# -----------------------------------------------------------------------------------
 
 target_link_libraries(pico
     pico_stdlib

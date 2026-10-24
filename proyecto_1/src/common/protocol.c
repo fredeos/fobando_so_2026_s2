@@ -1,5 +1,6 @@
 #include "common/protocol.h"
 
+// =================================================================================================
 /*
  * Implementación del CRC-16/CCITT-FALSE.
  *
@@ -11,8 +12,7 @@
 uint16_t protocol_crc16(
     const uint8_t *data,
     size_t length
-)
-{
+){
     uint16_t crc = 0xFFFFu;
 
     // Procesar cada byte
