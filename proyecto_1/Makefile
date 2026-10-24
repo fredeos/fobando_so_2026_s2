@@ -47,6 +47,7 @@ CONFIG_TEST := $(OUT_DIR)/test_config
 TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
+MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
 
 # ============================================================
 # COMPILER FLAGS
@@ -56,7 +57,8 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -std=c17 \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
-          -Iinclude
+          -Iinclude \
+          -Ithird_party/coreJSON
 
 ifeq ($(MODE),release)
     CFLAGS += -O2
@@ -84,6 +86,10 @@ SOURCES := $(foreach dir,$(SOURCE_DIRS),\
 
 OBJS := $(patsubst \
     $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+
+# Biblioteca JSON común a Linux, ESP32 y Pico
+CORE_JSON_OBJ := $(BUILD_DIR)/third_party/coreJSON/core_json.o
+OBJS += $(CORE_JSON_OBJ)
 
 # ============================================================
 # PLANNER DEPENDENCIES
@@ -116,6 +122,7 @@ TASK_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_task_parser.o
 FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
+MESSAGE_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_message_parser.o
 
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
@@ -123,7 +130,8 @@ TEST_OBJS := \
     $(CONFIG_TEST_OBJ) \
     $(TASK_PARSER_TEST_OBJ) \
     $(FAILOVER_TEST_OBJ) \
-    $(MANUAL_TEST_OBJ)
+    $(MANUAL_TEST_OBJ) \
+    $(MESSAGE_PARSER_TEST_OBJ)
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -158,6 +166,10 @@ $(TARGET): $(OBJS)
 # ============================================================
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(CORE_JSON_OBJ): third_party/coreJSON/core_json.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -228,18 +240,27 @@ $(MANUAL_TEST): $(MANUAL_TEST_OBJ) \
 # RUN ALL TESTS
 # ============================================================
 
+# Parser de contenido, independiente del protocolo serial
+$(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
+                        $(BUILD_DIR)/common/message_parser.o \
+                        $(CORE_JSON_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
 test: $(FOUNDATION_TEST) \
       $(PLANNER_TEST) \
       $(CONFIG_TEST) \
       $(TASK_PARSER_TEST) \
       $(FAILOVER_TEST) \
-      $(MANUAL_TEST)
+      $(MANUAL_TEST) \
+      $(MESSAGE_PARSER_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
 	./$(TASK_PARSER_TEST)
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
+	./$(MESSAGE_PARSER_TEST)
 
 # ============================================================
 # RUN HOST

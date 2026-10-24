@@ -28,13 +28,14 @@ project(pico C CXX ASM)
 pico_sdk_init()
 
 file(GLOB COMMON_SOURCES
-    "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c"
+    "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c"
 )
 
 add_executable(pico
     main.c
 
     ${COMMON_SOURCES}
+    ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON/core_json.c
 
     gpio/gpio.c
     serial/serial.c
@@ -42,6 +43,7 @@ add_executable(pico
 
 target_include_directories(pico PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../../include
+    ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON
 )
 
 target_link_libraries(pico
