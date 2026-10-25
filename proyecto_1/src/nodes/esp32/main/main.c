@@ -15,7 +15,7 @@
 
 #define UART_PORT   UART_NUM_0
 
-#define MESSAGE_LEN 64
+#define MESSAGE_LEN 80
 
 void app_main(void){
     bool setup_fail = false;
@@ -61,6 +61,7 @@ void app_main(void){
     // << Setup basic messages >>
     const char *pong = "PONG from ESP32";
     const char *default_msg = "ESP32 didn't understand message";
+    const char *polo = "POLO from ESP32";
     
     char message [MESSAGE_LEN];
     char response[MESSAGE_LEN];
@@ -101,6 +102,8 @@ void app_main(void){
                     // (Check message)
                     if (strcmp(message, "PING") == 0 && rx_frame.relevance == 0)
                         msg = pong;
+                    else if (strcmp(message, "MARCO") == 0 && rx_frame.relevance > 0)
+                        msg = polo;
                 }
                 // [Setup response]
                 uint32_t size = strlen(msg) + 1; // copy response until '\0'
