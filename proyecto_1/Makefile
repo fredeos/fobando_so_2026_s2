@@ -47,9 +47,10 @@ CONFIG_TEST := $(OUT_DIR)/test_config
 TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
-SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
-RMS_TEST := $(OUT_DIR)/test_rms
-EDF_TEST := $(OUT_DIR)/test_edf
+MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
+EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
+REPORT_TEST := $(OUT_DIR)/test_report
+REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
 
 # ============================================================
 # COMPILER FLAGS
@@ -60,6 +61,7 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
           -Iinclude \
+          -Ithird_party/coreJSON \
           -Isrc/nodes/scheduler
 
 ifeq ($(MODE),release)
@@ -88,6 +90,10 @@ SOURCES := $(foreach dir,$(SOURCE_DIRS),\
 
 OBJS := $(patsubst \
     $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+
+# Biblioteca JSON común a Linux, ESP32 y Pico
+CORE_JSON_OBJ := $(BUILD_DIR)/third_party/coreJSON/core_json.o
+OBJS += $(CORE_JSON_OBJ)
 
 # ============================================================
 # PLANNER DEPENDENCIES
@@ -120,6 +126,15 @@ TASK_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_task_parser.o
 FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
+MESSAGE_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_message_parser.o
+EVENT_QUEUE_TEST_OBJ := $(BUILD_DIR)/tests/test_event_queue.o
+REPORT_TEST_OBJ := $(BUILD_DIR)/tests/test_report.o
+REPORT_SESSION_TEST_OBJ := $(BUILD_DIR)/tests/test_report_session.o
+
+EVENT_QUEUE_OBJ := $(BUILD_DIR)/host/ipc/event_queue.o
+REPORT_OBJS := $(BUILD_DIR)/host/report/report.o \
+               $(BUILD_DIR)/host/report/statistics.o \
+               $(BUILD_DIR)/host/report/gantt.o
 
 SCHEDULER_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_scheduler.o
 
@@ -141,7 +156,11 @@ TEST_OBJS := \
     $(CONFIG_TEST_OBJ) \
     $(TASK_PARSER_TEST_OBJ) \
     $(FAILOVER_TEST_OBJ) \
-    $(MANUAL_TEST_OBJ)
+    $(MANUAL_TEST_OBJ) \
+    $(MESSAGE_PARSER_TEST_OBJ) \
+    $(EVENT_QUEUE_TEST_OBJ) \
+    $(REPORT_TEST_OBJ) \
+    $(REPORT_SESSION_TEST_OBJ)
 	
 
 # ============================================================
@@ -162,7 +181,7 @@ DEPS := $(sort \
 # PHONY TARGETS
 # ============================================================
 
-.PHONY: all run demo debug release test test-scheduler test-rms test-edf clean
+.PHONY: all run demo reports-demo debug release test test-scheduler test-rms test-edf clean
 
 # ============================================================
 # DEFAULT BUILD
@@ -183,6 +202,10 @@ $(TARGET): $(OBJS)
 # ============================================================
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(CORE_JSON_OBJ): third_party/coreJSON/core_json.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -289,6 +312,27 @@ $(EDF_TEST): $(EDF_TEST_OBJ) \
 # RUN ALL TESTS
 # ============================================================
 
+# Parser de contenido, independiente del protocolo serial
+$(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
+                        $(BUILD_DIR)/common/message_parser.o \
+                        $(CORE_JSON_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+# Cola compartida, reconstrucción de reportes y coordinación de cierre
+$(EVENT_QUEUE_TEST): $(EVENT_QUEUE_TEST_OBJ) $(EVENT_QUEUE_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(REPORT_TEST): $(REPORT_TEST_OBJ) $(EVENT_QUEUE_OBJ) $(REPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(REPORT_SESSION_TEST): $(REPORT_SESSION_TEST_OBJ) $(EVENT_QUEUE_OBJ) \
+                        $(REPORT_OBJS) $(BUILD_DIR)/host/report/session.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
 test: $(FOUNDATION_TEST) \
       $(PLANNER_TEST) \
       $(CONFIG_TEST) \
@@ -297,13 +341,21 @@ test: $(FOUNDATION_TEST) \
       $(MANUAL_TEST) \
       $(SCHEDULER_TEST) \
       $(RMS_TEST) \
-      $(EDF_TEST)
+      $(EDF_TEST) \
+      $(MESSAGE_PARSER_TEST) \
+      $(EVENT_QUEUE_TEST) \
+      $(REPORT_TEST) \
+      $(REPORT_SESSION_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
 	./$(TASK_PARSER_TEST)
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
+	./$(MESSAGE_PARSER_TEST)
+	./$(EVENT_QUEUE_TEST)
+	./$(REPORT_TEST)
+	./$(REPORT_SESSION_TEST)
 	./$(SCHEDULER_TEST)
 	./$(RMS_TEST)
 	./$(EDF_TEST)
@@ -344,6 +396,10 @@ run: $(TARGET)
 
 demo: $(TARGET)
 	./$(TARGET) --demo config/system.conf 100 40
+
+# Dos productores simulados y un consumidor de reportes; q detiene la sesión
+reports-demo: $(TARGET)
+	./$(TARGET) --report-demo
 
 # ============================================================
 # DEBUG BUILD

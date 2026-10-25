@@ -5,19 +5,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "serial/serial.h"
 #include "serial/posix.h"
+#include "host/report_session.h"
 
 #define BUFFER_LEN  128u
 #define MESSAGE_LEN 64u
 
 int main(int argc, char *argv[])
 {
+    /* Modo aislado para verificar reportes y cierre sin hardware ni protocolo */
+    if (argc >= 2 && strcmp(argv[1], "--report-demo") == 0) {
+        if (argc > 3) {
+            fprintf(stderr, "Usage: %s --report-demo [output_directory]\n", argv[0]);
+            return 1;
+        }
+        char directory[128];
+        if (argc == 2 && mkdir("output", 0775) != 0 && errno != EEXIST) {
+            perror("output");
+            return 1;
+        }
+        snprintf(directory, sizeof(directory), "output/report_%ld_%ld", (long)time(NULL), (long)getpid());
+        return report_demo_run(argc == 3 ? argv[2] : directory);
+    }
+
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s /dev/ttyUSB0\n", argv[0]);
+        fprintf(stderr, "Usage: %s /dev/ttyUSB0 | --report-demo [output_directory]\n", argv[0]);
         return 1;
     }
     // << Configure serial interface >>
