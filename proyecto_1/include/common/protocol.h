@@ -193,6 +193,15 @@ typedef struct {
 } protocol_tx_t;
 
 /*
+ * Inicializar componentes de transmision
+ *
+*/
+protocol_errno_t protocol_tx_init(
+    protocol_tx_t* tx,
+    serial_packet_t* packet
+);
+
+/*
  * Solicitar actualizacion de maquina de estados de transmision. Avanza
  * progreso de transmision.
  * 
@@ -241,6 +250,15 @@ typedef struct {
     size_t offset;  // offset de RX en lectura del encabezado
     size_t count;   // contador de RX para lecturas de encabezado
 } protocol_rx_t;
+
+/*
+ * Inicializar componentes de recepcion
+ *
+*/
+protocol_errno_t protocol_rx_init(
+    protocol_rx_t* rx,
+    serial_packet_t* packet
+);
 
 
 /*

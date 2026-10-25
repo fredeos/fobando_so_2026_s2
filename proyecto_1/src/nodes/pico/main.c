@@ -4,12 +4,14 @@
 
 #include "serial/pico.h"
 #include "serial/serial.h"
+#include "common/protocol.h"
 #include "gpio/gpio.h"
 
-#define LED0 25
-#define LED1 26
+#define LED0 26
+#define LED1 25
+#define LED2 33
+#define LED3 32
 
-#define BUFFER_SIZE 128
 #define MESSAGE_LEN 64
 
 void main(void){
@@ -26,128 +28,105 @@ void main(void){
         &serial_conf
     );
 
-    setup_fail = (conf_errno != SERIAL_OK);
-    // << Setup input packet >>
-    uint8_t in[BUFFER_SIZE];
-    serial_packet_t input = {
-        .mode = SERIAL_IN,
-        .buffer = in,
-        .length = sizeof(in),
-        .complete = false,
-        .processed = 0
-    };
+    if (!setup_fail) setup_fail = (conf_errno != SERIAL_OK);
+    // << Setup the protocol interface >>
+    // [TX:output]
+    protocol_frame_t tx_frame;
+    protocol_tx_t tx;
+    serial_packet_t tx_packet;
+    protocol_errno_t tx_setup_errno = protocol_tx_init(&tx, &tx_packet);
 
-    // << Setup output packet >>
-    uint8_t out[BUFFER_SIZE];
-    serial_packet_t output = {
-        .mode = SERIAL_OUT,
-        .buffer = out,
-        .length = sizeof(out),
-        .complete = false,
-        .processed = 0
-    };
+    // [RX:input]
+    protocol_frame_t rx_frame;
+    protocol_rx_t rx;
+    serial_packet_t rx_packet;
+    protocol_errno_t rx_setup_errno = protocol_rx_init(&rx, &rx_packet);
 
+    if (!setup_fail) setup_fail = (tx_setup_errno != PROTOCOL_OK || rx_setup_errno != PROTOCOL_OK);
     // << Setup GPIO >>
     board_gpio_init(LED0, GPIO_OUTPUT);
     board_gpio_init(LED1, GPIO_OUTPUT);
-
+    board_gpio_init(LED2, GPIO_OUTPUT);
+    board_gpio_init(LED3, GPIO_OUTPUT);
+    
     board_gpio_write(LED0, GPIO_LOW);
     board_gpio_write(LED1, GPIO_LOW);
+    board_gpio_write(LED2, GPIO_LOW);
+    board_gpio_write(LED3, GPIO_LOW);
     // << Setup basic messages >>
-    const char *pong ="PONG from Pico";
-    const char *heartbeat = "HEARTBEAT from Pico";
-    const char *default_msg = "Pico didn't understand message";
-
-    char message[MESSAGE_LEN];
+    const char *pong = "PONG from ESP32";
+    const char *default_msg = "ESP32 didn't understand message";
+    
+    char message [MESSAGE_LEN];
     char response[MESSAGE_LEN];
     // << Procedure loop >>
-    int send_events = 2;
-    int recv_type = 0;
+    int state = 0;
 
     if (setup_fail) board_gpio_write(LED0, GPIO_HIGH);
     else board_gpio_write(LED1, GPIO_HIGH);
     while (1) {
         if (setup_fail) continue;
-        // [Read from serial]
-        size_t rd = 0;
-        serial_errno_t rd_errno = serial_read(
-            &serial,
-            &input,
-            &rd
-        );
-
-        if (rd_errno == SERIAL_FAILURE)
-            serial_restart_packet(&input);
-
-        if (input.complete) {
-            // Convert bytes
-            char *buffer = (char *)in;
-            for (unsigned int i = 0; i < sizeof(response); i++) {
-                char ch = buffer[i];
-                if (ch == '\n')
-                    response[i] = '\0';
-                else
-                    response[i] = ch;
-            }
-            // Restart packet for next message
-            serial_restart_packet(&input);
-            // Check response
-            if (strcmp(response, "PING") == 0) {
-                recv_type = 1;
-                if (send_events == 2)send_events = 0;
-            } else if (strcmp(response, "CHECK") == 0) {
-                recv_type = 2;
-                if (send_events == 2) send_events = 0;
-            }
-        }
-
-        // [Send with serial]
-        if (send_events == 0) {
-            // Select message
-            const char *msg = default_msg;
-            if (recv_type == 1) msg = pong;
-            if (recv_type == 2) msg = heartbeat;
-            size_t len = strlen(msg);
-
-            // Build message
-            for (size_t i = 0; i < sizeof(message); i++) {
-                if (i < len)
-                    message[i] = msg[i];
-                else if (i == len)
-                    message[i] = '\n';
-                else
-                    message[i] = '\0';
-            }
-
-            // Set output buffer
-            const uint8_t *buffer = (uint8_t *)message;
-            for (size_t i = 0; i < sizeof(out); i++) {
-                if (i < sizeof(message))
-                    out[i] = buffer[i];
-                else
-                    out[i] = 0x00u;
-            }
-
-            // Move to send
-            send_events = 1;
-        }
-
-        if (send_events == 1) { 
-            // Send message
-            size_t wd = 0;
-            serial_errno_t wd_errno = serial_write(
+        // [RX state]
+        if (state == 0){
+            board_gpio_write(LED2, GPIO_HIGH);
+            board_gpio_write(LED3, GPIO_LOW);
+            // [Poll RX state machine]
+            protocol_errno_t rx_errno = protocol_rx_poll(
                 &serial,
-                &output,
-                &wd
+                &rx,
+                &rx_packet
             );
+            // [Check RX]
+            if (rx.complete){
+                // [Check message]
+                const char *msg = default_msg;
+                if (rx.valid){
+                    // (Read buffer to frame)
+                    protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
+                        &rx_frame,
+                        rx.buffer,
+                        sizeof(rx.buffer)
+                    );
+                    // (Load to message)
+                    memcpy(
+                        message,
+                        rx_frame.payload,
+                        rx_frame.length
+                    );
+                    // (Check message)
+                    if (strcmp(message, "PING") == 0 && rx_frame.relevance == 0)
+                        msg = pong;
+                }
+                // [Setup response]
+                uint32_t size = strlen(msg) + 1; // copy response until '\0'
 
-            if (wd_errno == SERIAL_FAILURE)
-                serial_restart_packet(&output);
+                tx_frame.relevance = 0;
+                tx_frame.length = size;
+                memcpy(tx_frame.payload, msg, size);
 
-            if (output.complete) {
-                serial_restart_packet(&output);
-                // Move to wait
-                send_events = 2;
+                protocol_errno_t tx_frame_errno = protocol_set_frame_to_buffer(
+                    &tx_frame,
+                    tx.buffer,
+                    sizeof(tx.buffer)
+                );
+                // [Move to TX]
+                state = 1;
+            }
+        }
+        // [TX state]
+        if (state == 1){
+            board_gpio_write(LED2, GPIO_LOW);
+            board_gpio_write(LED3, GPIO_HIGH);
+            // [Poll TX state machine]
+            protocol_errno_t tx_errno = protocol_tx_poll(
+                &serial,
+                &tx,
+                &tx_packet
+            );
+            // [Check TX]
+            if (tx.complete && tx.valid){
+                // [Move to RX]
+                state = 0;
             }
         }
     }

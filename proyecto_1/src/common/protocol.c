@@ -138,6 +138,32 @@ protocol_errno_t protocol_set_buffer_to_frame(
 
 // =================================================================================================
 
+protocol_errno_t protocol_tx_init(
+    protocol_tx_t* tx,
+    serial_packet_t* packet
+){
+    // << Excepcions >>
+    if (tx == NULL || packet == NULL)
+        return PROTOCOL_INVALID_ARG;
+    // << Configuracion de paquete >>
+    packet->mode = SERIAL_OUT,
+    packet->buffer = NULL,
+    packet->length = 0,
+    packet->complete = false;
+    packet->processed = 0;
+    // << Configuracion de TX >>
+    tx->complete = false;
+    tx->valid = false;
+    tx->state = PROTOCOL_TX_INIT;
+    tx->ack_state = PROTOCOL_ACK_UNKNOWN;
+    tx->rd_busy = false;
+    tx->wd_busy = false;
+    tx->offset = 0;
+    tx->count = 0;
+    // << Retorno >>
+    return PROTOCOL_OK;
+}
+
 protocol_errno_t protocol_tx_poll(
     void* obj,
     protocol_tx_t*  tx,
@@ -358,6 +384,32 @@ protocol_errno_t protocol_tx_poll(
 }
 
 // =================================================================================================
+
+protocol_errno_t protocol_rx_init(
+    protocol_rx_t* rx,
+    serial_packet_t* packet
+){
+    // << Excepcions >>
+    if (rx == NULL || packet == NULL)
+        return PROTOCOL_INVALID_ARG;
+    // << Configuracion de paquete >>
+    packet->mode = SERIAL_IN,
+    packet->buffer = NULL,
+    packet->length = 0,
+    packet->complete = false;
+    packet->processed = 0;
+    // << Configuracion de TX >>
+    rx->complete = false;
+    rx->valid = false;
+    rx->state = PROTOCOL_RX_INIT;
+    rx->ack_state = PROTOCOL_ACK_UNKNOWN;
+    rx->rd_busy = false;
+    rx->wd_busy = false;
+    rx->offset = 0;
+    rx->count = 0;
+    // << Retorno >>
+    return PROTOCOL_OK;
+}
 
 protocol_errno_t protocol_rx_poll(
     void* obj,

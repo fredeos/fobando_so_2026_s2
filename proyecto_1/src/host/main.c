@@ -40,43 +40,17 @@ int main(int argc, char *argv[])
     // << Setup protocol interface
     // [TX:output]
     protocol_frame_t tx_frame;
-    protocol_tx_t tx = {
-        .complete = false,
-        .valid = false,
-        .ack_state = PROTOCOL_ACK_UNKNOWN,
-        .rd_busy = false,
-        .wd_busy = false,
-        .state = PROTOCOL_TX_INIT,
-        .offset = 0,
-        .count = 0
-    };
-    serial_packet_t tx_packet = {
-        .mode = SERIAL_OUT,
-        .buffer = NULL,
-        .length = 0,
-        .complete  = false,
-        .processed = 0
-    };
+    protocol_tx_t tx;
+    serial_packet_t tx_packet;
+    protocol_errno_t tx_setup_errno = protocol_tx_init(&tx, &tx_packet);
+
     // [RX:input]
     protocol_frame_t rx_frame;
-    protocol_rx_t rx = {
-        .complete = false,
-        .valid = false,
-        .ack_state = PROTOCOL_ACK_UNKNOWN,
-        .rd_busy = false,
-        .wd_busy = false,
-        .state = PROTOCOL_RX_INIT,
-        .offset = 0,
-        .count = 0
-    };
-    serial_packet_t rx_packet = {
-        .mode = SERIAL_IN,
-        .buffer = NULL,
-        .length = 0,
-        .complete  = false,
-        .processed = 0
-    };
+    protocol_rx_t rx;
+    serial_packet_t rx_packet;
+    protocol_errno_t rx_setup_errno = protocol_rx_init(&rx, &rx_packet);
 
+    if (!setup_fail) setup_fail = (tx_setup_errno != PROTOCOL_OK || rx_setup_errno != PROTOCOL_OK);
     // << Message handling >>
     char response[MESSAGE_LEN]; // received
     
