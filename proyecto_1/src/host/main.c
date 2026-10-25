@@ -12,9 +12,8 @@
 
 #include "serial/serial.h"
 #include "serial/posix.h"
-#include "host/report_session.h"
+#include "common/protocol.h"
 
-#define BUFFER_LEN  128u
 #define MESSAGE_LEN 64u
 
 int main(int argc, char *argv[])
@@ -53,120 +52,115 @@ int main(int argc, char *argv[])
         &fd,
         &ser_conf
     );
-    setup_fail = (conf_errno != SERIAL_OK);
+    if (!setup_fail) setup_fail = (conf_errno == SERIAL_FAILURE);
 
-    // [Packets]
-    uint8_t in[BUFFER_LEN];
-    serial_packet_t input = {
-        .mode   = SERIAL_IN,
-        .buffer = in,
-        .length = sizeof(in),
-        .complete  = false,
-        .processed = 0
-    };
+    // << Setup protocol interface
+    // [TX:output]
+    protocol_frame_t tx_frame;
+    protocol_tx_t tx;
+    serial_packet_t tx_packet;
+    protocol_errno_t tx_setup_errno = protocol_tx_init(&tx, &tx_packet);
 
-    uint8_t out[BUFFER_LEN];
-    serial_packet_t output = {
-        .mode   = SERIAL_OUT,
-        .buffer = out,
-        .length = sizeof(out),
-        .complete  = false,
-        .processed = 0
-    };
+    // [RX:input]
+    protocol_frame_t rx_frame;
+    protocol_rx_t rx;
+    serial_packet_t rx_packet;
+    protocol_errno_t rx_setup_errno = protocol_rx_init(&rx, &rx_packet);
+
+    if (!setup_fail) setup_fail = (tx_setup_errno != PROTOCOL_OK || rx_setup_errno != PROTOCOL_OK);
     // << Message handling >>
-    const char *ping  = "PING";
-    const char *check = "CHECK";
+    char response[MESSAGE_LEN]; // received
     
-    char response[MESSAGE_LEN];
-    char message [MESSAGE_LEN];
+    char message [MESSAGE_LEN]; // sent
+    const char *default_msg  = "PING";
+    uint32_t size = strlen(default_msg) + 1;
+    // << Configure TX frame >>
+    tx_frame.relevance = 0;
+    tx_frame.length = size;
+    memcpy(tx_frame.payload, default_msg, size); // copy whole message until '\0'
+    
+    protocol_errno_t tx_frame_errno = protocol_set_frame_to_buffer(
+        &tx_frame,
+        tx.buffer,
+        sizeof(tx.buffer)
+    );
+    if (!setup_fail) setup_fail = (tx_frame_errno == PROTOCOL_ERROR);
+
     // << Procedure loop >>
     int recv_events = 0;
-    int send_events = 0;
-    int alt = false;
+    int ack_wait = 0;
+    int state = 0;
 
-    if (setup_fail) printf("Something went wrong when setting serial communication!\n");
-    else printf("Starting procedure...\n");
+    if (setup_fail) printf("Something went wrong when setting up serial connection!\n");
+    else {
+        printf("Starting procedure...\n");
+        printf("TX initial state: %d\n", tx.state);
+        printf("RX initial state: %d\n", rx.state);
+    }
     while (!setup_fail){
-        if (recv_events == 5)
-            break;
-        // [Read from serial]
-        // read bytes
-        size_t rd = 0;
-        serial_errno_t rd_errno = serial_read(
-            &fd, &input, &rd
-        );
-
-        if (rd_errno == SERIAL_FAILURE)
-            serial_restart_packet(&input);
-        else if (rd > 0)
-            printf("Read %lu bytes\n", rd);
-        
-        if (input.complete){
-            // Convert bytes
-            char* buffer = (char*) in;
-            for (unsigned int i = 0; i < sizeof(response); i++){
-                char ch = buffer[i];
-                if (ch == '\n')
-                    response[i] = '\0';
-                else
-                    response[i] = ch;
-            }
-            printf("Received: %s\n", response);
-            // Restart packet for next message
-            serial_restart_packet(&input);
-            // Count event
-            recv_events++;
-            // Restart send
-            if (send_events == 2) send_events = 0;
-        }
-        // [Send with serial]
-        if (send_events == 0){ // setup message
-            // Select message
-            const char* msg = ping;
-            if (alt) msg = check;
-            size_t len = strlen(msg);
-            alt = !alt;
-            printf("Message: %s (%lu)\n", msg, len);
-            // Build message
-            for (size_t i = 0; i < sizeof(message);i++){
-                if (i < len)
-                    message[i] = msg[i];
-                else if (i == len)
-                    message[i] = '\n';
-                else
-                    message[i] = '\0';
-            }
-            // Set to buffer
-            const uint8_t* buffer = (uint8_t*) message;
-            for (size_t i = 0; i < sizeof(out);i++){
-                if (i < sizeof(message))
-                    out[i] = buffer[i];
-                else
-                    out[i] = 0x00u;
-            }
-            // Move to send
-            send_events = 1;
-        }
-        if (send_events == 1){ // send message
-            // send bytes
-            size_t wd = 0;
-            serial_errno_t wd_errno = serial_write(
-                &fd, &output, &wd
+        if (recv_events == 5) break;
+        // [TX state]
+        if (state == 0){
+            // [Poll TX state machine]
+            protocol_errno_t tx_errno = protocol_tx_poll(
+                &fd,
+                &tx,
+                &tx_packet
             );
-
-            if (wd_errno == SERIAL_FAILURE)
-                serial_restart_packet(&output);
-            else if (wd > 0)
-                printf("Sent %lu bytes\n", wd);
-
-            if (output.complete){
-                serial_restart_packet(&output);
-                printf("Sent: %s", (char*)out);
-                // Move to wait
-                send_events = 2;
+            // [Check TX]
+            if (tx_errno != PROTOCOL_OK) printf("protocol_tx_poll(): Something went wrong!\n");
+            if (tx.state == PROTOCOL_TX_ACK && ack_wait == 0) {
+                printf("Waiting for device response...\n");
+                ack_wait++;
+            }
+            if (tx.complete){
+                if (tx.ack_state == PROTOCOL_ACK) printf("Device understood response!\n");
+                else if (tx.ack_state == PROTOCOL_NACK) printf("Device didn't understood response!\n");
+                else if (tx.ack_state == PROTOCOL_ACK_UNKNOWN) printf("Device didn't confirm response!\n");
+                else if (tx.ack_state == PROTOCOL_ACK_TIMEOUT) printf("Device disconnected!\n");
+                // [Check if message sent]
+                if (tx.valid){
+                    memcpy(message, tx_frame.payload, tx_frame.length);
+                    printf("Sent: %s\n", message);
+                    state = 1;
+                }
+                ack_wait = 0;
+            }
+        }
+        // [RX state]
+        if (state == 1){
+            // [Poll RX state machine]
+            protocol_errno_t rx_errno = protocol_rx_poll(
+                &fd,
+                &rx,
+                &rx_packet
+            );
+            // [Check RX]
+            if (rx_errno != PROTOCOL_OK) printf("protocol_rx_poll(): Something went wrong!\n");
+            if (rx.state == PROTOCOL_RX_HEADER) printf("Waiting for header...\n");
+            else if (rx.state == PROTOCOL_RX_ACK) printf("Sending confirmation...\n");
+            if (rx.complete){
+                if (rx.ack_state == PROTOCOL_ACK) printf("Response received correctly!\n");
+                else if (rx.ack_state == PROTOCOL_NACK) printf("Response received was not correct!\n");
+                // [Check if message received]
+                if (rx.valid){
+                    protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
+                        &rx_frame,
+                        rx.buffer,
+                        sizeof(rx.buffer)
+                    );
+                    if (rx_frame_errno == PROTOCOL_OK){
+                        memcpy(response, rx_frame.payload, rx_frame.length);
+                        if (rx_frame.relevance == 0)
+                            printf("Received: %s\n", response);
+                    }
+                    recv_events++;
+                }
+                state = 0;
             }
         }
     }
+    printf("End of loop...\n");
 
     close(fd);
     return 0;
