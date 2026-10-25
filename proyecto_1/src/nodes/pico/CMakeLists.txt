@@ -57,12 +57,8 @@ target_link_libraries(pico
 pico_enable_stdio_usb(pico 1)
 pico_enable_stdio_uart(pico 0)
 
-<<<<<<< HEAD
 # -----------------------------------------------------------------------------------
 # Generate output binaries
 # -----------------------------------------------------------------------------------
 
 pico_add_extra_outputs(pico)
-=======
-pico_add_extra_outputs(pico)
->>>>>>> origin/feature/messages

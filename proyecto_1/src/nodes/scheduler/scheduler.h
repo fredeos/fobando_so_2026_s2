@@ -123,11 +123,6 @@ int scheduler_select_job(Scheduler *sc);
  */
 bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id);
 
-/*
- * Checks active jobs for missed deadlines, updates the corresponding
- * statistics, and aborts jobs that have not completed on time.
- */
-void check_deadline_misses(Scheduler *sc);
 
 /*
  * Registers an event for the sporadic task and creates a job if the

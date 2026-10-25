@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+static void check_deadline_misses(Scheduler *sc);
 // ---------------------- init ----------------------
 
 /*

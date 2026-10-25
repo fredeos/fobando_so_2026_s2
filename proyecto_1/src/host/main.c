@@ -13,6 +13,7 @@
 #include "serial/serial.h"
 #include "serial/posix.h"
 #include "common/protocol.h"
+#include "host/report_session.h"
 
 #define MESSAGE_LEN 64u
 
