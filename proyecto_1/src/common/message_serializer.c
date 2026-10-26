@@ -115,7 +115,7 @@ static bool format_data(const Message *message, char *data, size_t capacity)
                     "{\"message_type\":\"%s\"}", reply_type);
             } else {
                 if (message->data.reply.reason <= REJECT_NONE ||
-                    message->data.reply.reason > REJECT_CALIBRATION_FAILED) {
+                    message->data.reply.reason > REJECT_NO_TASKS) {
                     return false;
                 }
                 written = snprintf(data, capacity,

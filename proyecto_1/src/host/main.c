@@ -16,7 +16,22 @@
 #define HANDSHAKE_TIMEOUT_SECONDS 30
 #define CALIBRATION_REQUEST_ID 2u
 #define FIRST_DEPLOY_REQUEST_ID 3u
+#define FIRST_CONTROL_REQUEST_ID UINT32_C(0x80000000)
 
+/**
+ * @brief Serializa y encola un mensaje para enviarlo a un nodo.
+ *
+ * Usa el buffer asociado al dispositivo y reporta errores de serialización o
+ * de preparación del transporte.
+ *
+ * @param handler     Enlace de comunicación del dispositivo.
+ * @param buffer      Buffer JSON dedicado a ese enlace.
+ * @param message     Mensaje común que se enviará.
+ * @param node_id     Identificador del nodo destino, usado en los diagnósticos.
+ * @param message_name Nombre legible del tipo de mensaje.
+ *
+ * @return true si el mensaje quedó preparado para el transporte.
+ */
 static bool send_message(
     comms_handler_t *handler,
     char *buffer,
@@ -46,6 +61,19 @@ static bool send_message(
     return true;
 }
 
+/**
+ * @brief Espera el ACK de CONFIG correspondiente a una solicitud.
+ *
+ * Consume las respuestas recibidas por el hilo de comunicación y verifica
+ * tipo, nodo y request_id antes de aceptar el ACK.
+ *
+ * @param handler   Enlace serial del nodo.
+ * @param node_id   Identificador esperado en la respuesta.
+ * @param request_id Identificador de la solicitud CONFIG.
+ * @param device    Nombre del dispositivo para los mensajes de diagnóstico.
+ *
+ * @return true si llega el ACK esperado antes del timeout.
+ */
 static bool wait_for_ack(
     comms_handler_t *handler,
     uint32_t node_id,
@@ -108,6 +136,20 @@ static bool wait_for_ack(
     }
 }
 
+/**
+ * @brief Espera el resultado de calibración del nodo.
+ *
+ * Acepta una respuesta CALIBRATE_RESPONSE con capacidad positiva o termina
+ * con error si recibe un NACK correlacionado o vence el timeout.
+ *
+ * @param handler     Enlace serial del nodo.
+ * @param node_id     Identificador esperado en la respuesta.
+ * @param request_id  Identificador de CALIBRATE_REQUEST.
+ * @param device      Nombre del dispositivo para los mensajes de diagnóstico.
+ * @param ut_per_tick Dirección donde se guardará la capacidad calibrada.
+ *
+ * @return true si se recibió una calibración válida.
+ */
 static bool wait_for_calibration(
     comms_handler_t *handler,
     uint32_t node_id,
@@ -175,6 +217,21 @@ static bool wait_for_calibration(
     }
 }
 
+/**
+ * @brief Espera el ACK o NACK del despliegue de una tarea.
+ *
+ * Solo acepta una respuesta cuyo nodo, request_id y tipo de solicitud
+ * coincidan con el DEPLOY_TASK que está pendiente.
+ *
+ * @param handler   Enlace serial del nodo destino.
+ * @param node_id   Identificador esperado en la respuesta.
+ * @param request_id Identificador del despliegue.
+ * @param device    Nombre del dispositivo para los mensajes de diagnóstico.
+ * @param accepted  Recibe true para ACK y false para NACK.
+ * @param reason    Recibe el motivo de rechazo; REJECT_NONE en caso de ACK.
+ *
+ * @return true si llegó una respuesta correlacionada antes del timeout.
+ */
 static bool wait_for_task_deploy(
     comms_handler_t *handler,
     uint32_t node_id,
@@ -240,6 +297,284 @@ static bool wait_for_task_deploy(
     }
 }
 
+/**
+ * @brief Espera y valida la respuesta a START o STOP de un nodo.
+ *
+ * Correlaciona la respuesta por tipo, nodo y request_id. Informa el motivo
+ * cuando el nodo rechaza el comando y libera el turno de envío del enlace.
+ *
+ * @param handler     Enlace serial del nodo.
+ * @param node_id     Identificador esperado en la respuesta.
+ * @param request_id  Identificador del comando de control.
+ * @param request_type Tipo de comando enviado, START o STOP.
+ * @param device      Nombre del dispositivo para los mensajes de diagnóstico.
+ *
+ * @return true si el nodo respondió ACK; false ante NACK, error o timeout.
+ */
+static bool wait_for_control_reply(
+    comms_handler_t *handler,
+    uint32_t node_id,
+    uint32_t request_id,
+    MessageType request_type,
+    const char *device
+)
+{
+    time_t start = time(NULL);
+    for (;;) {
+        char response[COMMS_MESSAGE_CAPACITY];
+        size_t response_size = 0u;
+        bool ready;
+
+        pthread_mutex_lock(&handler->mutex);
+        ready = handler->recv.rdy;
+        if (ready) {
+            response_size = handler->recv.size;
+            memcpy(response, handler->recv.content, response_size);
+            response[response_size] = '\0';
+            handler->recv.rdy = false;
+        }
+        pthread_mutex_unlock(&handler->mutex);
+
+        if (ready) {
+            if (response_size > 0u && response[response_size - 1u] == '\0')
+                --response_size;
+
+            Message reply;
+            MessageParseResult parsed = message_parse(
+                response, response_size, &reply
+            );
+            if (parsed == MESSAGE_PARSE_OK &&
+                reply.node_id == node_id &&
+                reply.request_id == request_id &&
+                (reply.type == MSG_ACK || reply.type == MSG_NACK) &&
+                reply.data.reply.type == request_type) {
+                comms_acquire_send(handler);
+                if (reply.type == MSG_ACK) {
+                    printf("%s confirmado por nodo %u (%s).\n",
+                        request_type == MSG_START ? "START" : "STOP",
+                        node_id, device);
+                    return true;
+                }
+
+                fprintf(stderr,
+                    "%s rechazado por nodo %u (%s): %s.\n",
+                    request_type == MSG_START ? "START" : "STOP",
+                    node_id, device,
+                    report_reject_reason(reply.data.reply.reason));
+                return false;
+            }
+
+            if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
+                response[0] == '{') {
+                fprintf(stderr,
+                    "Respuesta de control no válida de nodo %u (%s): %s\n",
+                    node_id, device, message_parse_result_string(parsed));
+            }
+        }
+
+        if (time(NULL) - start >= HANDSHAKE_TIMEOUT_SECONDS) {
+            fprintf(stderr, "Timeout esperando respuesta de %s en nodo %u (%s).\n",
+                request_type == MSG_START ? "START" : "STOP", node_id, device);
+            return false;
+        }
+        struct timespec pause = {.tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+}
+
+/**
+ * @brief Envía START o STOP a ambos nodos y espera sus respuestas.
+ *
+ * Envía a los dos enlaces antes de esperar cada ACK/NACK. El resultado de un
+ * nodo no cancela ni revierte la operación del otro; se devuelve true solo
+ * cuando ambos aceptaron el comando.
+ *
+ * @param type     Tipo de comando, MSG_START o MSG_STOP.
+ * @param request_id Identificador común de correlación para este comando.
+ * @param node_ids Identificadores de los nodos.
+ * @param devices  Rutas o nombres de los dispositivos seriales.
+ * @param handlers Enlaces de comunicación activos.
+ * @param sent     Buffers JSON de envío, uno por dispositivo.
+ *
+ * @return true si ambos nodos aceptaron el comando.
+ */
+static bool send_control_to_nodes(
+    MessageType type,
+    uint32_t request_id,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    const char *devices[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+)
+{
+    const char *name = type == MSG_START ? "START" : "STOP";
+    bool sent_to_node[EXPECTED_DEVICES] = {false, false};
+    bool all_accepted = true;
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        Message request = {
+            .type = type,
+            .node_id = node_ids[i],
+            .request_id = request_id
+        };
+        sent_to_node[i] = send_message(
+            &handlers[i], sent[i], &request, node_ids[i], name
+        );
+        if (!sent_to_node[i])
+            all_accepted = false;
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (sent_to_node[i] &&
+            !wait_for_control_reply(&handlers[i], node_ids[i], request_id,
+                                    type, devices[i])) {
+            all_accepted = false;
+        }
+    }
+    return all_accepted;
+}
+
+/**
+ * @brief Envía START o STOP a un único nodo y espera su respuesta.
+ *
+ * @param type       Tipo de comando, MSG_START o MSG_STOP.
+ * @param request_id Identificador de correlación del comando.
+ * @param node_index Índice del enlace y nodo a controlar.
+ * @param node_ids   Identificadores de los nodos.
+ * @param devices    Rutas o nombres de los dispositivos seriales.
+ * @param handlers   Enlaces de comunicación activos.
+ * @param sent       Buffers JSON de envío, uno por dispositivo.
+ *
+ * @return true si el nodo seleccionado respondió ACK.
+ */
+static bool send_control_to_node(
+    MessageType type,
+    uint32_t request_id,
+    size_t node_index,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    const char *devices[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+)
+{
+    const char *name = type == MSG_START ? "START" : "STOP";
+    Message request = {
+        .type = type,
+        .node_id = node_ids[node_index],
+        .request_id = request_id
+    };
+
+    if (!send_message(&handlers[node_index], sent[node_index], &request,
+                      node_ids[node_index], name)) {
+        return false;
+    }
+
+    return wait_for_control_reply(
+        &handlers[node_index], node_ids[node_index], request_id, type,
+        devices[node_index]
+    );
+}
+
+/**
+ * @brief Obtiene un request_id de control y prepara el siguiente.
+ *
+ * Los identificadores de control usan un rango separado de CONFIG,
+ * calibración y despliegue.
+ *
+ * @param next_request_id Contador que se consume y luego se actualiza.
+ *
+ * @return Identificador asignado a la solicitud actual.
+ */
+static uint32_t take_control_request_id(uint32_t *next_request_id)
+{
+    uint32_t request_id = *next_request_id;
+    *next_request_id = request_id == UINT32_MAX
+        ? FIRST_CONTROL_REQUEST_ID : request_id + 1u;
+    return request_id;
+}
+
+/**
+ * @brief Lee comandos interactivos y controla los schedulers remotos.
+ *
+ * Acepta `start`/`stop` para ambos nodos, `start 1`/`stop 1` para ESP32,
+ * `start 2`/`stop 2` para Pico, y `exit` para detener ambos y salir. Las
+ * respuestas se procesan independientemente por nodo.
+ *
+ * @param node_ids Identificadores de los nodos.
+ * @param devices  Rutas o nombres de los dispositivos seriales.
+ * @param handlers Enlaces de comunicación que permanecen abiertos durante
+ *                 la consola.
+ * @param sent     Buffers JSON de envío, uno por dispositivo.
+ */
+static void run_control_console(
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    const char *devices[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+)
+{
+    char line[64];
+    uint32_t next_request_id = FIRST_CONTROL_REQUEST_ID;
+
+    puts("Comandos: start [1|2], stop [1|2], exit.");
+    for (;;) {
+        fputs("> ", stdout);
+        fflush(stdout);
+        if (fgets(line, sizeof(line), stdin) == NULL)
+            break;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, "start") == 0) {
+            uint32_t request_id = take_control_request_id(&next_request_id);
+            (void)send_control_to_nodes(MSG_START, request_id, node_ids, devices,
+                                        handlers, sent);
+        } else if (strcmp(line, "stop") == 0) {
+            uint32_t request_id = take_control_request_id(&next_request_id);
+            (void)send_control_to_nodes(MSG_STOP, request_id, node_ids, devices,
+                                        handlers, sent);
+        } else if (strcmp(line, "start 1") == 0 ||
+                   strcmp(line, "start 2") == 0 ||
+                   strcmp(line, "stop 1") == 0 ||
+                   strcmp(line, "stop 2") == 0) {
+            const bool starting =
+                strcmp(line, "start 1") == 0 ||
+                strcmp(line, "start 2") == 0;
+            const size_t node_index = line[strlen(line) - 1u] == '1' ? 0u : 1u;
+            uint32_t request_id = take_control_request_id(&next_request_id);
+            (void)send_control_to_node(
+                starting ? MSG_START : MSG_STOP, request_id, node_index,
+                node_ids, devices, handlers, sent
+            );
+        } else if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
+            uint32_t request_id = take_control_request_id(&next_request_id);
+            (void)send_control_to_nodes(MSG_STOP, request_id, node_ids, devices,
+                                        handlers, sent);
+            break;
+        } else if (line[0] == '\0') {
+            continue;
+        } else {
+            puts("Comando inválido. Usa start [1|2], stop [1|2] o exit.");
+        }
+    }
+}
+
+/**
+ * @brief Carga, planifica y despliega las tareas admitidas por el Host.
+ *
+ * Inicializa el Planner con las capacidades calibradas, asigna cada tarea,
+ * envía DEPLOY_TASK al nodo correspondiente y espera su ACK/NACK. Si un nodo
+ * rechaza una tarea, revierte su reserva local para mantener coherente el
+ * planificador.
+ *
+ * @param config     Configuración del algoritmo, heurística y archivo CSV.
+ * @param node_ids   Identificadores de los nodos disponibles.
+ * @param devices    Rutas de los puertos seriales.
+ * @param handlers   Enlaces de comunicación activos.
+ * @param sent       Buffers JSON de envío, uno por dispositivo.
+ * @param ut_per_tick Capacidades medidas de los nodos.
+ *
+ * @return true si la carga y el proceso de despliegue terminaron correctamente.
+ */
 static bool plan_and_deploy_tasks(
     const HostConfig *config,
     const uint32_t node_ids[EXPECTED_DEVICES],
@@ -371,6 +706,15 @@ cleanup:
     return success;
 }
 
+/**
+ * @brief Solicita el cierre de los enlaces y espera que terminen sus hilos.
+ *
+ * Primero detiene todos los handlers y después revisa bajo mutex el estado de
+ * cada hilo hasta que finalice.
+ *
+ * @param handlers Arreglo de handlers de comunicación.
+ * @param count    Cantidad de handlers que deben cerrarse.
+ */
 static void stop_handlers(comms_handler_t *handlers, size_t count)
 {
     /* Solicita el cierre a todos los hilos antes de esperar su terminación. */
@@ -390,6 +734,19 @@ static void stop_handlers(comms_handler_t *handlers, size_t count)
     }
 }
 
+/**
+ * @brief Ejecuta la secuencia Host–nodos desde la configuración hasta START/STOP.
+ *
+ * Valida los puertos, inicia los enlaces, configura y calibra ambos nodos,
+ * despliega las tareas admitidas y abre la consola de control. Los enlaces se
+ * mantienen activos hasta que el usuario sale de la consola o ocurre un error.
+ *
+ * @param argc Cantidad de argumentos de línea de comandos.
+ * @param argv Debe incluir el ejecutable, el puerto ESP32 y el puerto Pico.
+ *
+ * @return 0 si la secuencia termina correctamente; valor distinto de cero ante
+ *         errores de argumentos, configuración, enlace, calibración o despliegue.
+ */
 int main(int argc, char *argv[])
 {
     if (argc != 1 + EXPECTED_DEVICES) {
@@ -488,10 +845,13 @@ int main(int argc, char *argv[])
     bool deployed = plan_and_deploy_tasks(
         &config, node_ids, devices, handlers, sent, ut_per_tick
     );
-    stop_handlers(handlers, EXPECTED_DEVICES);
-    if (!deployed)
+    if (!deployed) {
+        stop_handlers(handlers, EXPECTED_DEVICES);
         return 1;
+    }
 
     puts("CONFIG, calibración y despliegue de tareas completados.");
+    run_control_console(node_ids, devices, handlers, sent);
+    stop_handlers(handlers, EXPECTED_DEVICES);
     return 0;
 }

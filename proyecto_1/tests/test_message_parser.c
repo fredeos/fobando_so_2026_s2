@@ -250,7 +250,7 @@ static void test_numeric_limits(void)
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":2147483648}}",
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":-2147483649}}",
         "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":0}}",
-        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":8}}",
+        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":10}}",
         "{\"type\":\"DEPLOY_TASK\",\"node_id\":1,\"request_id\":1,\"data\":{\"task\":{\"id\":1,\"type\":\"P\",\"work\":0,\"period\":1,\"deadline\":1,\"criticality\":0},\"cost_ticks\":1}}"
     };
 
@@ -358,6 +358,11 @@ static void test_message_serialization(void)
     }
     message.data.reply.type = MSG_DEPLOY_TASK;
     message.data.reply.reason = REJECT_INSUFFICIENT_CAPACITY;
+    assert_round_trip(&message);
+    message.data.reply.type = MSG_START;
+    message.data.reply.reason = REJECT_INVALID_STATE;
+    assert_round_trip(&message);
+    message.data.reply.reason = REJECT_NO_TASKS;
     assert_round_trip(&message);
 
     char buffer[MESSAGE_MAX_BYTES + 1u];

@@ -38,6 +38,10 @@ add_executable(pico
     ${COMMON_SOURCES}
     src/calibrator.c
     ../scheduler/task_conversion.c
+    ../scheduler/scheduler_runtime.c
+    ../scheduler/scheduler.c
+    ../scheduler/rms.c
+    ../scheduler/edf.c
     ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON/core_json.c
 
     gpio/gpio.c

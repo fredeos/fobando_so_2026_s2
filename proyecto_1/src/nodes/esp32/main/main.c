@@ -3,13 +3,14 @@
 #include <inttypes.h>
 
 #include "driver/uart.h"
-#include "esp_log.h"
+#include "esp_timer.h"
 
 #include "common/protocol.h"
 #include "common/message_parser.h"
 #include "common/messages.h"
 #include "common/task_store.h"
 #include "calibrator.h"
+#include "scheduler_runtime.h"
 #include "serial/esp32.h"
 #include "serial/serial.h"
 #include "gpio/gpio.h"
@@ -25,9 +26,30 @@
 #define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
 
 static uint32_t configured_tick_ms;
+static MessageAlgorithm configured_algorithm = MESSAGE_SCHED_RMS;
+static uint32_t configured_ut_per_tick;
+static uint64_t next_tick_us;
 /* Tabla temporal: los despliegues aceptados desaparecen al reiniciar el MCU. */
 static TaskStore deployed_tasks;
+static SchedulerRuntime scheduler_runtime;
 
+/**
+ * @brief Serializa una respuesta correlacionada con una solicitud recibida.
+ *
+ * Construye un ACK, NACK o CALIBRATE_RESPONSE para este nodo, conservando el
+ * request_id del mensaje original. La respuesta queda en formato JSON dentro
+ * del buffer proporcionado.
+ *
+ * @param request           Solicitud que se está respondiendo.
+ * @param type              Tipo de respuesta que se generará.
+ * @param reason            Motivo de rechazo si la respuesta es NACK.
+ * @param ut_per_tick       Capacidad calibrada para CALIBRATE_RESPONSE.
+ * @param response          Buffer que recibirá el JSON serializado.
+ * @param response_capacity Capacidad total del buffer.
+ * @param response_length   Dirección donde se escribirá la longitud JSON.
+ *
+ * @return true si la respuesta se serializa; false si no cabe o no es válida.
+ */
 static bool serialize_reply(
     const Message *request,
     MessageType type,
@@ -61,6 +83,19 @@ static bool serialize_reply(
     return true;
 }
 
+/**
+ * @brief Mide el número promedio de unidades de trabajo por tick.
+ *
+ * Ejecuta la calibración solicitada usando la duración de tick recibida en
+ * CONFIG y una reserva del 20 por ciento. El resultado es el promedio entero
+ * de las muestras.
+ *
+ * @param sample_ticks Cantidad de muestras solicitadas.
+ * @param ut_per_tick  Dirección donde se guardará el promedio medido.
+ *
+ * @return true si todas las muestras y el promedio son válidos; false en caso
+ *         contrario.
+ */
 static bool calibrate(
     uint32_t sample_ticks,
     uint32_t *ut_per_tick
@@ -87,7 +122,22 @@ static bool calibrate(
     return true;
 }
 
-/* Prepara CONFIG/ACK JSON y conserva el protocolo de prueba PING/MARCO. */
+/**
+ * @brief Procesa una trama recibida y prepara su respuesta.
+ *
+ * Interpreta CONFIG, CALIBRATE_REQUEST, DEPLOY_TASK, START, STOP y
+ * TRIGGER_SPORADIC. Comprueba que el mensaje esté dirigido a este nodo,
+ * actualiza su configuración o estado y produce el ACK/NACK correspondiente.
+ * También conserva la compatibilidad con los mensajes de prueba PING/MARCO.
+ *
+ * @param received          Trama de protocolo recibida por el ESP32.
+ * @param response          Buffer donde se almacenará la respuesta.
+ * @param response_capacity Capacidad del buffer de respuesta.
+ * @param response_length   Dirección donde se guardará la longitud generada.
+ *
+ * @return true si se preparó una respuesta válida; false si la trama no puede
+ *         procesarse o la respuesta no cabe en el buffer.
+ */
 static bool prepare_response(
     const protocol_frame_t *received,
     char *response,
@@ -112,14 +162,26 @@ static bool prepare_response(
             return false;
 
         if (incoming.type == MSG_CONFIG) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
             configured_tick_ms = incoming.data.config.tick_ms;
+            configured_algorithm = incoming.data.config.algorithm;
             return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
                 response, response_capacity, response_length);
         }
 
         if (incoming.type == MSG_CALIBRATE_REQUEST) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
             uint32_t ut_per_tick = 0u;
             if (calibrate(incoming.data.sample_ticks, &ut_per_tick)) {
+                configured_ut_per_tick = ut_per_tick;
                 return serialize_reply(&incoming, MSG_CALIBRATE_RESPONSE,
                     REJECT_NONE, ut_per_tick, response, response_capacity,
                     response_length);
@@ -130,6 +192,11 @@ static bool prepare_response(
         }
 
         if (incoming.type == MSG_DEPLOY_TASK) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
             /*
              * El Host ya hizo la prueba de admisión. Este paso valida límites
              * locales, guarda la tarea y confirma el almacenamiento con ACK.
@@ -141,6 +208,41 @@ static bool prepare_response(
             );
             MessageType reply_type = reason == REJECT_NONE ? MSG_ACK : MSG_NACK;
             return serialize_reply(&incoming, reply_type, reason, 0u,
+                response, response_capacity, response_length);
+        }
+
+        if (incoming.type == MSG_START) {
+            bool was_running = scheduler_runtime.running;
+            RejectReason reason = REJECT_INVALID_STATE;
+            SchedulerType scheduler_type =
+                configured_algorithm == MESSAGE_SCHED_EDF ? EDF : RMS;
+            if (!scheduler_runtime_start(&scheduler_runtime, &deployed_tasks,
+                                         configured_ut_per_tick,
+                                         scheduler_type, &reason)) {
+                return serialize_reply(&incoming, MSG_NACK, reason, 0u,
+                    response, response_capacity, response_length);
+            }
+            if (!was_running)
+                next_tick_us = (uint64_t)esp_timer_get_time() +
+                    (uint64_t)configured_tick_ms * 1000u;
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
+        }
+
+        if (incoming.type == MSG_STOP) {
+            scheduler_runtime_stop(&scheduler_runtime);
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
+        }
+
+        if (incoming.type == MSG_TRIGGER_SPORADIC) {
+            RejectReason reason = REJECT_INVALID_STATE;
+            if (!scheduler_runtime_trigger_sporadic(
+                    &scheduler_runtime, incoming.data.task_id, &reason)) {
+                return serialize_reply(&incoming, MSG_NACK, reason, 0u,
+                    response, response_capacity, response_length);
+            }
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
                 response, response_capacity, response_length);
         }
 
@@ -162,10 +264,50 @@ static bool prepare_response(
     return true;
 }
 
+/**
+ * @brief Ejecuta un tick cuando el scheduler está activo y vence su intervalo.
+ *
+ * Ejecuta como máximo un tick por llamada. Si el scheduler informa un error,
+ * enciende LED0 y detiene la ejecución. Después del tick, calcula el siguiente
+ * vencimiento desde el tiempo actual para no ejecutar ticks atrasados en
+ * ráfaga y permitir que continúe el polling serial.
+ */
+static void run_scheduler_if_due(void)
+{
+    if (!scheduler_runtime.running || configured_tick_ms == 0u)
+        return;
+
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    if (now_us < next_tick_us)
+        return;
+
+    uint32_t selected_task_id;
+    if (!scheduler_runtime_run_tick(&scheduler_runtime, &selected_task_id)) {
+        board_gpio_write(LED0, GPIO_HIGH);
+        scheduler_runtime_stop(&scheduler_runtime);
+        return;
+    }
+
+    /* Evita ejecutar ticks atrasados en ráfaga y deja tiempo al polling serial. */
+    next_tick_us = (uint64_t)esp_timer_get_time() +
+        (uint64_t)configured_tick_ms * 1000u;
+}
+
+/**
+ * @brief Inicializa el ESP32 y mantiene activo su ciclo de comunicación.
+ *
+ * Prepara el almacenamiento de tareas, el runtime del scheduler, UART,
+ * protocolo y GPIO. El bucle principal alterna entre polling de recepción y
+ * transmisión de respuestas; en cada iteración también comprueba si debe
+ * ejecutarse un tick, sin bloquear la recepción de comandos mientras corre.
+ *
+ * Si falla la inicialización, indica el error con LED0 y no procesa mensajes.
+ */
 void app_main(void){
     bool setup_fail = false;
     /* No se conserva estado de tareas entre reinicios del ESP32. */
     task_store_init(&deployed_tasks);
+    scheduler_runtime_init(&scheduler_runtime);
     // << Setup ESP32 serial interface >>
     esp32_uart_t uart;
     esp32_uart_configs_t uart_conf = {
@@ -173,7 +315,7 @@ void app_main(void){
         .baudrate = SERIAL_BAUDRATE,
         .rx_buffer_size = 1024,
         .tx_buffer_size = 0,
-        .tick_ms = 100
+        .tick_ms = 0u
     };
 
     serial_errno_t conf_errno = serial_configure(
@@ -273,5 +415,6 @@ void app_main(void){
                 state = 0;
             }
         }
+        run_scheduler_if_due();
     }
 }

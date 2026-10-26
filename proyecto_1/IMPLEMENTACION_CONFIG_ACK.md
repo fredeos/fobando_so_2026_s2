@@ -14,6 +14,8 @@ Host ── CALIBRATE_REQUEST > ESP32
 Host <── CALIBRATE_RESPONSE ESP32
 Host ── DEPLOY_TASK JSON ──> ESP32
 Host <── ACK/NACK ───────── ESP32
+Host ── START / STOP ──────> ESP32
+Host <── ACK/NACK ───────── ESP32
 
 Host ── CONFIG en JSON ──> Raspberry Pi Pico
 Host <── ACK en JSON ───── Raspberry Pi Pico
@@ -21,17 +23,18 @@ Host ── CALIBRATE_REQUEST > Raspberry Pi Pico
 Host <── CALIBRATE_RESPONSE Pico
 Host ── DEPLOY_TASK JSON ──> Pico
 Host <── ACK/NACK ───────── Pico
+Host ── START / STOP ──────> Pico
+Host <── ACK/NACK ───────── Pico
 ```
 
 El JSON viaja dentro del payload del protocolo binario serial ya existente.
 Por lo tanto, el framing, la máquina de estados de transmisión/recepción y el
 CRC no fueron reemplazados: se añadió una capa de contenido tipado sobre ellos.
 
-El flujo implementado configura ambos nodos y mide su capacidad en unidades de
-trabajo por tick (`UT/tick`). Todavía no realiza admisión o despliegue de
-tareas, inicio del scheduler, transmisión de eventos ni parada coordinada de
-una ejecución. El Host ahora carga y planifica las tareas, y los nodos guardan
-las asignadas en RAM; sin embargo, `START` todavía no inicia su ejecución.
+El flujo implementado configura ambos nodos, mide su capacidad en unidades de
+trabajo por tick (`UT/tick`), admite y despliega tareas, e inicia o pausa el
+scheduler de forma remota. El Host conserva abiertas las conexiones seriales
+después del despliegue y acepta los comandos `start`, `stop` y `exit`.
 
 ## 2. Capas de comunicación
 
@@ -386,10 +389,7 @@ Para `MSG_DEPLOY_TASK`, ambos firmware usan el almacenamiento común
 `TASK_MAX_PER_NODE` establece una capacidad de 8 entradas por nodo. La tabla
 es estática y reside en RAM; no sobrevive al reinicio. El scheduler usa esa
 misma constante mediante `MAX_TASKS`, así que no puede aceptar más tareas que
-las almacenables en `TaskStore`. Aunque ya existe una función de conversión al
-tipo del scheduler, el flujo todavía no la invoca: no se crean `Job`, no se
-ejecuta RMS/EDF y no se genera ningún `EVENT` o `TICK_REPORT`. La tarea queda
-preparada para un futuro paso de inicio/ejecución.
+las almacenables en `TaskStore`.
 
 ### Conversión de la tarea guardada al tipo del scheduler
 
@@ -434,10 +434,44 @@ for (size_t i = 0u; i < deployed_tasks.count; ++i) {
 }
 ```
 
-Este bucle es ilustrativo y todavía no se ejecuta en el firmware: el flujo
-actual almacena las tareas y responde ACK/NACK, pero aún no procesa `START` ni
-registra las tareas en `Scheduler`. El conversor se compila para Pico/Pico W y
-ESP32, y tiene una prueba unitaria que verifica el mapeo y los casos inválidos.
+El firmware ejecuta esta conversión al recibir `START`, registra cada tarea con
+`add_task()` y luego llama a `scheduler_run_tick()` cada `tick_ms`. El runtime
+compartido se implementa en `src/nodes/scheduler/scheduler_runtime.c` y se
+compila para Pico/Pico W y ESP32.
+
+### Inicio, pausa y recepción serial durante la ejecución
+
+El Host permanece en una consola después de desplegar las tareas. `start` y
+`stop` sin argumento envían el comando a ambos nodos; `start 1`, `stop 1`,
+`start 2` y `stop 2` controlan solamente el nodo indicado. Cada nodo responde
+de forma independiente: un NACK o timeout de un dispositivo no deshace ni
+detiene el scheduler del otro. `exit` envía STOP a ambos antes de cerrar los
+enlaces. La ejecución comienza solamente si el nodo tiene tareas guardadas,
+tick configurado y calibración válida. Si no tiene tareas, rechaza START con
+`REJECT_NO_TASKS`. La primera recepción válida de START construye el scheduler
+a partir del `TaskStore`; START posterior reanuda el estado existente.
+
+Cada firmware conserva el polling del protocolo serial en el bucle principal
+con lectura no bloqueante (`timeout_us=0` en Pico y `tick_ms=0` en ESP32), y
+ejecuta como máximo un tick cuando vence el intervalo configurado. Así puede
+atender STOP y otros mensajes mientras el scheduler está activo. Si una
+iteración se retrasa, el siguiente tick se agenda desde el momento actual para
+evitar ráfagas de ticks atrasados que priven de tiempo al polling serial.
+
+STOP es una pausa, no un reinicio: se conservan definiciones, tick lógico,
+trabajo pendiente y estadísticas internas. START reanuda ese estado; el tiempo
+de pared durante la pausa no incrementa el tick lógico. Las tareas nuevas,
+CONFIG y calibración se rechazan después de la primera preparación del
+scheduler con `REJECT_INVALID_STATE`, incluso si está pausado, para no dejar
+desincronizados el `TaskStore` y el scheduler ya construido. Los eventos
+`TRIGGER_SPORADIC` se aceptan únicamente mientras se ejecuta y si el ID coincide
+con la tarea esporádica registrada.
+
+Los ticks periódicos ejecutan el workload local de `unidad_trabajo()`; esta
+versión no transmite todavía eventos de ejecución ni `TICK_REPORT` al Host.
+El transporte serial no proporciona inicio simultáneo sincronizado: si se usa
+un comando sin argumento, cada nodo empieza su primer tick después de recibir
+su START respectivo.
 
 Si el mensaje no coincide con el comportamiento implementado, el firmware
 responde con el texto heredado “didn't understand message”. El manejo de
@@ -511,27 +545,29 @@ El Makefile también contiene dependencias de enlace para que:
 |---|---|
 | `src/common/message_serializer.c` | Implementa la conversión de `Message` a JSON y serializa el nuevo motivo NACK. |
 | `include/common/message_parser.h` | Declara el parser/serializador y los límites de muestras de calibración. |
-| `src/host/main.c` | Coordina CONFIG, calibración, carga CSV, admisión, despliegue y ACK/NACK de cada tarea. |
+| `src/host/main.c` | Coordina CONFIG, calibración, admisión, despliegue y consola interactiva START/STOP/EXIT. |
 | `src/host/planner/planner.c` | Conserva la asignación existente y permite revertir una reserva tras un NACK del MCU. |
 | `include/host/planner.h` | Declara la operación `planner_remove_task()` para rollback. |
 | `src/host/config/task_parser.c` | Carga las definiciones de tareas desde el CSV configurado. |
 | `src/host/comms/comms.h` | Define la capacidad de buffers para el payload JSON. |
 | `src/host/comms/comms.c` | Transporta mensajes y sincroniza buffers; permite que JSON de aplicación reemplace texto heartbeat antiguo en RX. |
-| `src/nodes/esp32/main/main.c` | Maneja CONFIG y calibración del nodo 1; responde ACK, resultado o NACK. |
-| `src/nodes/pico/main.c` | Maneja CONFIG y calibración del nodo 2; responde ACK, resultado o NACK, con GPIO de estado válidos para RP2040. |
+| `src/nodes/esp32/main/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP y ticks del nodo 1 sin bloquear el polling serial. |
+| `src/nodes/pico/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP y ticks del nodo 2 sin bloquear el polling serial. |
 | `src/nodes/esp32/src/calibrator.c` | Mide unidades de trabajo por intervalo del ESP32. |
 | `src/nodes/pico/src/calibrator.c` | Mide unidades de trabajo por intervalo del Pico. |
 | `src/nodes/scheduler/task.h` | Define `SchedulerTask` y `Job` para separar el tipo de ejecución del `Task` compartido. |
 | `src/nodes/scheduler/task_conversion.h` | Expone la conversión de `StoredTask` a `SchedulerTask`. |
 | `src/nodes/scheduler/task_conversion.c` | Valida y convierte campos, incluyendo el costo guardado a `C`. |
+| `src/nodes/scheduler/scheduler_runtime.c` | Construye el scheduler desde `TaskStore`, pausa/reanuda y permite ejecutar ticks/eventos esporádicos. |
+| `tests/test_scheduler_runtime.c` | Verifica START inicial, pausa, preservación del estado y reanudación. |
 | `include/common/task.h` | Define el máximo común de 8 tareas por nodo, compartido por almacenamiento y scheduler. |
 | `include/common/task_store.h` | Define `StoredTask` (tarea y costo) y `TaskStore` (tabla fija). |
 | `src/common/task_store.c` | Valida, detecta duplicados/límites y almacena tareas recibidas. |
 | `src/nodes/esp32/main/CMakeLists.txt` | Incluye serializador, calibrador y dependencia `esp_timer`. |
 | `src/nodes/pico/CMakeLists.txt` | Incluye fuentes comunes y el calibrador del Pico. |
 | `src/common/ut.c` | Define el trabajo unitario medido por los calibradores. |
-| `src/common/message_parser.c` | Reconoce `REJECT_CALIBRATION_FAILED` como motivo NACK. |
-| `include/common/events.h` | Añade `REJECT_CALIBRATION_FAILED` como motivo de NACK. |
+| `src/common/message_parser.c` | Reconoce los motivos NACK compartidos, incluido `REJECT_INVALID_STATE`. |
+| `include/common/events.h` | Añade motivos NACK para calibración y estado de ejecución inválido. |
 | `src/host/report/statistics.c` | Asigna una descripción al nuevo motivo de rechazo. |
 | `tests/test_message_parser.c` | Comprueba mensajes de calibración y NACK de despliegue, ida y vuelta. |
 | `tests/test_task_store.c` | Comprueba copia de parámetros, duplicados, límite esporádico y capacidad. |
@@ -662,21 +698,28 @@ Si CONFIG/ACK funciona pero vuelve a ocurrir un timeout de calibración, revisar
 4. Cerrar cualquier monitor serial que esté usando `/dev/ttyACM0`.
 5. Confirmar que los argumentos siguen el orden ESP32 y luego Pico W.
 
-## 12. Límites actuales y siguiente incremento
+## 12. Límites actuales
 
 - El Host implementa CONFIG/ACK, calibración, admisión, asignación y
   despliegue/almacenamiento de las tareas admitidas.
-- Los nodos guardan `tick_ms` para calibrar. El algoritmo y la frecuencia de
-  reportes recibidos en CONFIG aún no se aplican a un scheduler.
+- Los nodos usan `tick_ms` y el algoritmo recibido en CONFIG. La frecuencia de
+  reportes todavía no se aplica.
 - El Host usa las capacidades calibradas para llamar al `Planner`, pero la
   tabla resultante solo vive durante esta sesión del Host.
 - `TaskStore` es RAM volátil; al reiniciar un nodo se vacía.
-- `START` todavía no traduce las tareas almacenadas a los `Job` del scheduler
-  ni inicia la ejecución. Tampoco se generan `EVENT` o `TICK_REPORT`.
-- `STOP`, cancelación remota y persistencia no están implementados en este
-  flujo.
+- El inicio de ambos nodos no es simultáneo de forma sincronizada.
+- No se generan `EVENT` o `TICK_REPORT` para informar al Host del avance.
+- El Host envía STOP al salir normalmente; si el proceso termina abruptamente
+  o se pierde el enlace, el nodo no cuenta con un mecanismo de timeout que lo
+  detenga automáticamente.
 
-El siguiente incremento recomendado es integrar `TaskStore` con el scheduler
-del nodo: convertir cada tarea almacenada al tipo que consume el scheduler,
-crear/liberar jobs, recibir `START`, ejecutar ticks y devolver eventos y
-reportes. Antes de eso, validar físicamente `DEPLOY_TASK` y sus ACK/NACK.
+Para operar el flujo, compilar el Host y los firmwares actualizados, flashear
+cada MCU y ejecutar:
+
+```sh
+./output/host /dev/ttyUSB0 /dev/ttyACM0
+```
+
+En la consola del Host, escribir `start` para comenzar, `stop` para pausar,
+`start` de nuevo para reanudar o `exit` para detener ambos nodos y cerrar la
+sesión. La ejecución física de este flujo debe validarse en ambos dispositivos.
