@@ -78,7 +78,8 @@ typedef enum {
     PROTOCOL_OUT_RANGE    = -2,
     PROTOCOL_INVALID_ARG  = -3,
     PROTOCOL_INVALID_SIZE = -4,
-    PROTOCOL_INVALID_MODE = -5
+    PROTOCOL_INVALID_MODE = -5,
+    PROTOCOL_SERIAL_EIO = -6
 } protocol_errno_t;
 
 /*
@@ -248,7 +249,6 @@ typedef struct {
     bool wd_busy;   // RX ocupado con escritura
     bool rd_busy;   // RX ocupado con lectura
     size_t offset;  // offset de RX en lectura del encabezado
-    size_t count;   // contador de RX para lecturas de encabezado
 } protocol_rx_t;
 
 /*

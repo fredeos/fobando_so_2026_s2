@@ -20,22 +20,22 @@
 */
 serial_errno_t serial_configure(void* _obj, void* _config){
     // << Exceptions >>
-    if (_obj == NULL && _config == NULL)
+    if (_obj == NULL || _config == NULL)
         return SERIAL_INVALID_ARG;
     // << Open device >>
     int* dfd = (int*) _obj;
     posix_serial_config_t* conf = (posix_serial_config_t*) _config;
 
     *dfd = -1;
-    int fd = open(conf->device, O_RDWR | O_NOCTTY);
+    int fd = open(conf->device,  O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        perror("open");
+        //perror("open");
         return SERIAL_FAILURE;
     }
     // << Configure termios >>
     struct termios tty;
     if (tcgetattr(fd, &tty) != 0) {
-        perror("tcgetattr");
+        //perror("tcgetattr");
         close(fd);
         return SERIAL_FAILURE;
     }
@@ -51,16 +51,15 @@ serial_errno_t serial_configure(void* _obj, void* _config){
     tty.c_cflag &= ~CSIZE;
     tty.c_cflag |= CS8;
 
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 10;  // 1-second read timeout
+    tty.c_cc[VMIN]  = 0;
+    tty.c_cc[VTIME] = 0;
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        perror("tcsetattr");
+        //perror("tcsetattr");
         close(fd);
         return SERIAL_FAILURE;
     }
     // << Set the open file >>
-    
     tcflush(fd, TCIOFLUSH);
     *dfd = fd;
     // << Return >>
@@ -83,6 +82,7 @@ serial_errno_t serial_write(
         return SERIAL_INVALID_ARG;
     // << Cast object >>
     int* fd = (int*) _obj;
+    if (*fd < 0) return SERIAL_DISCONNECT;
     // << Configure packet >>
     if (_packet->mode != SERIAL_OUT)
         return SERIAL_INVALID_MODE; // Error: invalid packet mode
@@ -97,9 +97,11 @@ serial_errno_t serial_write(
         ptr,
         rem
     );
-    if (n < 0){
+    if (n < 0 && errno != EINTR){
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return SERIAL_NO_DATA;
+        if (errno == EIO)
+            return SERIAL_DISCONNECT;
         return SERIAL_FAILURE; // Error: failed to send packet
     }
     // << Detect if full packet sent >>
@@ -126,6 +128,7 @@ serial_errno_t serial_read(
         return SERIAL_INVALID_ARG;
     // << Cast object >>
     int* fd = (int*) _obj;
+    if (*fd < 0) return SERIAL_DISCONNECT;
     // << Configure packet >>
     if (_packet->mode != SERIAL_IN)
         return SERIAL_INVALID_MODE; // Error: invalid packet mode
@@ -140,9 +143,11 @@ serial_errno_t serial_read(
         ptr,
         rem
     );
-    if (n < 0){
+    if (n < 0 && errno != EINTR){
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return SERIAL_NO_DATA;
+        if (errno == EIO)
+            return SERIAL_DISCONNECT;
         return SERIAL_FAILURE; // Error: failed to receive packet
     }
     // << Detect if full packet sent >>

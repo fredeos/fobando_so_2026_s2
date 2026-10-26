@@ -86,6 +86,7 @@ void app_main(void){
             if (rx.complete){
                 // [Check message]
                 const char *msg = default_msg;
+                tx_frame.relevance = 0;
                 if (rx.valid){
                     // (Read buffer to frame)
                     protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
@@ -100,15 +101,18 @@ void app_main(void){
                         rx_frame.length
                     );
                     // (Check message)
-                    if (strcmp(message, "PING") == 0 && rx_frame.relevance == 0)
+                    if (strcmp(message, "PING") == 0 && rx_frame.relevance == 0){
                         msg = pong;
-                    else if (strcmp(message, "MARCO") == 0 && rx_frame.relevance > 0)
+                        tx_frame.relevance = 0;
+                    }
+                    else if (strcmp(message, "MARCO") == 0 && rx_frame.relevance > 0){
                         msg = polo;
+                        tx_frame.relevance = 1;
+                    }
                 }
                 // [Setup response]
                 uint32_t size = strlen(msg) + 1; // copy response until '\0'
 
-                tx_frame.relevance = 0;
                 tx_frame.length = size;
                 memcpy(tx_frame.payload, msg, size);
 

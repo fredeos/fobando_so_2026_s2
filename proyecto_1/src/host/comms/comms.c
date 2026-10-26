@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <string.h>
 
+#include "./../serial/posix.h"
+#include "./../timing/timing.h"
 // ===============================================================================================
 
 comms_status_t comms_init_handler(
@@ -23,7 +25,6 @@ comms_status_t comms_init_handler(
     handler->id  = id;
 
     handler->status = COMMS_OK;
-    handler->transactions = 0;
     
     handler->tick = tick;
     handler->tick_limit = tick_limit;
@@ -31,6 +32,7 @@ comms_status_t comms_init_handler(
     handler->online  = false;
     handler->running = false;
     handler->active  = false;
+    handler->finished = false;
 
     handler->priority = priority;
 
@@ -146,35 +148,24 @@ comms_status_t comms_acquire_receive(
 // ===============================================================================================
 
 void* comms_handler(void* arg){
-    bool setup_fail = false;
     // << Cast the argument >>
     comms_handler_t* hd = (comms_handler_t*) arg;
-    pthread_mutex_lock(&hd->mutex);   // lock
     // << Configure serial interface >>
     posix_serial_config_t ser_conf = {
         .device = hd->dev,
         .baudrate = SERIAL_BAUDRATE
     };
-
-    serial_errno_t ser_errno = serial_configure(
-        &hd->fd,
-        &ser_conf
-    );
-
-    if (!setup_fail) setup_fail = (ser_errno != SERIAL_OK);
     // << Configure protocol interface >>
+    // [TX:output]
     protocol_frame_t tx_frame;
     protocol_tx_t tx;
     serial_packet_t tx_packet;
-    protocol_errno_t tx_setup_errno = protocol_tx_init(&tx, &tx_packet);
-
+    
     // [RX:input]
     protocol_frame_t rx_frame;
     protocol_rx_t rx;
     serial_packet_t rx_packet;
-    protocol_errno_t rx_setup_errno = protocol_rx_init(&rx, &rx_packet);
 
-    if (!setup_fail) setup_fail = (tx_setup_errno != PROTOCOL_OK || rx_setup_errno != PROTOCOL_OK);
     // << Default values >>
     const char* default_msg = "PING";
     uint32_t default_size = strlen(default_msg) + 1;
@@ -183,46 +174,116 @@ void* comms_handler(void* arg){
 
     // << Thread variables >>
     comms_status_t status = COMMS_ALIVE;
+    uint64_t last = get_time_ms();
+    uint64_t ticks = 0;
 
-    int stage = 0;        // protocol stage transitions; TX <-> RX
+    int stage = 0;        // protocol stage transitions; MSG <-> TX <-> RX
     int transactions = 0; // transactions done
 
-    bool sent_pending = false;
+    bool sent_pending  = false; // custom message is pending to be sent
+    bool serial_refresh = true; // flag for interface refresh
     // << Procedure loop >>
-    if (setup_fail) {
-        printf("Failed to connect to device %s [%d]!\n", hd->dev, hd->id);
-    } else { 
-        hd->running = true;
-        hd->active  = true;
-        printf("Connected to device %s [%d] succesfully!\n", hd->dev, hd->id);
-    }
+    pthread_mutex_lock(&hd->mutex);   // lock
+    hd->online  = false;
+    hd->active  = true;
+    hd->running = false;
+    hd->finished = false;
     pthread_mutex_unlock(&hd->mutex); // unlock
-    while (!setup_fail){
+    while (1){
+        // [Refresh check]
+        /* The refresh check allow initializing protocol and serial interface components for
+         * connection, or reconnection in case device disconnection.
+         * This also handles transaction restarts to allow correct flow; this works by
+         * setting back the state to 0 and re-setting messages.
+        */
+        if (serial_refresh){ // check for refresh signal
+            serial_errno_t ser_errno = serial_configure(
+                &hd->fd,
+                &ser_conf
+            ); // <- try to setup the serial interface and flush it.
+            if (ser_errno == SERIAL_OK){
+                printf("%s: Device(%d) connected!\n", hd->dev, hd->id);
+                protocol_tx_init(&tx, &tx_packet); // <- this will reset the TX state machine
+                protocol_rx_init(&rx, &rx_packet); // <- this will reset the RX state machine
+                serial_refresh = false;
+                stage = 0;
+                transactions = 0;
+            }
+        }
         // [Transactions check]
-        bool timeout = false;
-
-        // [Synchronization barrier]
-        pthread_mutex_lock(&hd->mutex);   // lock
-        hd->online = !timeout;
-        if (timeout) status = COMMS_DEAD;
-
-        if(!hd->active && stage == 0){
-            hd->status = COMMS_END;
-            hd->online = false;
-            pthread_mutex_unlock(&hd->mutex); // unlock
-            break;
+        /* Transactions check allows verifying if the handler has received transactions
+         * in the defined number of ticks. This allows checking the responsiveness of
+         * the connected device.
+        */
+        uint64_t now = get_time_ms();
+        bool on_tick = (now - last >= hd->tick);
+        if (on_tick){
+            ticks++;
+            last += hd->tick;
         }
 
-        hd->status = status;
+        bool minimum = (transactions > 0);
+        bool full_ticks = (ticks >= hd->tick_limit);
+        if (full_ticks) {
+            ticks = 0;
+            transactions = 0;
+        }
 
+        bool timeout = (full_ticks && !minimum && !serial_refresh);
+        if (timeout) {
+            printf("%s: Device(%d) disconnected by timeout!\n", hd->dev, hd->id);
+            close(hd->fd);
+            stage = 0;
+            serial_refresh = true;
+            status = COMMS_TX_ERROR;
+        }
+        // [Synchronization barrier]
+        /* The barrier allows the handler synchronizing with main thread to check
+         * it's own status flags for events.
+        */
+        pthread_mutex_lock(&hd->mutex);   // lock
+        // (Set thread as running)
+        hd->running = true;
+        // (Set device online)
+        if (serial_refresh) hd->online = false;
+        else hd->online = !timeout;
+
+        if (!hd->online) status = COMMS_DEAD;
+        // (Thread killed)
+        if(!hd->active && stage == 0){
+            // + Update status and flags
+            hd->status = COMMS_END;
+            hd->online = false;
+            hd->running = false;
+            hd->finished = true;
+            pthread_mutex_unlock(&hd->mutex); // unlock
+            // + Close file descriptor
+            if (!serial_refresh){
+                printf("Closing file descriptor for device(%d)\n", hd->id);
+                close(hd->fd);
+            }
+            break;
+        }
+        // (Update status)
+        hd->status = status;
+        // (Extract requests)
         bool recv_set = hd->recv.set;
         bool recv_rdy = hd->recv.rdy;
 
         bool sent_set = hd->sent.set;
         bool sent_rdy = hd->sent.rdy;
         pthread_mutex_unlock(&hd->mutex); // unlock
+
         status = COMMS_ALIVE;
+        // [Refresh skip]
+        /* If the serial interface has no connection skips the whole prtocol polling */
+        if (serial_refresh) continue;
+
         // [Message configuration]
+        /* Setup a message for TX (stage 1). Checks if there are requests for custom messages
+         * and if it's possible to attend them. Otherwise, sets a default message; default
+         * message only has to be set once every time a custom message overrides it.
+        */
         if (stage == 0){
             char* msg = NULL;
             bool msg_set = false;
@@ -269,6 +330,14 @@ void* comms_handler(void* arg){
             stage = 1;
         }
         // [TX polling]
+        /* TX polling allows making the state machine progress and send each component
+         * of the defined frame. If the protocol throws an error from the serial interface
+         * it forces a serial refresh to check if the current device is still connected.
+         * Otherwise, if it still retains connection but it's waiting for an ACK; it eventually
+         * reaches a timeout which allows resending the whole frame again; however this could
+         * lead to a deadlock if RX on other device never reaches the ACK state. The ACK state
+         * allows to check the current frame as valid if the other device received it.
+        */
         if (stage == 1){
             // (Poll TX state machine)
             protocol_errno_t tx_errno = protocol_tx_poll(
@@ -277,8 +346,13 @@ void* comms_handler(void* arg){
                 &tx_packet
             );
             // (Check errors)
-            if (tx_errno != PROTOCOL_OK) status = COMMS_TX_ERROR;
-            else status = COMMS_TX_BUSY;
+            if (tx_errno == PROTOCOL_SERIAL_EIO) {
+                printf("%s: Device(%d) disconnected by error!\n", hd->dev, hd->id);
+                close(hd->fd);
+                stage = 0;
+                serial_refresh = true;
+                status = COMMS_TX_ERROR;
+            } else status = COMMS_TX_BUSY;
             // (Check completion)
             if (tx.complete && tx.valid){
                 if (sent_pending) {
@@ -288,11 +362,20 @@ void* comms_handler(void* arg){
                     pthread_mutex_unlock(&hd->mutex); // unlock
                     sent_pending = false;
                 }
+                // [Count transactions]
+                transactions++;
                 // [Move to RX]
                 stage = 2;
             }
         }
         // [RX polling]
+        /* RX polling allows making the state machine progress and receive components of
+         * a frame from an connected device. If the protoco, throws and error from the serial
+         * interface it forces a serial refresh to check if the currect device is still connected.
+         * The RX must wait for a valid header to start, meaning if TX from the other device never
+         * sends or sends an incorrect header the RX on this end will deadlock. However, the received
+         * frame doesn't have to be valid, since after receiving the complete frame it will move to stage 0
+        */
         if (stage == 2){
             // (Poll RX state machine)
             protocol_errno_t rx_errno = protocol_rx_poll(
@@ -301,8 +384,13 @@ void* comms_handler(void* arg){
                 &rx_packet
             );
             // (Check errors)
-            if (rx_errno != PROTOCOL_OK) status = COMMS_RX_ERROR;
-            else status = COMMS_RX_BUSY;
+            if (rx_errno == PROTOCOL_SERIAL_EIO) {
+                printf("%s: Device(%d) disconnected by error!\n", hd->dev, hd->id);
+                stage = 0;
+                serial_refresh = true;
+                status = COMMS_RX_ERROR;
+                close(hd->fd);
+            } else status = COMMS_RX_BUSY;
             // (Check completion)
             if (rx.complete){
                 if (rx.valid){ // [Extract message]
@@ -312,8 +400,8 @@ void* comms_handler(void* arg){
                         sizeof(rx.buffer)
                     );
                     if (rx_frame_errno == PROTOCOL_OK){
-                        // (Copy contents)
                         pthread_mutex_lock(&hd->mutex);   // lock
+                        // (Save contents)
                         bool msg_save = false;
                         if (recv_set && !recv_rdy){ // force message save
                             // + Save frame contents
@@ -327,6 +415,7 @@ void* comms_handler(void* arg){
                             // + Reset flags
                             hd->recv.rdy = true;
                         }
+                        // (Copy contents)
                         if (msg_save){
                             // + Copy frame contents
                             hd->recv.size = rx_frame.length;
@@ -337,21 +426,15 @@ void* comms_handler(void* arg){
                                 rx_frame.length
                             );
                         }
-                        hd->transactions++;
                         pthread_mutex_unlock(&hd->mutex); // unlock
-                        // (Count transactions)
-                        transactions++;
                     }
                 }
+                // [Count transactions]
+                transactions++;
                 // [Move to message change]
                 stage = 0;
             }
         }
-    }
-    hd->running = false;
-    if (!setup_fail) {
-        printf("Closing file descriptor for %s device(%d)\n", hd->dev, hd->id);
-        close(hd->fd);
     }
     // << Return >>
     return NULL;
