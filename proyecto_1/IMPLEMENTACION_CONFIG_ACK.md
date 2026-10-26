@@ -12,11 +12,15 @@ Host ── CONFIG en JSON ──> ESP32
 Host <── ACK en JSON ───── ESP32
 Host ── CALIBRATE_REQUEST > ESP32
 Host <── CALIBRATE_RESPONSE ESP32
+Host ── DEPLOY_TASK JSON ──> ESP32
+Host <── ACK/NACK ───────── ESP32
 
 Host ── CONFIG en JSON ──> Raspberry Pi Pico
 Host <── ACK en JSON ───── Raspberry Pi Pico
 Host ── CALIBRATE_REQUEST > Raspberry Pi Pico
 Host <── CALIBRATE_RESPONSE Pico
+Host ── DEPLOY_TASK JSON ──> Pico
+Host <── ACK/NACK ───────── Pico
 ```
 
 El JSON viaja dentro del payload del protocolo binario serial ya existente.
@@ -26,8 +30,8 @@ CRC no fueron reemplazados: se añadió una capa de contenido tipado sobre ellos
 El flujo implementado configura ambos nodos y mide su capacidad en unidades de
 trabajo por tick (`UT/tick`). Todavía no realiza admisión o despliegue de
 tareas, inicio del scheduler, transmisión de eventos ni parada coordinada de
-una ejecución. Los resultados se imprimen en el Host; todavía no se guardan
-en el `Planner`.
+una ejecución. El Host ahora carga y planifica las tareas, y los nodos guardan
+las asignadas en RAM; sin embargo, `START` todavía no inicia su ejecución.
 
 ## 2. Capas de comunicación
 
@@ -112,6 +116,36 @@ respuesta exitosa informa la media entera de las muestras:
 Si no se puede realizar la medición, el nodo responde `NACK` para
 `CALIBRATE_REQUEST` con `REJECT_CALIBRATION_FAILED`.
 
+El despliegue reutiliza `MSG_DEPLOY_TASK` y el identificador propio de la
+tarea:
+
+```json
+{
+  "type": "DEPLOY_TASK",
+  "node_id": 2,
+  "request_id": 3,
+  "data": {
+    "task": {
+      "id": 1,
+      "type": "P",
+      "work": 40,
+      "period": 20,
+      "deadline": 20,
+      "criticality": 2
+    },
+    "cost_ticks": 1
+  }
+}
+```
+
+`task.id` identifica la tarea, `node_id` indica el nodo destino y
+`request_id` correlaciona esta operación de despliegue con su respuesta. No se
+agregó un segundo ID de tarea. El Host reserva el 1 para CONFIG, el 2 para
+calibración y asigna IDs de solicitud consecutivos desde 3 para los
+despliegues. La respuesta satisfactoria es `ACK` con `message_type` igual a
+`DEPLOY_TASK`; errores de validación, duplicado, límite de tareas esporádicas
+o almacenamiento lleno producen `NACK` con el mismo nodo, solicitud y tipo.
+
 El ACK de ejemplo tiene esta forma:
 
 ```json
@@ -153,8 +187,8 @@ El serializador conoce los tipos declarados en el contrato común —entre ellos
 `CONFIG`, calibración, despliegue de tareas, `START`, eventos, reportes, ACK y
 NACK—, pero que un tipo se pueda serializar no significa que ya esté conectado
 al flujo de ejecución del Host o implementado en el comportamiento del
-firmware. En este incremento están conectados CONFIG/ACK y
-CALIBRATE_REQUEST/CALIBRATE_RESPONSE.
+firmware. En este flujo están conectados CONFIG/ACK,
+CALIBRATE_REQUEST/CALIBRATE_RESPONSE y DEPLOY_TASK con su ACK/NACK.
 
 ### Parser
 
@@ -215,6 +249,33 @@ Después de confirmar CONFIG en ambos, el Host envía a cada nodo
 `request_id = 2`. Ambos mensajes se encolan antes de esperar resultados. Los
 controladores seriales permanecen activos entre CONFIG y calibración y se
 detienen una vez que termina la sesión, no inmediatamente después de los ACK.
+
+Al terminar la calibración, el Host:
+
+1. Lee `config.tasks_file` con `task_parser_load()` y obtiene un arreglo de
+   `Task` desde el CSV.
+2. Inicializa un `Planner` con el algoritmo y la heurística de
+   `config/system.conf`.
+3. Agrega los nodos 1 y 2 al `Planner`, usando el resultado `ut_per_tick`
+   medido para cada dispositivo.
+4. Llama a `planner_plan_batch()`. El planificador reutiliza la lógica
+   existente de costo, utilización, límites RMS/EDF, duplicados y límite de
+   una tarea esporádica por nodo. Las decisiones conservan el orden original
+   del CSV, aunque la asignación interna se ordena para planificar el lote.
+5. Imprime las tareas que el planificador no admite y no las envía.
+6. Para cada tarea admitida, crea un `MSG_DEPLOY_TASK` con la tarea completa,
+   el `cost_ticks` calculado para el nodo elegido y un `request_id` único.
+   Envía una tarea y espera su respuesta antes de continuar con la siguiente
+   asignada a ese controlador.
+7. Si llega ACK, registra en la salida que la tarea quedó almacenada. Si llega
+   NACK, muestra su razón y elimina la reserva del `Planner` local con
+   `planner_remove_task()`, para que su estado refleje lo que realmente aceptó
+   el nodo. Un timeout o error de transporte interrumpe el despliegue y
+   termina la sesión.
+
+La decisión del planificador ocurre **antes** de mandar la tarea: un ACK del
+nodo significa “la guardé en mi tabla de tareas”, no “la tarea ya está
+ejecutándose” ni que el nodo haya repetido la prueba de admisión del Host.
 
 ### Validación de la respuesta
 
@@ -307,6 +368,77 @@ Cada firmware comparte la misma forma de proceder:
     `tx_frame.length`.
 11. La máquina TX del protocolo transmite la respuesta.
 
+Para `MSG_DEPLOY_TASK`, ambos firmware usan el almacenamiento común
+`TaskStore`:
+
+1. El parser llena `incoming.data.deploy_task.task` y
+   `incoming.data.deploy_task.cost_ticks`.
+2. `task_store_add()` valida que los campos esenciales sean válidos y que el
+   costo sea positivo.
+3. Rechaza un `task.id` ya almacenado con `REJECT_DUPLICATE_TASK`, una segunda
+   tarea esporádica con `REJECT_SPORADIC_LIMIT` y una tabla llena con
+   `REJECT_INSUFFICIENT_CAPACITY`.
+4. Si acepta, copia la definición completa y `cost_ticks` a un `StoredTask` en
+   la tabla fija del MCU, y aumenta `TaskStore.count`.
+5. El firmware serializa un ACK correlacionado. Ante rechazo, serializa un
+   NACK correlacionado con la razón correspondiente.
+
+`TASK_MAX_PER_NODE` establece una capacidad de 8 entradas por nodo. La tabla
+es estática y reside en RAM; no sobrevive al reinicio. El scheduler usa esa
+misma constante mediante `MAX_TASKS`, así que no puede aceptar más tareas que
+las almacenables en `TaskStore`. Aunque ya existe una función de conversión al
+tipo del scheduler, el flujo todavía no la invoca: no se crean `Job`, no se
+ejecuta RMS/EDF y no se genera ningún `EVENT` o `TICK_REPORT`. La tarea queda
+preparada para un futuro paso de inicio/ejecución.
+
+### Conversión de la tarea guardada al tipo del scheduler
+
+Para poder incluir en un mismo archivo la definición compartida del mensaje y
+la definición que usa el scheduler, se renombró el tipo interno del scheduler
+de `Task` a `SchedulerTask` en `src/nodes/scheduler/task.h`. El tipo común
+`Task` mantiene su nombre y sigue siendo el que guarda `TaskStore` y el que
+viaja en JSON.
+
+La función `scheduler_task_from_stored()` está declarada en
+`src/nodes/scheduler/task_conversion.h` e implementada en
+`src/nodes/scheduler/task_conversion.c`. Recibe un `StoredTask` y produce un
+`SchedulerTask` con este mapeo:
+
+| Tarea compartida / almacenada | Tipo del scheduler | Significado |
+|---|---|---|
+| `task.id` | `id` | Identificador de la tarea |
+| `task.type` | `type` | `'P'` periódica o `'S'` esporádica |
+| `task.work` | `W` | Trabajo requerido en unidades de trabajo |
+| `task.period` | `T` | Período o intervalo mínimo |
+| `task.deadline` | `D` | Plazo relativo |
+| `task.criticality` | `criticality` | Criticidad |
+| `StoredTask.cost_ticks` | `C` | Costo estimado en ticks del nodo |
+
+La función valida que los valores requeridos sean positivos y que la
+criticidad no sea negativa: el tipo común permite `int32_t`, mientras que
+`SchedulerTask.criticality` es `uint32_t`, por lo que una criticidad negativa
+no se puede representar sin cambiar su significado. Escribe el resultado solo
+si toda la entrada es válida; devuelve `false` para punteros inválidos o datos
+no representables.
+
+Ejemplo para el futuro bucle de carga del scheduler:
+
+```c
+for (size_t i = 0u; i < deployed_tasks.count; ++i) {
+    SchedulerTask scheduler_task;
+    if (!scheduler_task_from_stored(&deployed_tasks.tasks[i],
+                                    &scheduler_task) ||
+        !add_task(&scheduler_task, &scheduler)) {
+        // Manejar explícitamente la tarea no representable o no aceptada.
+    }
+}
+```
+
+Este bucle es ilustrativo y todavía no se ejecuta en el firmware: el flujo
+actual almacena las tareas y responde ACK/NACK, pero aún no procesa `START` ni
+registra las tareas en `Scheduler`. El conversor se compila para Pico/Pico W y
+ESP32, y tiene una prueba unitaria que verifica el mapeo y los casos inválidos.
+
 Si el mensaje no coincide con el comportamiento implementado, el firmware
 responde con el texto heredado “didn't understand message”. El manejo de
 `PING`/`MARCO` permanece disponible para conservar la prueba anterior.
@@ -345,9 +477,9 @@ ejecución del calibrador por nodo es de aproximadamente 40 ms, más el tiempo
 de comunicación y el overhead del sistema.
 
 Cada plataforma mide su propio hardware. La frecuencia, la compilación, las
-optimizaciones y la carga del dispositivo pueden afectar el resultado. La
-medición todavía no inicializa el planificador ni equivale a desplegar o
-ejecutar tareas.
+optimizaciones y la carga del dispositivo pueden afectar el resultado. El Host
+usa el valor para la admisión, pero la calibración por sí sola no inicia el
+scheduler ni equivale a desplegar o ejecutar tareas.
 
 ## 8. Integración de archivos comunes en los builds
 
@@ -379,20 +511,32 @@ El Makefile también contiene dependencias de enlace para que:
 |---|---|
 | `src/common/message_serializer.c` | Implementa la conversión de `Message` a JSON y serializa el nuevo motivo NACK. |
 | `include/common/message_parser.h` | Declara el parser/serializador y los límites de muestras de calibración. |
-| `src/host/main.c` | Carga configuración, genera CONFIG por nodo, espera ACK y coordina el cierre. |
+| `src/host/main.c` | Coordina CONFIG, calibración, carga CSV, admisión, despliegue y ACK/NACK de cada tarea. |
+| `src/host/planner/planner.c` | Conserva la asignación existente y permite revertir una reserva tras un NACK del MCU. |
+| `include/host/planner.h` | Declara la operación `planner_remove_task()` para rollback. |
+| `src/host/config/task_parser.c` | Carga las definiciones de tareas desde el CSV configurado. |
 | `src/host/comms/comms.h` | Define la capacidad de buffers para el payload JSON. |
 | `src/host/comms/comms.c` | Transporta mensajes y sincroniza buffers; permite que JSON de aplicación reemplace texto heartbeat antiguo en RX. |
 | `src/nodes/esp32/main/main.c` | Maneja CONFIG y calibración del nodo 1; responde ACK, resultado o NACK. |
 | `src/nodes/pico/main.c` | Maneja CONFIG y calibración del nodo 2; responde ACK, resultado o NACK, con GPIO de estado válidos para RP2040. |
 | `src/nodes/esp32/src/calibrator.c` | Mide unidades de trabajo por intervalo del ESP32. |
 | `src/nodes/pico/src/calibrator.c` | Mide unidades de trabajo por intervalo del Pico. |
+| `src/nodes/scheduler/task.h` | Define `SchedulerTask` y `Job` para separar el tipo de ejecución del `Task` compartido. |
+| `src/nodes/scheduler/task_conversion.h` | Expone la conversión de `StoredTask` a `SchedulerTask`. |
+| `src/nodes/scheduler/task_conversion.c` | Valida y convierte campos, incluyendo el costo guardado a `C`. |
+| `include/common/task.h` | Define el máximo común de 8 tareas por nodo, compartido por almacenamiento y scheduler. |
+| `include/common/task_store.h` | Define `StoredTask` (tarea y costo) y `TaskStore` (tabla fija). |
+| `src/common/task_store.c` | Valida, detecta duplicados/límites y almacena tareas recibidas. |
 | `src/nodes/esp32/main/CMakeLists.txt` | Incluye serializador, calibrador y dependencia `esp_timer`. |
 | `src/nodes/pico/CMakeLists.txt` | Incluye fuentes comunes y el calibrador del Pico. |
 | `src/common/ut.c` | Define el trabajo unitario medido por los calibradores. |
 | `src/common/message_parser.c` | Reconoce `REJECT_CALIBRATION_FAILED` como motivo NACK. |
 | `include/common/events.h` | Añade `REJECT_CALIBRATION_FAILED` como motivo de NACK. |
 | `src/host/report/statistics.c` | Asigna una descripción al nuevo motivo de rechazo. |
-| `tests/test_message_parser.c` | Comprueba round-trip de respuesta y NACK de calibración y errores de buffers. |
+| `tests/test_message_parser.c` | Comprueba mensajes de calibración y NACK de despliegue, ida y vuelta. |
+| `tests/test_task_store.c` | Comprueba copia de parámetros, duplicados, límite esporádico y capacidad. |
+| `tests/test_task_conversion.c` | Comprueba el mapeo a `SchedulerTask` y rechazos de entradas inválidas. |
+| `tests/test_planner.c` | Comprueba que el rollback del planner libera la asignación rechazada. |
 | `Makefile` | Mantiene dependencias y tests; ofrece targets `pico-build` y `picow-build`. |
 | `IMPLEMENTACION_CONFIG_ACK.md` | Documenta el diseño, compilación, carga y validación física. |
 
@@ -427,6 +571,7 @@ ejecutarse directamente:
 ```bash
 make output/test_message_parser
 ./output/test_message_parser
+./output/test_task_store
 ```
 
 ### Cargar firmware en Pico W
@@ -468,7 +613,7 @@ Las etiquetas `[0]` y `[1]` que aparecen en los mensajes internos
 viajan en JSON.
 
 Tras cargar el firmware Pico W actualizado y corregir la prioridad del buffer
-de recepción en el Host, se ejecutó el intercambio completo:
+de recepción en el Host, se ejecutó la calibración completa:
 
 ```text
 Enviando CONFIG a nodo 1 (108 bytes JSON).
@@ -487,6 +632,11 @@ correlacionado, procesaron `CALIBRATE_REQUEST` y entregaron una respuesta JSON
 que el Host aceptó. `71` y `99` son los resultados de esa ejecución y esa
 compilación: son mediciones, no constantes fijas ni valores que deban repetirse
 exactamente en otra sesión.
+
+El despliegue de tareas se incorporó después de esa prueba física. El Host,
+los dos firmwares y las pruebas unitarias ya compilan con el nuevo flujo, pero
+todavía debe validarse el envío/ACK de tareas con los firmwares recién
+flasheados en hardware.
 
 ### Diagnóstico de los timeouts durante la integración
 
@@ -514,16 +664,19 @@ Si CONFIG/ACK funciona pero vuelve a ocurrir un timeout de calibración, revisar
 
 ## 12. Límites actuales y siguiente incremento
 
-- El Host implementa CONFIG/ACK y solicitud/recepción de calibración, no el
-  ciclo entero de tareas.
+- El Host implementa CONFIG/ACK, calibración, admisión, asignación y
+  despliegue/almacenamiento de las tareas admitidas.
 - Los nodos guardan `tick_ms` para calibrar. El algoritmo y la frecuencia de
   reportes recibidos en CONFIG aún no se aplican a un scheduler.
-- No se envían tareas de `config/tasks.csv`.
-- No se envían `DEPLOY_TASK`, `START`, `STOP`, `EVENT` ni `TICK_REPORT` como
-  parte de una ejecución del scheduler.
-- La calibración produce y muestra `UT/tick`, pero todavía no inicializa el
-  `Planner` del Host con esos resultados.
+- El Host usa las capacidades calibradas para llamar al `Planner`, pero la
+  tabla resultante solo vive durante esta sesión del Host.
+- `TaskStore` es RAM volátil; al reiniciar un nodo se vacía.
+- `START` todavía no traduce las tareas almacenadas a los `Job` del scheduler
+  ni inicia la ejecución. Tampoco se generan `EVENT` o `TICK_REPORT`.
+- `STOP`, cancelación remota y persistencia no están implementados en este
+  flujo.
 
-El siguiente incremento recomendado es guardar las capacidades medidas en el
-planificador del Host y usarlas para planificar las tareas de
-`config/tasks.csv`.
+El siguiente incremento recomendado es integrar `TaskStore` con el scheduler
+del nodo: convertir cada tarea almacenada al tipo que consume el scheduler,
+crear/liberar jobs, recibir `START`, ejecutar ticks y devolver eventos y
+reportes. Antes de eso, validar físicamente `DEPLOY_TASK` y sus ACK/NACK.

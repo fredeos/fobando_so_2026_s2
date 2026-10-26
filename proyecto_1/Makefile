@@ -48,6 +48,8 @@ TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
+TASK_STORE_TEST := $(OUT_DIR)/test_task_store
+TASK_CONVERSION_TEST := $(OUT_DIR)/test_task_conversion
 EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
 REPORT_TEST := $(OUT_DIR)/test_report
 REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
@@ -130,6 +132,9 @@ FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
 MESSAGE_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_message_parser.o
+TASK_STORE_TEST_OBJ := $(BUILD_DIR)/tests/test_task_store.o
+TASK_CONVERSION_TEST_OBJ := $(BUILD_DIR)/tests/test_task_conversion.o
+TASK_CONVERSION_OBJ := $(BUILD_DIR)/nodes/scheduler/task_conversion.o
 EVENT_QUEUE_TEST_OBJ := $(BUILD_DIR)/tests/test_event_queue.o
 REPORT_TEST_OBJ := $(BUILD_DIR)/tests/test_report.o
 REPORT_SESSION_TEST_OBJ := $(BUILD_DIR)/tests/test_report_session.o
@@ -161,6 +166,8 @@ TEST_OBJS := \
     $(FAILOVER_TEST_OBJ) \
     $(MANUAL_TEST_OBJ) \
     $(MESSAGE_PARSER_TEST_OBJ) \
+    $(TASK_STORE_TEST_OBJ) \
+    $(TASK_CONVERSION_TEST_OBJ) \
     $(EVENT_QUEUE_TEST_OBJ) \
     $(REPORT_TEST_OBJ) \
     $(REPORT_SESSION_TEST_OBJ)
@@ -326,6 +333,20 @@ $(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
+$(TASK_STORE_TEST): $(TASK_STORE_TEST_OBJ) \
+                    $(BUILD_DIR)/common/task_store.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(TASK_CONVERSION_OBJ): $(SRC_DIR)/nodes/scheduler/task_conversion.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TASK_CONVERSION_TEST): $(TASK_CONVERSION_TEST_OBJ) \
+                         $(TASK_CONVERSION_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
 # Cola compartida, reconstrucción de reportes y coordinación de cierre
 $(EVENT_QUEUE_TEST): $(EVENT_QUEUE_TEST_OBJ) $(EVENT_QUEUE_OBJ)
 	@mkdir -p $(dir $@)
@@ -350,6 +371,8 @@ test: $(FOUNDATION_TEST) \
       $(RMS_TEST) \
       $(EDF_TEST) \
       $(MESSAGE_PARSER_TEST) \
+      $(TASK_STORE_TEST) \
+      $(TASK_CONVERSION_TEST) \
       $(EVENT_QUEUE_TEST) \
       $(REPORT_TEST) \
       $(REPORT_SESSION_TEST)
@@ -360,6 +383,8 @@ test: $(FOUNDATION_TEST) \
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
 	./$(MESSAGE_PARSER_TEST)
+	./$(TASK_STORE_TEST)
+	./$(TASK_CONVERSION_TEST)
 	./$(EVENT_QUEUE_TEST)
 	./$(REPORT_TEST)
 	./$(REPORT_SESSION_TEST)

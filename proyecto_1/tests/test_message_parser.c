@@ -356,6 +356,9 @@ static void test_message_serialization(void)
         assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
         assert(parsed.data.reply.reason == REJECT_CALIBRATION_FAILED);
     }
+    message.data.reply.type = MSG_DEPLOY_TASK;
+    message.data.reply.reason = REJECT_INSUFFICIENT_CAPACITY;
+    assert_round_trip(&message);
 
     char buffer[MESSAGE_MAX_BYTES + 1u];
     size_t length = 123u;

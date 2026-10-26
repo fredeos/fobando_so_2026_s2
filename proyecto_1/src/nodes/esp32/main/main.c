@@ -8,6 +8,7 @@
 #include "common/protocol.h"
 #include "common/message_parser.h"
 #include "common/messages.h"
+#include "common/task_store.h"
 #include "calibrator.h"
 #include "serial/esp32.h"
 #include "serial/serial.h"
@@ -24,6 +25,8 @@
 #define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
 
 static uint32_t configured_tick_ms;
+/* Tabla temporal: los despliegues aceptados desaparecen al reiniciar el MCU. */
+static TaskStore deployed_tasks;
 
 static bool serialize_reply(
     const Message *request,
@@ -126,6 +129,21 @@ static bool prepare_response(
                 response_length);
         }
 
+        if (incoming.type == MSG_DEPLOY_TASK) {
+            /*
+             * El Host ya hizo la prueba de admisión. Este paso valida límites
+             * locales, guarda la tarea y confirma el almacenamiento con ACK.
+             */
+            RejectReason reason = task_store_add(
+                &deployed_tasks,
+                &incoming.data.deploy_task.task,
+                incoming.data.deploy_task.cost_ticks
+            );
+            MessageType reply_type = reason == REJECT_NONE ? MSG_ACK : MSG_NACK;
+            return serialize_reply(&incoming, reply_type, reason, 0u,
+                response, response_capacity, response_length);
+        }
+
         return false;
     }
 
@@ -146,6 +164,8 @@ static bool prepare_response(
 
 void app_main(void){
     bool setup_fail = false;
+    /* No se conserva estado de tareas entre reinicios del ESP32. */
+    task_store_init(&deployed_tasks);
     // << Setup ESP32 serial interface >>
     esp32_uart_t uart;
     esp32_uart_configs_t uart_conf = {

@@ -119,6 +119,10 @@ int main(void)
     assert(planner_assign_task(
         &rms, &a
     ).accepted);
+    assert(rms.nodes[0].task_count == 1u);
+    assert(planner_remove_task(&rms, 1u, a.id));
+    assert(rms.nodes[0].task_count == 0u);
+    assert(planner_assign_task(&rms, &a).accepted);
 
     assert(!planner_assign_task(
         &rms, &b

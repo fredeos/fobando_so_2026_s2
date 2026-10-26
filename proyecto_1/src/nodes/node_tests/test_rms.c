@@ -15,7 +15,7 @@ void test_rms_criticality(void) {
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 1,
         .type = 'P',
         .W = 200,
@@ -25,7 +25,7 @@ void test_rms_criticality(void) {
         .C = 2
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 2,
         .type = 'P',
         .W = 100,
@@ -35,7 +35,7 @@ void test_rms_criticality(void) {
         .C = 1
     };
 
-    Task taskC = {
+    SchedulerTask taskC = {
         .id = 3,
         .type = 'P',
         .W = 300,
@@ -71,7 +71,7 @@ void test_rms_inactive_jobs(void) {
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 1,
         .type = 'P',
         .W = 100,
@@ -81,7 +81,7 @@ void test_rms_inactive_jobs(void) {
         .C = 1
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 2,
         .type = 'P',
         .W = 100,
@@ -120,7 +120,7 @@ void test_rms_release_tie(void) {
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 200,
@@ -151,7 +151,7 @@ void test_rms_release_tie(void) {
 
 
 // ---------------------------------------------------------
-// TEST 4: Tie by Task ID
+// TEST 4: Tie by SchedulerTask ID
 // ---------------------------------------------------------
 
 void test_rms_id_tie(void) {
@@ -159,7 +159,7 @@ void test_rms_id_tie(void) {
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 10,
         .type = 'P',
         .W = 100,
@@ -169,7 +169,7 @@ void test_rms_id_tie(void) {
         .C = 1
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 5,
         .type = 'P',
         .W = 100,
@@ -192,7 +192,7 @@ void test_rms_id_tie(void) {
     assert(selected >= 0);
     assert(sc.jobs[selected].task->id == 5);
 
-    printf("[SUCCESS] RMS tie by lowest Task ID\n");
+    printf("[SUCCESS] RMS tie by lowest SchedulerTask ID\n");
 }
 
 
@@ -205,7 +205,7 @@ void test_rms_index_tie(void) {
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 100,

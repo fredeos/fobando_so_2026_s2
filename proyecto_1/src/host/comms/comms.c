@@ -331,7 +331,8 @@ void* comms_handler(void* arg){
                             hd->recv.set = false;
                         } else if (rx_frame.relevance >= hd->priority &&
                                    (!hd->recv.rdy ||
-                                    (rx_frame.length > 0u &&
+                                    (hd->recv.content != NULL &&
+                                     rx_frame.length > 0u &&
                                      rx_frame.payload[0] == '{' &&
                                      (hd->recv.size == 0u ||
                                       hd->recv.content[0] != '{')))){ // prefer app JSON over heartbeat text

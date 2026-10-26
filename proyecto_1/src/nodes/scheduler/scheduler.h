@@ -3,9 +3,10 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "common/task.h"
 #include "task.h"
 
-#define MAX_TASKS 20
+#define MAX_TASKS TASK_MAX_PER_NODE
 #define MAX_JOBS 40
 
 // ---------------------- SchedulerType ----------------------
@@ -30,7 +31,7 @@ typedef enum {
 typedef struct Scheduler {
     SchedulerType type;
 
-    Task tasks[MAX_TASKS]; // Tasks assigned by the host.
+    SchedulerTask tasks[MAX_TASKS]; // Tasks assigned by the host.
     Job jobs[MAX_JOBS];    // Storage for active jobs.
 
     uint32_t free_index[MAX_JOBS];
@@ -78,7 +79,7 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type);
  * Registers a periodic or sporadic task after validating its parameters
  * and checking that the scheduler has enough capacity.
  */
-bool add_task(Task *task, Scheduler *sc);
+bool add_task(SchedulerTask *task, Scheduler *sc);
 
 /*
  * Retrieves an available job slot from the free-index list.

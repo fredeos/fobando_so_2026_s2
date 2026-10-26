@@ -4,9 +4,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// necessary structs for schedulers
+/*
+ * Scheduler-specific task representation.
+ * The name SchedulerTask keeps it distinct from common Task, the JSON type.
+ */
 
-typedef struct Task
+typedef struct SchedulerTask
 {
     uint32_t id;
     char type;
@@ -15,11 +18,11 @@ typedef struct Task
     uint32_t D; // relative end time
     uint32_t criticality; // how important the task is
     uint32_t C; // tick equivalent
-} Task;
+} SchedulerTask;
 
 typedef struct Job
 {
-    Task *task;
+    SchedulerTask *task;
     uint32_t release; // a partir de que tick empezò
     uint32_t deadline; 
     uint32_t ut_remaining; // cuantas uts le quedan

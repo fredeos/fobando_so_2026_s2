@@ -65,6 +65,16 @@ PlannerDecision planner_assign_task(
 );
 
 /*
+ * Revierte la reserva local si el MCU responde NACK al despliegue,
+ * manteniendo la capacidad del Planner alineada con las tareas almacenadas.
+ */
+bool planner_remove_task(
+    Planner *planner,
+    uint32_t node_id,
+    uint32_t task_id
+);
+
+/*
  * Planifica un conjunto de tareas.
  *
  * Las ordena por utilización decreciente

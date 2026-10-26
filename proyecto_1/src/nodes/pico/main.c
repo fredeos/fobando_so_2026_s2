@@ -123,6 +123,7 @@ int main(void)
 #include "common/protocol.h"
 #include "common/message_parser.h"
 #include "common/messages.h"
+#include "common/task_store.h"
 #include "calibrator.h"
 #include "gpio/gpio.h"
 
@@ -135,6 +136,8 @@ int main(void)
 #define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
 
 static uint32_t configured_tick_ms;
+/* Las tareas desplegadas se conservan en RAM y aún no se ejecutan con START. */
+static TaskStore deployed_tasks;
 
 static bool serialize_reply(
     const Message *request,
@@ -237,6 +240,21 @@ static bool prepare_response(
                 response_length);
         }
 
+        if (incoming.type == MSG_DEPLOY_TASK) {
+            /*
+             * Guarda Task y cost_ticks ya calculado por el Host. El ACK confirma
+             * almacenamiento, no admisión local ni inicio del scheduler.
+             */
+            RejectReason reason = task_store_add(
+                &deployed_tasks,
+                &incoming.data.deploy_task.task,
+                incoming.data.deploy_task.cost_ticks
+            );
+            MessageType reply_type = reason == REJECT_NONE ? MSG_ACK : MSG_NACK;
+            return serialize_reply(&incoming, reply_type, reason, 0u,
+                response, response_capacity, response_length);
+        }
+
         return false;
     }
 
@@ -257,6 +275,8 @@ static bool prepare_response(
 
 void main(void){
     bool setup_fail = false;
+    /* Cada arranque comienza con una tabla de tareas vacía. */
+    task_store_init(&deployed_tasks);
 
     // << Setup Pico serial interface >>
     pico_serial_t serial;
