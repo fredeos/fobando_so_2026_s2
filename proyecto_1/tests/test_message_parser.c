@@ -117,6 +117,9 @@ static void test_message_types(void)
     assert(message.type == MSG_NACK);
     assert(message.data.reply.type == MSG_DEPLOY_TASK);
     assert(message.data.reply.reason == REJECT_INSUFFICIENT_CAPACITY);
+    message = parse("NACK",
+        "{\"message_type\":\"CALIBRATE_REQUEST\",\"reason\":7}");
+    assert(message.data.reply.reason == REJECT_CALIBRATION_FAILED);
 }
 
 /*
@@ -247,7 +250,7 @@ static void test_numeric_limits(void)
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":2147483648}}",
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":-2147483649}}",
         "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":0}}",
-        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":7}}",
+        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":8}}",
         "{\"type\":\"DEPLOY_TASK\",\"node_id\":1,\"request_id\":1,\"data\":{\"task\":{\"id\":1,\"type\":\"P\",\"work\":0,\"period\":1,\"deadline\":1,\"criticality\":0},\"cost_ticks\":1}}"
     };
 
@@ -292,6 +295,15 @@ static void test_message_serialization(void)
     message.type = MSG_CALIBRATE_RESPONSE;
     message.data.ut_per_tick = 100u;
     assert_round_trip(&message);
+    {
+        char json[MESSAGE_MAX_BYTES + 1u];
+        size_t length = 0u;
+        Message parsed;
+        assert(message_serialize(&message, json, sizeof(json), &length)
+               == MESSAGE_SERIALIZE_OK);
+        assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+        assert(parsed.data.ut_per_tick == 100u);
+    }
 
     message = (Message){
         .type = MSG_DEPLOY_TASK, .node_id = 2u, .request_id = 9u,
@@ -333,8 +345,17 @@ static void test_message_serialization(void)
     };
     assert_round_trip(&message);
     message.type = MSG_NACK;
-    message.data.reply.reason = REJECT_INSUFFICIENT_CAPACITY;
+    message.data.reply.reason = REJECT_CALIBRATION_FAILED;
     assert_round_trip(&message);
+    {
+        char json[MESSAGE_MAX_BYTES + 1u];
+        size_t length = 0u;
+        Message parsed;
+        assert(message_serialize(&message, json, sizeof(json), &length)
+               == MESSAGE_SERIALIZE_OK);
+        assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+        assert(parsed.data.reply.reason == REJECT_CALIBRATION_FAILED);
+    }
 
     char buffer[MESSAGE_MAX_BYTES + 1u];
     size_t length = 123u;

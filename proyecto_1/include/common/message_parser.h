@@ -9,6 +9,8 @@
 
 /* Límite del contenido JSON, independiente de las cabeceras de transporte */
 #define MESSAGE_MAX_BYTES 256u
+#define CALIBRATION_DEFAULT_SAMPLES 5u
+#define CALIBRATION_MAX_SAMPLES 100u
 
 /* Algoritmo local solicitado al nodo, sin dependencias del Host */
 typedef enum {

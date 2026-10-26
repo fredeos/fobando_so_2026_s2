@@ -123,15 +123,77 @@ int main(void)
 #include "common/protocol.h"
 #include "common/message_parser.h"
 #include "common/messages.h"
+#include "calibrator.h"
 #include "gpio/gpio.h"
 
-#define LED0 26
-#define LED1 25
-#define LED2 33
-#define LED3 32
+#define LED0 22
+#define LED1 26
+#define LED2 27
+#define LED3 28
 
 #define NODE_ID 2u
 #define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
+
+static uint32_t configured_tick_ms;
+
+static bool serialize_reply(
+    const Message *request,
+    MessageType type,
+    RejectReason reason,
+    uint32_t ut_per_tick,
+    char *response,
+    size_t response_capacity,
+    uint32_t *response_length
+)
+{
+    Message reply = {
+        .type = type,
+        .node_id = NODE_ID,
+        .request_id = request->request_id
+    };
+    if (type == MSG_ACK) {
+        reply.data.reply.type = request->type;
+    } else if (type == MSG_NACK) {
+        reply.data.reply.type = request->type;
+        reply.data.reply.reason = reason;
+    } else {
+        reply.data.ut_per_tick = ut_per_tick;
+    }
+
+    size_t json_length = 0u;
+    if (message_serialize(&reply, response, response_capacity,
+                          &json_length) != MESSAGE_SERIALIZE_OK) {
+        return false;
+    }
+    *response_length = (uint32_t)json_length;
+    return true;
+}
+
+static bool calibrate(
+    uint32_t sample_ticks,
+    uint32_t *ut_per_tick
+)
+{
+    if (configured_tick_ms == 0u ||
+        configured_tick_ms > UINT32_MAX / 1000u ||
+        sample_ticks == 0u || sample_ticks > CALIBRATION_MAX_SAMPLES) {
+        return false;
+    }
+
+    uint64_t total_units = 0u;
+    for (uint32_t sample = 0u; sample < sample_ticks; ++sample) {
+        CalibrationResult result;
+        if (!calibrator_run(configured_tick_ms * 1000u, 20u, &result))
+            return false;
+        total_units += result.units_per_tick;
+    }
+
+    uint64_t average = total_units / sample_ticks;
+    if (average == 0u || average > UINT32_MAX)
+        return false;
+    *ut_per_tick = (uint32_t)average;
+    return true;
+}
 
 /* Prepara CONFIG/ACK JSON y conserva el protocolo de prueba PING/MARCO. */
 static bool prepare_response(
@@ -154,23 +216,28 @@ static bool prepare_response(
 
     Message incoming;
     if (message_parse(request, request_length, &incoming) == MESSAGE_PARSE_OK) {
-        if (incoming.type != MSG_CONFIG || incoming.node_id != NODE_ID)
+        if (incoming.node_id != NODE_ID)
             return false;
 
-        Message reply = {
-            .type = MSG_ACK,
-            .node_id = NODE_ID,
-            .request_id = incoming.request_id,
-            .data.reply = {.type = MSG_CONFIG}
-        };
-        size_t json_length = 0u;
-        /* El request_id permite asociar el ACK con la petición CONFIG original. */
-        if (message_serialize(&reply, response, response_capacity,
-                              &json_length) != MESSAGE_SERIALIZE_OK) {
-            return false;
+        if (incoming.type == MSG_CONFIG) {
+            configured_tick_ms = incoming.data.config.tick_ms;
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
         }
-        *response_length = (uint32_t)json_length;
-        return true;
+
+        if (incoming.type == MSG_CALIBRATE_REQUEST) {
+            uint32_t ut_per_tick = 0u;
+            if (calibrate(incoming.data.sample_ticks, &ut_per_tick)) {
+                return serialize_reply(&incoming, MSG_CALIBRATE_RESPONSE,
+                    REJECT_NONE, ut_per_tick, response, response_capacity,
+                    response_length);
+            }
+            return serialize_reply(&incoming, MSG_NACK,
+                REJECT_CALIBRATION_FAILED, 0u, response, response_capacity,
+                response_length);
+        }
+
+        return false;
     }
 
     const char *legacy = "Pico didn't understand message";

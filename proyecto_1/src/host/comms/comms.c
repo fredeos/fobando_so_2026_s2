@@ -106,7 +106,7 @@ comms_status_t comms_request_send(
     }
     handler->sent.priority = priority;
     handler->sent.size = size;
-    memcpy(
+    memmove(
         handler->sent.content,
         message,
         size
@@ -329,7 +329,12 @@ void* comms_handler(void* arg){
                             // + Reset flags
                             hd->recv.rdy = true;
                             hd->recv.set = false;
-                        } else if (rx_frame.relevance >= hd->priority && !recv_rdy){ // priority message save
+                        } else if (rx_frame.relevance >= hd->priority &&
+                                   (!hd->recv.rdy ||
+                                    (rx_frame.length > 0u &&
+                                     rx_frame.payload[0] == '{' &&
+                                     (hd->recv.size == 0u ||
+                                      hd->recv.content[0] != '{')))){ // prefer app JSON over heartbeat text
                             // + Save frame contents
                             msg_save = true;
                             // + Reset flags

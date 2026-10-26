@@ -360,6 +360,7 @@ const char *report_reject_reason(int32_t reason)
         case REJECT_SPORADIC_LIMIT: return "Límite de esporádicas";
         case REJECT_NO_AVAILABLE_NODE: return "Sin nodo disponible";
         case REJECT_SPORADIC_NODE_FAILED: return "Falla del nodo de la esporádica";
+        case REJECT_CALIBRATION_FAILED: return "Falla de calibración";
         default: return "Motivo desconocido";
     }
 }

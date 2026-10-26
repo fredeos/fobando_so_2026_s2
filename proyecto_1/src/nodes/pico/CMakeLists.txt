@@ -36,6 +36,7 @@ add_executable(pico
     main.c
 
     ${COMMON_SOURCES}
+    src/calibrator.c
     ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON/core_json.c
 
     gpio/gpio.c
@@ -43,6 +44,7 @@ add_executable(pico
 )
 
 target_include_directories(pico PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src
     ${CMAKE_CURRENT_LIST_DIR}/../../../include
     ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON
 )
