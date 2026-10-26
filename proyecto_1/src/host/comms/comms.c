@@ -98,6 +98,7 @@ comms_status_t comms_request_send(
     if (size > COMMS_MESSAGE_CAPACITY || size > PROTOCOL_PAYLOAD_BYTES)
         return COMMS_INVALID_ARG;
 
+    /* El buffer compartido con el hilo se actualiza bajo el mismo mutex. */
     pthread_mutex_lock(&handler->mutex);   // lock
     if (handler->sent.set) {
         pthread_mutex_unlock(&handler->mutex);

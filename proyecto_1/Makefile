@@ -224,6 +224,7 @@ $(BUILD_DIR)/tests/%.o: tests/%.c
 # FOUNDATION TEST
 # ============================================================
 
+# protocol.o también referencia conversión de enteros y la interfaz serial.
 $(FOUNDATION_TEST): $(FOUNDATION_TEST_OBJ) \
                     $(BUILD_DIR)/common/protocol.o \
                     $(BUILD_DIR)/common/conversion.o \

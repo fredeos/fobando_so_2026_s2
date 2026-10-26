@@ -255,6 +255,7 @@ static void test_numeric_limits(void)
         reject(out_of_range[i], MESSAGE_PARSE_OUT_OF_RANGE);
 }
 
+/* Comprueba que el JSON producido conserva el sobre común del Message. */
 static void assert_round_trip(const Message *source)
 {
     char json[MESSAGE_MAX_BYTES + 1u];
@@ -270,6 +271,7 @@ static void assert_round_trip(const Message *source)
     assert(parsed.request_id == source->request_id);
 }
 
+/* Incluye variantes de datos usadas por mensajes Host-nodo y nodo-Host. */
 static void test_message_serialization(void)
 {
     Message message = {

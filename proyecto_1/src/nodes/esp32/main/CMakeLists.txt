@@ -1,6 +1,7 @@
 file(GLOB COMMON_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c"
 )
+# ESP-IDF evalúa componentes en modo script; registra el serializer explícitamente.
 list(FILTER COMMON_SOURCES EXCLUDE REGEX "/message_serializer\\.c$")
 
 idf_component_register(

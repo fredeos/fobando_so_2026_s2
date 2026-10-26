@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+/* Mantiene los nombres JSON estables aunque cambien los valores internos del enum. */
 static const char *message_type_name(MessageType type)
 {
     switch (type) {
@@ -148,6 +149,7 @@ MessageSerializeResult message_serialize(
     if (type == NULL || !format_data(message, data, sizeof(data)))
         return MESSAGE_SERIALIZE_INVALID_MESSAGE;
 
+    /* Se construye en temporal para no modificar el buffer del llamador si falla. */
     int written = snprintf(serialized, sizeof(serialized),
         "{\"type\":\"%s\",\"node_id\":%" PRIu32
         ",\"request_id\":%" PRIu32 ",\"data\":%s}",

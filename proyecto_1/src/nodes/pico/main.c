@@ -133,6 +133,7 @@ int main(void)
 #define NODE_ID 2u
 #define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
 
+/* Prepara CONFIG/ACK JSON y conserva el protocolo de prueba PING/MARCO. */
 static bool prepare_response(
     const protocol_frame_t *received,
     char *response,
@@ -145,6 +146,7 @@ static bool prepare_response(
 
     if (request_length > PROTOCOL_PAYLOAD_BYTES)
         return false;
+    /* El transporte histórico incluye NUL; el parser recibe la longitud JSON exacta. */
     memcpy(request, received->payload, request_length);
     request[request_length] = '\0';
     if (request_length > 0u && request[request_length - 1u] == '\0')
@@ -162,6 +164,7 @@ static bool prepare_response(
             .data.reply = {.type = MSG_CONFIG}
         };
         size_t json_length = 0u;
+        /* El request_id permite asociar el ACK con la petición CONFIG original. */
         if (message_serialize(&reply, response, response_capacity,
                               &json_length) != MESSAGE_SERIALIZE_OK) {
             return false;
@@ -257,6 +260,7 @@ void main(void){
                             sizeof(response), &response_length);
                 }
                 if (response_length == 0u) {
+                    /* Mantiene una respuesta legible para mensajes no soportados. */
                     const char *fallback = "Pico didn't understand message";
                     response_length = (uint32_t)strlen(fallback) + 1u;
                     memcpy(response, fallback, response_length);

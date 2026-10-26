@@ -12,6 +12,7 @@
 #include "serial/serial.h"
 #include "./../serial/posix.h"
 
+/* Incluye espacio para el terminador NUL del payload JSON en la API de comms. */
 #define COMMS_MESSAGE_CAPACITY (MESSAGE_MAX_BYTES + 1u)
 
 /*

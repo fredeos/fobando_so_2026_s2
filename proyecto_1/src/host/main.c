@@ -42,6 +42,7 @@ static bool wait_for_ack(
             MessageParseResult parsed = message_parse(
                 response, response_size, &reply
             );
+            /* Acepta solo el ACK correlacionado con la petición CONFIG enviada. */
             if (parsed == MESSAGE_PARSE_OK &&
                 reply.type == MSG_ACK &&
                 reply.node_id == node_id &&
@@ -72,6 +73,7 @@ static bool wait_for_ack(
 
 static void stop_handlers(comms_handler_t *handlers, size_t count)
 {
+    /* Solicita el cierre a todos los hilos antes de esperar su terminación. */
     for (size_t i = 0u; i < count; ++i)
         comms_stop_handler(&handlers[i]);
 
@@ -103,6 +105,7 @@ int main(int argc, char *argv[])
     }
 
     const char *devices[EXPECTED_DEVICES] = {argv[1], argv[2]};
+    /* Los node_id del JSON son estables e independientes del índice del hilo. */
     const uint32_t node_ids[EXPECTED_DEVICES] = {1u, 2u};
     comms_handler_t handlers[EXPECTED_DEVICES] = {0};
     char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
@@ -133,6 +136,7 @@ int main(int argc, char *argv[])
             }
         };
         size_t json_length = 0u;
+        /* El serializer produce JSON; comms lo transporta dentro de una trama. */
         MessageSerializeResult serialized = message_serialize(
             &request, sent[i], sizeof(sent[i]), &json_length
         );
