@@ -19,7 +19,7 @@ include(pico_sdk_import.cmake)
 project(pico C CXX ASM)
 pico_sdk_init()
 
-option(PICO_LOCAL_TEST "Prueba autonoma RMS/EDF sin comunicacion" ON)
+option(PICO_LOCAL_TEST "Prueba autonoma RMS/EDF sin comunicacion" OFF)
 set(LOCAL_ALGORITHM "RMS" CACHE STRING "RMS o EDF para la prueba local")
 set_property(CACHE LOCAL_ALGORITHM PROPERTY STRINGS RMS EDF)
 set(LOCAL_TICK_MS "1000" CACHE STRING "Duracion del tick local en ms")
@@ -37,7 +37,7 @@ if(PICO_LOCAL_TEST)
        LOCAL_MISS_LED_PIN MATCHES "^(10|11|12|13|18)$")
         message(FATAL_ERROR "LOCAL_MISS_LED_PIN debe ser -1 o un GPIO libre de 0 a 28")
     endif()
-    add_executable(pico main.c gpio/gpio.c src/calibrator.c
+    add_executable(pico local_test_main.c gpio/gpio.c src/calibrator.c
         ../../common/ut.c
         ../scheduler/scheduler.c ../scheduler/rms.c ../scheduler/edf.c)
     target_compile_definitions(pico PRIVATE
@@ -48,7 +48,7 @@ if(PICO_LOCAL_TEST)
 else()
     file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c")
-    add_executable(pico communication_main.c ${COMMON_SOURCES}
+    add_executable(pico main.c ${COMMON_SOURCES}
         src/calibrator.c
         ../scheduler/task_conversion.c
         ../scheduler/scheduler_runtime.c
@@ -63,3 +63,8 @@ target_link_libraries(pico pico_stdlib)
 pico_enable_stdio_usb(pico 1)
 pico_enable_stdio_uart(pico 0)
 pico_add_extra_outputs(pico)
+
+# Compatibilidad de las macros de formato de 64 bits en Newlib/GCC ARM.
+# No modifica el serializer compartido ni afecta las fuentes ensamblador.
+target_compile_options(pico PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-include> $<$<COMPILE_LANGUAGE:C>:sys/types.h>)

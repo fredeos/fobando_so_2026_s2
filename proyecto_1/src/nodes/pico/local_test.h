@@ -32,7 +32,7 @@ static inline bool local_button_update(LocalButton *button, bool high,
 static inline bool local_tasks_init(Scheduler *sc, uint32_t sn, SchedulerType type)
 {
     if (sn == 0 || sn > UINT32_MAX / 3u) return false;
-    Task tasks[] = {
+    SchedulerTask tasks[] = {
         {.id=1, .type='P', .W=2u*sn, .T=7,  .D=7,  .criticality=2, .C=2},
         {.id=2, .type='P', .W=sn,    .T=8,  .D=8,  .criticality=2, .C=1},
         {.id=3, .type='P', .W=3u*sn, .T=10, .D=10, .criticality=2, .C=3},

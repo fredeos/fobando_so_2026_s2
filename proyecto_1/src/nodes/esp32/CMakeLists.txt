@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-option(ESP_LOCAL_TEST "Prueba autonoma de cinco tareas RMS/EDF" ON)
+option(ESP_LOCAL_TEST "Prueba autonoma de cinco tareas RMS/EDF" OFF)
 set(LOCAL_ALGORITHM "RMS" CACHE STRING "RMS o EDF")
 set_property(CACHE LOCAL_ALGORITHM PROPERTY STRINGS RMS EDF)
 set(LOCAL_TICK_MS "1000" CACHE STRING "Tick local en milisegundos")

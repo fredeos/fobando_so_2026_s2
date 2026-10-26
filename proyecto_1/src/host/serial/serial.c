@@ -20,13 +20,30 @@
 */
 serial_errno_t serial_configure(void* _obj, void* _config){
     // << Exceptions >>
-    if (_obj == NULL && _config == NULL)
+    if (_obj == NULL || _config == NULL)
         return SERIAL_INVALID_ARG;
     // << Open device >>
     int* dfd = (int*) _obj;
     posix_serial_config_t* conf = (posix_serial_config_t*) _config;
 
     *dfd = -1;
+    /* termios recibe constantes B*, no el número de baudios. */
+    speed_t speed;
+    switch (conf->baudrate) {
+        case 1200u:   speed = B1200;   break;
+        case 2400u:   speed = B2400;   break;
+        case 4800u:   speed = B4800;   break;
+        case 9600u:   speed = B9600;   break;
+        case 19200u:  speed = B19200;  break;
+        case 38400u:  speed = B38400;  break;
+        case 57600u:  speed = B57600;  break;
+        case 115200u: speed = B115200; break;
+        default:
+            fprintf(stderr, "Velocidad serial no soportada: %u baudios\n",
+                    conf->baudrate);
+            return SERIAL_INVALID_ARG;
+    }
+
     int fd = open(conf->device, O_RDWR | O_NOCTTY);
     if (fd < 0) {
         perror("open");
@@ -41,8 +58,16 @@ serial_errno_t serial_configure(void* _obj, void* _config){
     }
 
     cfmakeraw(&tty);
-    cfsetispeed(&tty, conf->baudrate);
-    cfsetospeed(&tty, conf->baudrate);
+    if (cfsetispeed(&tty, speed) != 0) {
+        perror("cfsetispeed");
+        close(fd);
+        return SERIAL_FAILURE;
+    }
+    if (cfsetospeed(&tty, speed) != 0) {
+        perror("cfsetospeed");
+        close(fd);
+        return SERIAL_FAILURE;
+    }
 
     tty.c_cflag |= CLOCAL | CREAD;
     tty.c_cflag &= ~CSTOPB;

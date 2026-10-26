@@ -1,8 +1,8 @@
-# main.c conserva la prueba local. communication_main.c contiene feature/edf.
+# main.c es el programa de comunicación; local_test_main.c es la prueba opcional.
 # Se compila un solo app_main() por firmware.
 if(ESP_LOCAL_TEST)
     set(NODE_SOURCES
-        "main.c" "gpio/gpio.c" "../src/calibrator.c"
+        "local_test_main.c" "gpio/gpio.c" "../src/calibrator.c"
         "../../../common/ut.c"
         "../../scheduler/scheduler.c"
         "../../scheduler/rms.c"
@@ -13,7 +13,7 @@ else()
     list(FILTER COMMON_SOURCES EXCLUDE REGEX "/message_serializer\\.c$")
     list(FILTER COMMON_SOURCES EXCLUDE REGEX "/task_store\\.c$")
     set(NODE_SOURCES
-        "communication_main.c"
+        "main.c"
         ${COMMON_SOURCES}
         "../../../common/message_serializer.c"
         "../../../common/task_store.c"

@@ -1,192 +1,527 @@
-/* Prueba autónoma de RMS/EDF: no requiere host ni protocolo serial. */
-#include <inttypes.h>
+
+
+#include <string.h>
 #include <stdio.h>
+
 #include "pico/stdlib.h"
-#include "pico/sem.h"
 #include "hardware/sync.h"
-#include "local_test.h"
+
+#include "serial/pico.h"
+#include "serial/serial.h"
+#include "common/protocol.h"
+#include "common/message_parser.h"
+#include "common/messages.h"
+#include "common/task_store.h"
 #include "calibrator.h"
+#include "scheduler_runtime.h"
 #include "gpio/gpio.h"
 
-#ifndef LOCAL_TICK_MS
-#define LOCAL_TICK_MS 10u
-#endif
-#ifndef LOCAL_USE_EDF
-#define LOCAL_USE_EDF 0
-#endif
+#define LED0 10
+#define LED1 11
+#define LED2 12
+#define LED3 13
 
-#ifndef LOCAL_MISS_LED_PIN
-#define LOCAL_MISS_LED_PIN 25
-#endif
+#define NODE_ID 2u
+#define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
 
-#define BUTTON_PIN 18u
-/* GP10 es el bit menos significativo; 0000=idle, 0001=tarea 1. */
-static const uint led_pins[] = {10u, 11u, 12u, 13u};
-static semaphore_t tick_sem;
-static volatile uint32_t pending_ticks;
-static volatile uint64_t button_edge_us;
-static volatile uint32_t pending_presses;
-static volatile bool button_error;
-static alarm_id_t debounce_alarm_id;
-static LocalButton button; /* Solo la rutina de antirrebote modifica su estado. */
-static Scheduler scheduler;
+// Estado de configuración y ejecución del nodo.
+static uint32_t configured_tick_ms;
+static MessageAlgorithm configured_algorithm = MESSAGE_SCHED_RMS;
+static uint32_t configured_ut_per_tick;
+static uint64_t next_tick_us;
 
-static void display_task(uint32_t id)
+// Las tareas desplegadas y el scheduler permanecen en RAM mientras el nodo está encendido.
+static TaskStore deployed_tasks;
+static SchedulerRuntime scheduler_runtime;
+
+/* Aporte de hardware: LEDs del scheduler y botón con pull-down externo.
+ * El procesamiento de mensajes y el runtime de comunicación siguen debajo. */
+#define HARDWARE_BUTTON_PIN 18u
+#define HARDWARE_MISS_PIN 25u
+static const uint32_t hardware_task_pins[] = {LED0, LED1, LED2, LED3};
+static uint32_t hardware_last_misses;
+static bool hardware_button_stable_high;
+static volatile uint64_t hardware_button_edge_us;
+static volatile uint32_t hardware_button_events;
+
+static void hardware_show_task(uint32_t id)
 {
     uint32_t code = id == UINT32_MAX ? 0u : id;
-    for (unsigned i=0; i<4; ++i)
-        board_gpio_write(led_pins[i], ((code >> i) & 1u) ? GPIO_HIGH : GPIO_LOW);
+    for (unsigned bit = 0; bit < 4; ++bit)
+        board_gpio_write(hardware_task_pins[bit],
+                         code & (1u << bit) ? GPIO_HIGH : GPIO_LOW);
 }
 
-/* El calendarizador llama este observador después de comprobar plazos y antes
- * de ejecutar las UT: GP25 refleja el tick actual, sin borrar el historial. */
-static void display_scheduled_task(uint32_t id)
+/* El scheduler llama este observador después de revisar plazos y antes de UT. */
+static void hardware_show_selection(uint32_t task_id)
 {
-    static uint32_t previous_misses;
-    display_task(id);
-#if LOCAL_MISS_LED_PIN >= 0
-    board_gpio_write(LOCAL_MISS_LED_PIN,
-        scheduler.deadline_miss_count != previous_misses ? GPIO_HIGH : GPIO_LOW);
-#endif
-    previous_misses = scheduler.deadline_miss_count;
+    hardware_show_task(task_id);
+    uint32_t misses = scheduler_runtime.scheduler.deadline_miss_count;
+    board_gpio_write(HARDWARE_MISS_PIN,
+                     misses != hardware_last_misses ? GPIO_HIGH : GPIO_LOW);
+    hardware_last_misses = misses;
 }
 
-/* El antirrebote tiene su propia alarma: no depende del tick de 1 segundo.
- * Las IRQ registran pulsaciones; solo el bucle principal libera trabajos. */
-static int64_t debounce_irq(alarm_id_t id, void *user_data)
+static repeating_timer_t hardware_debounce_timer;
+
+static void hardware_clear_button(void)
 {
-    (void)id;
-    (void)user_data;
-    debounce_alarm_id = 0;
-    gpio_level_t level = GPIO_LOW;
-    if (board_gpio_read(BUTTON_PIN, &level) != 0) {
-        button_error = true;
-        return 0;
-    }
-    if (local_button_update(&button, level == GPIO_HIGH,
-                            button_edge_us, time_us_64())) {
-        if (pending_presses != UINT32_MAX) ++pending_presses;
-        else button_error = true;
-    }
-    return 0;
+    uint32_t saved = save_and_disable_interrupts();
+    hardware_button_events = 0;
+    restore_interrupts(saved);
 }
 
-static void button_irq(uint gpio, uint32_t events)
+static void hardware_button_irq(uint pin, uint32_t events)
 {
     (void)events;
-    if (gpio != BUTTON_PIN) return;
-    button_edge_us = time_us_64();
-    if (debounce_alarm_id > 0) cancel_alarm(debounce_alarm_id);
-    debounce_alarm_id = add_alarm_in_us(LOCAL_BUTTON_DEBOUNCE_US,
-                                        debounce_irq, NULL, true);
-    if (debounce_alarm_id <= 0) button_error = true;
+    if (pin == HARDWARE_BUTTON_PIN)
+        hardware_button_edge_us = time_us_64();
 }
 
-static bool tick_irq(repeating_timer_t *timer)
+/* Alarma auxiliar de antirrebote: no ejecuta las UT del scheduler. */
+static bool hardware_debounce_irq(repeating_timer_t *timer)
 {
     (void)timer;
-    if (pending_ticks != UINT32_MAX) ++pending_ticks;
-    sem_release(&tick_sem);
+    gpio_level_t level = GPIO_LOW;
+    if (board_gpio_read(HARDWARE_BUTTON_PIN, &level) == 0 &&
+        time_us_64() - hardware_button_edge_us >= 30000u &&
+        (level == GPIO_HIGH) != hardware_button_stable_high) {
+        hardware_button_stable_high = level == GPIO_HIGH;
+        if (hardware_button_stable_high && hardware_button_events < UINT32_MAX)
+            ++hardware_button_events;
+    }
     return true;
 }
 
-static void wait_forever(void)
+static bool hardware_init(void)
 {
-    /* El procesador duerme entre interrupciones; no hay espera ocupada. */
-    while (true) __wfi();
+    if (board_gpio_init(HARDWARE_MISS_PIN, GPIO_OUTPUT) != 0 ||
+        board_gpio_write(HARDWARE_MISS_PIN, GPIO_LOW) != 0 ||
+        board_gpio_init(HARDWARE_BUTTON_PIN, GPIO_INPUT) != 0)
+        return false;
+    hardware_button_edge_us = time_us_64();
+    gpio_set_irq_enabled_with_callback(HARDWARE_BUTTON_PIN,
+        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, hardware_button_irq);
+    return add_repeating_timer_us(-1000, hardware_debounce_irq, NULL,
+                                   &hardware_debounce_timer);
 }
 
-int main(void)
+static uint32_t hardware_take_button_events(void)
 {
-    stdio_init_all(); /* La ejecución no espera a que se conecte una terminal. */
-    for (unsigned i=0; i<4; ++i) {
-        board_gpio_init(led_pins[i], GPIO_OUTPUT);
-        board_gpio_write(led_pins[i], GPIO_LOW);
+    uint32_t saved = save_and_disable_interrupts();
+    uint32_t events = hardware_button_events;
+    hardware_button_events = 0;
+    restore_interrupts(saved);
+    return events;
+}
+
+static void hardware_button_poll(void)
+{
+    uint32_t events = hardware_take_button_events();
+    if (!scheduler_runtime.running || !scheduler_runtime.prepared)
+        return;
+    Scheduler *scheduler = &scheduler_runtime.scheduler;
+    uint32_t index = scheduler->sporadic_task_index;
+    if (index == UINT32_MAX || index >= scheduler->task_count)
+        return;
+    while (events-- > 0u) {
+        RejectReason reason;
+        (void)scheduler_runtime_trigger_sporadic(&scheduler_runtime,
+            scheduler->tasks[index].id, &reason);
+    }
+}
+
+
+/**
+ * @brief Crea y serializa una respuesta a un mensaje recibido.
+ *
+ * Conserva el identificador de la petición original y establece el identificador
+ * del nodo local. Según el tipo de respuesta, incluye la operación confirmada,
+ * la razón del rechazo o el resultado de calibración.
+ *
+ * @param request           Mensaje recibido al que se debe responder.
+ * @param type              Tipo de respuesta que se va a generar.
+ * @param reason            Motivo del rechazo, si la respuesta es MSG_NACK.
+ * @param ut_per_tick       Unidades de trabajo por tick, si corresponde.
+ * @param response          Búfer donde se almacenará el mensaje serializado.
+ * @param response_capacity Capacidad del búfer de respuesta.
+ * @param response_length   Dirección donde se guardará la longitud del mensaje.
+ *
+ * @return true si la serialización fue exitosa; false en caso contrario.
+ */
+static bool serialize_reply(
+    const Message *request,
+    MessageType type,
+    RejectReason reason,
+    uint32_t ut_per_tick,
+    char *response,
+    size_t response_capacity,
+    uint32_t *response_length
+)
+{
+    Message reply = {
+        .type = type,
+        .node_id = NODE_ID,
+        .request_id = request->request_id
+    };
+
+    if (type == MSG_ACK) {
+        reply.data.reply.type = request->type;
+    } else if (type == MSG_NACK) {
+        reply.data.reply.type = request->type;
+        reply.data.reply.reason = reason;
+    } else {
+        reply.data.ut_per_tick = ut_per_tick;
     }
 
-    board_gpio_init(LOCAL_MISS_LED_PIN, GPIO_OUTPUT);
-    board_gpio_write(LOCAL_MISS_LED_PIN, GPIO_LOW);
-
-    board_gpio_init(BUTTON_PIN, GPIO_INPUT); /* Pulldown externo configurado en gpio.c. */
-
-    CalibrationResult calibration;
-    if (!calibrator_run(LOCAL_TICK_MS * 1000u, 30u, &calibration) ||
-        !local_tasks_init(&scheduler, calibration.units_per_tick,
-                          LOCAL_USE_EDF ? EDF : RMS)) {
-        display_task(15u);
-        puts("ERROR de calibracion o carga local (LEDs=1111)");
-        wait_forever();
-    }
-    printf("LOCAL %s tick=%u ms sn=%" PRIu32 " UT/tick; boton GP18 activo alto\n",
-           LOCAL_USE_EDF ? "EDF" : "RMS", (unsigned)LOCAL_TICK_MS, scheduler.sn);
-
-    scheduler.on_selection = display_scheduled_task;
-    button_edge_us = time_us_64();
-    /* La interfaz compartida solo ofrece init/read/write; la IRQ usa el SDK. */
-    gpio_set_irq_enabled_with_callback(BUTTON_PIN,
-        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, button_irq);
-    sem_init(&tick_sem, 0, 1);
-    repeating_timer_t timer;
-    /* Periodo negativo: las alarmas se programan entre inicios de ticks. */
-    if (!add_repeating_timer_us(-((int64_t)LOCAL_TICK_MS * 1000),
-                                tick_irq, NULL, &timer)) {
-        display_task(15u);
-        puts("ERROR creando temporizador (LEDs=1111)");
-        wait_forever();
+    size_t json_length = 0u;
+    if (message_serialize(&reply, response, response_capacity,
+                          &json_length) != MESSAGE_SERIALIZE_OK) {
+        return false;
     }
 
-    while (true) {
-        sem_acquire_blocking(&tick_sem);
-        uint32_t irq_state = save_and_disable_interrupts();
-        uint32_t due = pending_ticks;
-        pending_ticks = 0;
-        uint32_t presses = pending_presses;
-        pending_presses = 0;
-        bool input_error = button_error;
-        restore_interrupts(irq_state);
+    *response_length = (uint32_t)json_length;
+    return true;
+}
 
-        if (input_error) {
-            cancel_repeating_timer(&timer);
-            display_task(15u);
-            puts("ERROR leyendo boton GP18 (1111)");
-            wait_forever();
+
+/**
+ * @brief Calibra el nodo y calcula el promedio de unidades de trabajo por tick.
+ *
+ * Ejecuta varias muestras de calibración y calcula el promedio de sus
+ * resultados, reservando un 20 % del tiempo disponible.
+ *
+ * @param sample_ticks Cantidad de muestras que se realizarán.
+ * @param ut_per_tick  Dirección donde se almacenará el promedio calculado.
+ *
+ * @return true si la calibración termina correctamente; false si los parámetros
+ *         son inválidos, alguna muestra falla o el resultado está fuera de rango.
+ */
+static bool calibrate(
+    uint32_t sample_ticks,
+    uint32_t *ut_per_tick
+)
+{
+    if (configured_tick_ms == 0u ||
+        configured_tick_ms > UINT32_MAX / 1000u ||
+        sample_ticks == 0u || sample_ticks > CALIBRATION_MAX_SAMPLES) {
+        return false;
+    }
+
+    uint64_t total_units = 0u;
+    for (uint32_t sample = 0u; sample < sample_ticks; ++sample) {
+        CalibrationResult result;
+        if (!calibrator_run(configured_tick_ms * 1000u, 20u, &result))
+            return false;
+        total_units += result.units_per_tick;
+    }
+
+    uint64_t average = total_units / sample_ticks;
+    if (average == 0u || average > UINT32_MAX)
+        return false;
+
+    *ut_per_tick = (uint32_t)average;
+    return true;
+}
+
+
+/**
+ * @brief Procesa un mensaje recibido y prepara la respuesta correspondiente.
+ *
+ * Interpreta los mensajes del protocolo para configurar el nodo, calibrarlo,
+ * desplegar tareas, iniciar o detener el scheduler y activar tareas esporádicas.
+ * Genera respuestas ACK o NACK según el resultado de cada operación.
+ * Si el mensaje no pertenece al protocolo actual, conserva la compatibilidad
+ * con los comandos de prueba PING y MARCO.
+ *
+ * @param received          Trama recibida por el nodo.
+ * @param response          Buffer donde se almacenará la respuesta.
+ * @param response_capacity Capacidad del buffer de respuesta.
+ * @param response_length   Dirección donde se guardará la longitud de la respuesta.
+ *
+ * @return true si la respuesta se prepara correctamente; false si el mensaje
+ *         es inválido, no corresponde al nodo o no hay espacio suficiente.
+ */
+static bool prepare_response(
+    const protocol_frame_t *received,
+    char *response,
+    size_t response_capacity,
+    uint32_t *response_length
+)
+{
+    char request[MESSAGE_LEN];
+    size_t request_length = received->length;
+
+    if (request_length > PROTOCOL_PAYLOAD_BYTES)
+        return false;
+    /* El transporte histórico incluye NUL; el parser recibe la longitud JSON exacta. */
+    memcpy(request, received->payload, request_length);
+    request[request_length] = '\0';
+    if (request_length > 0u && request[request_length - 1u] == '\0')
+        --request_length;
+
+    Message incoming;
+    if (message_parse(request, request_length, &incoming) == MESSAGE_PARSE_OK) {
+        if (incoming.node_id != NODE_ID)
+            return false;
+
+        if (incoming.type == MSG_CONFIG) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
+            configured_tick_ms = incoming.data.config.tick_ms;
+            configured_algorithm = incoming.data.config.algorithm;
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
         }
-        if (due > 1u) {
-            /* No comprimir ticks atrasados: invalidaría la prueba temporal. */
-            cancel_repeating_timer(&timer);
-            display_task(15u);
-            puts("OVERRUN: mas de un tick pendiente; prueba detenida (1111)");
-            wait_forever();
+
+        if (incoming.type == MSG_CALIBRATE_REQUEST) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
+            uint32_t ut_per_tick = 0u;
+            if (calibrate(incoming.data.sample_ticks, &ut_per_tick)) {
+                configured_ut_per_tick = ut_per_tick;
+                return serialize_reply(&incoming, MSG_CALIBRATE_RESPONSE,
+                    REJECT_NONE, ut_per_tick, response, response_capacity,
+                    response_length);
+            }
+            return serialize_reply(&incoming, MSG_NACK,
+                REJECT_CALIBRATION_FAILED, 0u, response, response_capacity,
+                response_length);
         }
-        if (due == 0u) continue;
-        while (presses-- > 0u) {
-            bool accepted = scheduler_register_sporadic_event(&scheduler);
-            printf("boton tick=%" PRIu32 " %s; ignorados=%" PRIu32 "\n",
-                   scheduler.current_tick, accepted ? "aceptado" : "ignorado por T minimo",
-                   scheduler.sporadic_rejected_count);
+
+        if (incoming.type == MSG_DEPLOY_TASK) {
+            if (scheduler_runtime.prepared) {
+                return serialize_reply(&incoming, MSG_NACK,
+                    REJECT_INVALID_STATE, 0u, response, response_capacity,
+                    response_length);
+            }
+            /*
+             * Guarda Task y cost_ticks ya calculado por el Host. El ACK confirma
+             * almacenamiento, no admisión local ni inicio del scheduler.
+             */
+            RejectReason reason = task_store_add(
+                &deployed_tasks,
+                &incoming.data.deploy_task.task,
+                incoming.data.deploy_task.cost_ticks
+            );
+            MessageType reply_type = reason == REJECT_NONE ? MSG_ACK : MSG_NACK;
+            return serialize_reply(&incoming, reply_type, reason, 0u,
+                response, response_capacity, response_length);
         }
-        uint32_t misses = scheduler.deadline_miss_count;
-        uint32_t selected;
-        if (!scheduler_run_tick(&scheduler, &selected)) {
-            cancel_repeating_timer(&timer);
-            display_task(15u);
-            puts("ERROR del calendarizador (1111)");
-            wait_forever();
+
+        if (incoming.type == MSG_START) {
+            bool was_running = scheduler_runtime.running;
+            RejectReason reason = REJECT_INVALID_STATE;
+            SchedulerType scheduler_type =
+                configured_algorithm == MESSAGE_SCHED_EDF ? EDF : RMS;
+            if (!scheduler_runtime_start(&scheduler_runtime, &deployed_tasks,
+                                         configured_ut_per_tick,
+                                         scheduler_type, &reason)) {
+                return serialize_reply(&incoming, MSG_NACK, reason, 0u,
+                    response, response_capacity, response_length);
+            }
+            scheduler_runtime.scheduler.on_selection = hardware_show_selection;
+            if (!was_running) {
+                hardware_last_misses = scheduler_runtime.scheduler.deadline_miss_count;
+                hardware_clear_button();
+            }
+            if (!was_running)
+                next_tick_us = time_us_64() +
+                    (uint64_t)configured_tick_ms * 1000u;
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
         }
-        /* El observador actualiza LEDs antes de ejecutar las UT de cada tick. */
-        if (scheduler.deadline_miss_count != misses) {
-            printf("MISS tick=%" PRIu32 " tarea=%" PRIu32 " total=%" PRIu32 "\n",
-                   scheduler.current_tick-1u, scheduler.last_missed_task_id,
-                   scheduler.deadline_miss_count);
+
+        if (incoming.type == MSG_STOP) {
+            scheduler_runtime_stop(&scheduler_runtime);
+            hardware_show_task(UINT32_MAX);
+            board_gpio_write(HARDWARE_MISS_PIN, GPIO_LOW);
+            hardware_clear_button();
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
         }
-        /* USB es diagnóstico: timeout=0 en CMake, nunca esperar al host.
-         * Puede perder texto si la terminal no consume; no es reporte final. */
-        if (scheduler.current_tick <= 20u || scheduler.current_tick % 10u == 0u) {
-            printf("tick=%" PRIu32 " tarea=%" PRIu32 " misses=%" PRIu32
-                   " S_completadas=%" PRIu32 " S_ignoradas=%" PRIu32 "\n",
-                   scheduler.current_tick-1u, selected == UINT32_MAX ? 0u : selected,
-                   scheduler.deadline_miss_count, scheduler.sporadic_completed_count,
-                   scheduler.sporadic_rejected_count);
+
+        if (incoming.type == MSG_TRIGGER_SPORADIC) {
+            RejectReason reason = REJECT_INVALID_STATE;
+            if (!scheduler_runtime_trigger_sporadic(
+                    &scheduler_runtime, incoming.data.task_id, &reason)) {
+                return serialize_reply(&incoming, MSG_NACK, reason, 0u,
+                    response, response_capacity, response_length);
+            }
+            return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
+                response, response_capacity, response_length);
         }
+
+        return false;
+    }
+
+    const char *legacy = "Pico didn't understand message";
+    if (request_length == 4u && memcmp(request, "PING", 4u) == 0)
+        legacy = "PONG from Pico";
+    else if (request_length == 5u && memcmp(request, "MARCO", 5u) == 0 &&
+             received->relevance > 0u)
+        legacy = "POLO from Pico";
+
+    size_t legacy_length = strlen(legacy) + 1u;
+    if (legacy_length > response_capacity)
+        return false;
+    memcpy(response, legacy, legacy_length);
+    *response_length = (uint32_t)legacy_length;
+    return true;
+}
+
+
+/**
+ * @brief Ejecuta un tick del scheduler cuando corresponde.
+ *
+ * Comprueba si el scheduler está activo y si se alcanzó el momento del
+ * siguiente tick. Si la ejecución falla, enciende LED0 y detiene el
+ * scheduler. Después de cada tick, programa el siguiente usando el tiempo
+ * actual para evitar ejecutar ticks atrasados en ráfaga.
+ */
+static void run_scheduler_if_due(void)
+{
+    hardware_button_poll();
+    if (!scheduler_runtime.running || configured_tick_ms == 0u)
+        return;
+
+    if (time_us_64() < next_tick_us)
+        return;
+
+    uint32_t selected_task_id;
+    if (!scheduler_runtime_run_tick(&scheduler_runtime, &selected_task_id)) {
+        hardware_show_task(15u);
+        scheduler_runtime_stop(&scheduler_runtime);
+        return;
+    }
+
+    /* Evita ejecutar ticks atrasados en ráfaga y deja tiempo al polling serial. */
+    next_tick_us = time_us_64() + (uint64_t)configured_tick_ms * 1000u;
+}
+
+/**
+ * @brief Inicializa el nodo y ejecuta su ciclo principal.
+ *
+ * Configura el almacenamiento de tareas, el scheduler, la comunicación serial,
+ * el protocolo y los GPIO. Después, procesa continuamente las tramas recibidas,
+ * genera y transmite respuestas, y ejecuta los ticks del scheduler cuando
+ * corresponde.
+ *
+ * Si falla la configuración inicial, el ciclo principal no procesa mensajes
+ * ni ejecuta el scheduler.
+ */
+int main(void){
+    bool setup_fail = false;
+    /* Cada arranque comienza con una tabla de tareas vacía. */
+    task_store_init(&deployed_tasks);
+    scheduler_runtime_init(&scheduler_runtime);
+
+    // << Setup Pico serial interface >>
+    pico_serial_t serial;
+    pico_serial_configs_t serial_conf = {
+        .timeout_us = 0u
+    };
+
+    serial_errno_t conf_errno = serial_configure(
+        &serial,
+        &serial_conf
+    );
+
+    if (!setup_fail) setup_fail = (conf_errno != SERIAL_OK);
+    // << Setup the protocol interface >>
+    // [TX:output]
+    protocol_frame_t tx_frame;
+    protocol_tx_t tx;
+    serial_packet_t tx_packet;
+    protocol_errno_t tx_setup_errno = protocol_tx_init(&tx, &tx_packet);
+
+    // [RX:input]
+    protocol_frame_t rx_frame;
+    protocol_rx_t rx;
+    serial_packet_t rx_packet;
+    protocol_errno_t rx_setup_errno = protocol_rx_init(&rx, &rx_packet);
+
+    if (!setup_fail) setup_fail = (tx_setup_errno != PROTOCOL_OK || rx_setup_errno != PROTOCOL_OK);
+    // << Setup GPIO >>
+    board_gpio_init(LED0, GPIO_OUTPUT);
+    board_gpio_init(LED1, GPIO_OUTPUT);
+    board_gpio_init(LED2, GPIO_OUTPUT);
+    board_gpio_init(LED3, GPIO_OUTPUT);
+    
+    board_gpio_write(LED0, GPIO_LOW);
+    board_gpio_write(LED1, GPIO_LOW);
+    board_gpio_write(LED2, GPIO_LOW);
+    board_gpio_write(LED3, GPIO_LOW);
+    if (!hardware_init()) setup_fail = true;
+    // << Setup basic messages >>
+    char response[MESSAGE_LEN];
+    // << Procedure loop >>
+    int state = 0;
+
+    if (setup_fail) hardware_show_task(15u);
+    while (1) {
+        if (setup_fail) continue;
+        // [RX state]
+        if (state == 0){
+            // [Poll RX state machine]
+            protocol_errno_t rx_errno = protocol_rx_poll(
+                &serial,
+                &rx,
+                &rx_packet
+            );
+            // [Check RX]
+            if (rx.complete){
+                uint32_t response_length = 0u;
+                if (rx.valid){
+                    protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
+                        &rx_frame,
+                        rx.buffer,
+                        sizeof(rx.buffer)
+                    );
+                    if (rx_frame_errno == PROTOCOL_OK)
+                        (void)prepare_response(&rx_frame, response,
+                            sizeof(response), &response_length);
+                }
+                if (response_length == 0u) {
+                    /* Mantiene una respuesta legible para mensajes no soportados. */
+                    const char *fallback = "Pico didn't understand message";
+                    response_length = (uint32_t)strlen(fallback) + 1u;
+                    memcpy(response, fallback, response_length);
+                }
+
+                tx_frame.relevance = 0;
+                tx_frame.length = response_length;
+                memcpy(tx_frame.payload, response, response_length);
+
+                protocol_errno_t tx_frame_errno = protocol_set_frame_to_buffer(
+                    &tx_frame,
+                    tx.buffer,
+                    sizeof(tx.buffer)
+                );
+                // [Move to TX]
+                state = 1;
+            }
+        }
+        // [TX state]
+        if (state == 1){
+            // [Poll TX state machine]
+            protocol_errno_t tx_errno = protocol_tx_poll(
+                &serial,
+                &tx,
+                &tx_packet
+            );
+            // [Check TX]
+            if (tx.complete && tx.valid){
+                // [Move to RX]
+                state = 0;
+            }
+        }
+        run_scheduler_if_due();
     }
 }
