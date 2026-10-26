@@ -27,28 +27,54 @@ project(pico C CXX ASM)
 
 pico_sdk_init()
 
-file(GLOB COMMON_SOURCES
-    "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c"
-)
+option(PICO_LOCAL_TEST "Prueba autonoma RMS/EDF sin comunicacion" ON)
+set(LOCAL_ALGORITHM "RMS" CACHE STRING "RMS o EDF para la prueba local")
+set_property(CACHE LOCAL_ALGORITHM PROPERTY STRINGS RMS EDF)
+set(LOCAL_TICK_MS "1000" CACHE STRING "Duracion del tick local en ms")
 
-add_executable(pico
-    main.c
+set(LOCAL_MISS_LED_PIN "25" CACHE STRING "GPIO LED de plazo perdido; 25=LED integrado Pico H, -1=desactivado")
 
-    ${COMMON_SOURCES}
-    ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON/core_json.c
+if(PICO_LOCAL_TEST)
+    if(NOT LOCAL_ALGORITHM MATCHES "^(RMS|EDF)$")
+        message(FATAL_ERROR "LOCAL_ALGORITHM debe ser RMS o EDF")
+    endif()
+    if(NOT LOCAL_TICK_MS MATCHES "^[1-9][0-9]*$" OR LOCAL_TICK_MS GREATER 1000)
+        message(FATAL_ERROR "LOCAL_TICK_MS debe estar entre 1 y 1000")
+    endif()
+    if(NOT LOCAL_MISS_LED_PIN MATCHES "^(-1|[0-9]+)$" OR
+       LOCAL_MISS_LED_PIN GREATER 28 OR
+       LOCAL_MISS_LED_PIN MATCHES "^(10|11|12|13|18)$")
+        message(FATAL_ERROR "LOCAL_MISS_LED_PIN debe ser -1 o un GPIO libre de 0 a 28")
+    endif()
+    add_executable(pico
+        main.c
+        gpio/gpio.c
+        src/calibrator.c
+        ../../common/ut.c
+        ../scheduler/scheduler.c
+        ../scheduler/rms.c
+        ../scheduler/edf.c
+    )
+    target_include_directories(pico PRIVATE
+        ../../../include src ../scheduler
+    )
+    target_compile_definitions(pico PRIVATE
+        LOCAL_MISS_LED_PIN=${LOCAL_MISS_LED_PIN}
+        LOCAL_TICK_MS=${LOCAL_TICK_MS}
+        LOCAL_USE_EDF=$<STREQUAL:${LOCAL_ALGORITHM},EDF>
+        PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
+    )
+else()
+    # Se conserva la prueba de comunicacion anterior para el resto del grupo.
+    file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c")
+    add_executable(pico communication_main.c ${COMMON_SOURCES}
+        ../../../third_party/coreJSON/core_json.c gpio/gpio.c serial/serial.c)
+    target_include_directories(pico PRIVATE
+        ../../../include ../../../third_party/coreJSON)
+endif()
 
-    gpio/gpio.c
-    serial/serial.c
-)
-
-target_include_directories(pico PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/../../../include
-    ${CMAKE_CURRENT_LIST_DIR}/../../../third_party/coreJSON
-)
-
-target_link_libraries(pico
-    pico_stdlib
-)
+target_compile_options(pico PRIVATE -Wall -Wextra)
+target_link_libraries(pico pico_stdlib)
 
 # -----------------------------------------------------------------------------------
 # USB serial configuration

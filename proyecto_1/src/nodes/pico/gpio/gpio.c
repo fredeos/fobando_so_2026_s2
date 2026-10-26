@@ -11,6 +11,10 @@
 int board_gpio_init(uint32_t _pin, gpio_direction_t _mode){
     gpio_init(_pin);
 
+    /* Las entradas usan la resistencia externa del circuito (GP18: pulldown).
+     * Evitar que una resistencia interna altere ese circuito. */
+    if (_mode == GPIO_INPUT) gpio_disable_pulls(_pin);
+
     gpio_set_dir(
         _pin,
         (_mode == GPIO_OUTPUT) ? GPIO_OUT : GPIO_IN

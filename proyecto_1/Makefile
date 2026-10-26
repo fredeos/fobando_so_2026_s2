@@ -23,8 +23,8 @@ ESP_SRC_DIR    := $(SRC_DIR)/nodes/esp32
 PICO_SRC_DIR   := $(SRC_DIR)/nodes/pico
 
 HOST_BUILD_DIR  := $(BUILD_DIR)/host
-ESP_BUILD_DIR   := $(BUILD_DIR)/esp32
-PICO_BUILD_DIR  := $(BUILD_DIR)/pico
+ESP_BUILD_DIR   := $(ESP_SRC_DIR)/build/esp32
+PICO_BUILD_DIR  := $(PICO_SRC_DIR)/build/pico
 
 
 # ============================================================
@@ -32,7 +32,10 @@ PICO_BUILD_DIR  := $(BUILD_DIR)/pico
 # ============================================================
 
 DEV ?= USB0
-IDF_ACTIVATE := $(HOME)/esp/esp-idf/export.sh
+IDF_ACTIVATE ?= $(HOME)/esp/esp-idf/export.sh
+ESP_ALGORITHM ?= RMS
+ESP_TICK_MS ?= 1000
+ESP_LOCAL_TEST ?= ON
 export PICO_SDK_PATH := $(HOME)/pico-sdk
 
 # ============================================================
@@ -61,6 +64,7 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
           -Iinclude \
+          -Isrc/host \
           -Ithird_party/coreJSON \
           -Isrc/nodes/scheduler
 
@@ -431,25 +435,37 @@ mcu-config:
 # ESP: make rules
 # ============================================================
 
+# Usa un entorno ESP-IDF activo o IDF_ACTIVATE=/ruta/al/export.sh.
+.PHONY: esp-build esp-flash esp-monitor test-esp-local
 esp-build:
-	@mkdir -p $(dir ${ESP_BUILD_DIR})
-	@echo "Building ESP32 project files..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) build'
-	@echo "[DONE]"
-	@echo ""
+	@mkdir -p $(ESP_BUILD_DIR)
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -DESP_LOCAL_TEST=$(ESP_LOCAL_TEST) -DLOCAL_ALGORITHM=$(ESP_ALGORITHM) -DLOCAL_TICK_MS=$(ESP_TICK_MS) build'
 
 esp-flash:
-	@echo "Flashing ESP32..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p /dev/tty$(DEV) flash'
-	@echo "[DONE]"
-	@echo ""
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p /dev/tty$(DEV) flash'
+
+esp-monitor:
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p /dev/tty$(DEV) monitor'
+
+# La misma regresión de cinco tareas se ejecuta sobre el fixture del ESP32.
+test-esp-local: $(OUT_DIR)/test_esp_local
+	./$(OUT_DIR)/test_esp_local
+
+$(OUT_DIR)/test_esp_local: tests/test_pico_local.c \
+    src/nodes/esp32/main/local_test.h src/nodes/scheduler/scheduler.c \
+    src/nodes/scheduler/scheduler.h src/nodes/scheduler/task.h \
+    src/nodes/scheduler/rms.c src/nodes/scheduler/edf.c src/common/ut.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc/nodes/esp32/main tests/test_pico_local.c \
+	    src/nodes/scheduler/scheduler.c src/nodes/scheduler/rms.c \
+	    src/nodes/scheduler/edf.c src/common/ut.c -o $@ $(LDLIBS)
 
 # ============================================================
 # Pico: make rules
 # ============================================================
 
 pico-build:
-	@mkdir -p $(dir ${PICO_BUILD_DIR})
+	@mkdir -p $(PICO_BUILD_DIR)
 	@echo "Building Pi Pico project files..."
 	cmake -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR) -G "Unix Makefiles" -DPICO_BOARD=pico
 	@echo "Generating Pi Pico binaries..."
@@ -476,3 +492,17 @@ clean:
 # ============================================================
 
 -include $(DEPS)
+
+# Prueba del fixture local de Pico en Linux, sin SDK ni hardware.
+.PHONY: test-pico-local
+test-pico-local: $(OUT_DIR)/test_pico_local
+	./$(OUT_DIR)/test_pico_local
+
+$(OUT_DIR)/test_pico_local: tests/test_pico_local.c \
+    src/nodes/pico/local_test.h src/nodes/scheduler/scheduler.c \
+    src/nodes/scheduler/scheduler.h src/nodes/scheduler/task.h \
+    src/nodes/scheduler/rms.c src/nodes/scheduler/edf.c src/common/ut.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc/nodes/pico tests/test_pico_local.c \
+	    src/nodes/scheduler/scheduler.c src/nodes/scheduler/rms.c \
+	    src/nodes/scheduler/edf.c src/common/ut.c -o $@ $(LDLIBS)

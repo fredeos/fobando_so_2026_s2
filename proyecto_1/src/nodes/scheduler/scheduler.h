@@ -30,6 +30,10 @@ typedef enum {
 typedef struct Scheduler {
     SchedulerType type;
 
+    /* Optional board observer: called after selecting a task, before its UTs.
+     * UINT32_MAX means idle. Keep it short and nonblocking (e.g. LED writes). */
+    void (*on_selection)(uint32_t task_id);
+
     Task tasks[MAX_TASKS]; // Tasks assigned by the host.
     Job jobs[MAX_JOBS];    // Storage for active jobs.
 

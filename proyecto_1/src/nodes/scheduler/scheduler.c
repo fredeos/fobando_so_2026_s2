@@ -25,6 +25,7 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
     }
 
     sc->type = type;
+    sc->on_selection = NULL;
     sc->task_count = 0;
     sc->job_count = 0;
     sc->current_tick = 0;
@@ -356,11 +357,15 @@ bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
         }
 
         *selected_task_id = job->task->id;
+        if (sc->on_selection != NULL) sc->on_selection(*selected_task_id);
 
         if (!execute_job_tick(sc, job_index)) {
             return false;
         }
     }
+
+    if (job_index < 0 && sc->on_selection != NULL)
+        sc->on_selection(UINT32_MAX);
 
     // Advance the simulation after processing the current tick.
     sc->current_tick++;
