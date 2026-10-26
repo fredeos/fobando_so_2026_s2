@@ -12,7 +12,7 @@
 #include "./../serial/posix.h"
 
 /*
- *
+ * Communications status codes
  *
 */
 typedef enum {
@@ -40,7 +40,7 @@ extern "C" {
 
 // ----------------------------------------------------------------------------------
 /*
- *
+ * Structure for a communication message for handler
  *
 */
 typedef struct {
@@ -52,8 +52,8 @@ typedef struct {
 } comms_message_t;
 
 /*
- *
- *
+ * Handler structure for communications via serial and protocol interface
+ * 
 */
 typedef struct {
     // << Information >>
@@ -75,6 +75,25 @@ typedef struct {
     pthread_mutex_t mutex;  // pthread mutex
     pthread_cond_t  cond;   // pthread condition variable
 } comms_handler_t;
+
+/*
+ * The communication handlers implement serial+protocol communication (CRC-16).
+ * Their job is abstract the communication layer, the user interacts with it by setting up
+ * requests to send a custom message or to read the next incoming message. 
+ * 
+ * If no custom message is setup the handler sends a default PING message, 
+ * to which connected devices must reply PONG. This requires a continous stream of 
+ * message transactions between devices; otherwise the connection becomes deadlocked. 
+ * 
+ * Each device must be configured to use the same protocol to read (receive) and reply (transmit).
+ * 
+ * Also, handlers can be configured to only save priority received messages; via the 'priority'
+ * field which is compared to 'relevance' field on a protocol frame to determine the filtering
+ * criteria. Higher or equal than messages are saved, while those that are less than are taken as
+ * update messages to keep the connection alive.
+ * 
+*/
+
 // ----------------------------------------------------------------------------------
 /*
  * Initialize the handler structure for communication
@@ -108,7 +127,8 @@ comms_status_t comms_stop_handler(
 
 // ----------------------------------------------------------------------------------
 /*
- * Request handler to setup a custom message to send to device
+ * Request handler to setup a custom message to send to device.
+ * If handler is currently busy with another message it can't setup more messages.
  *
 */
 comms_status_t comms_request_send(
@@ -118,7 +138,7 @@ comms_status_t comms_request_send(
 );
 
 /*
- * 
+ * Signal handler to setup for another custom message. It allows writing more custom messages.
  *
 */
 comms_status_t comms_acquire_send(
@@ -126,7 +146,7 @@ comms_status_t comms_acquire_send(
 );
 
 /*
- *
+ * Request handler to forcefully save the next received message
  *
 */
 comms_status_t comms_request_receive(
@@ -134,7 +154,7 @@ comms_status_t comms_request_receive(
 );
 
 /*
- * 
+ * Signal handler to allow another incoming message to be saved
  *
 */
 comms_status_t comms_acquire_receive(
@@ -143,7 +163,8 @@ comms_status_t comms_acquire_receive(
 
 // ----------------------------------------------------------------------------------
 /*
- *
+ * Communication handler worker function.
+ * This functions handles the protocol and serial interface,
  *
 */
 void* comms_handler(void* arg);
