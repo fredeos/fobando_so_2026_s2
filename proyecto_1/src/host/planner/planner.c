@@ -243,6 +243,23 @@ PlannerDecision planner_assign_task(
     return decision;
 }
 
+bool planner_remove_task(
+    Planner *planner,
+    uint32_t node_id,
+    uint32_t task_id
+)
+{
+    if (planner == NULL)
+        return false;
+
+    /* El node_id viene de la decisión tomada al asignar la tarea. */
+    for (size_t i = 0u; i < planner->node_count; ++i) {
+        if (planner->nodes[i].id == node_id)
+            return node_remove_task(&planner->nodes[i], task_id);
+    }
+    return false;
+}
+
 /*
  * Información utilizada para ordenar
  * las tareas antes de su asignación.

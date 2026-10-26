@@ -15,7 +15,7 @@ void test_edf_earliest_deadline(void)
     Scheduler sc;
     init(&sc, 100, EDF);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 1,
         .type = 'P',
         .W = 200,
@@ -25,7 +25,7 @@ void test_edf_earliest_deadline(void)
         .C = 2
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 2,
         .type = 'P',
         .W = 100,
@@ -35,7 +35,7 @@ void test_edf_earliest_deadline(void)
         .C = 1
     };
 
-    Task taskC = {
+    SchedulerTask taskC = {
         .id = 3,
         .type = 'P',
         .W = 300,
@@ -71,7 +71,7 @@ void test_edf_inactive_jobs(void)
     Scheduler sc;
     init(&sc, 100, EDF);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 1,
         .type = 'P',
         .W = 100,
@@ -81,7 +81,7 @@ void test_edf_inactive_jobs(void)
         .C = 1
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 2,
         .type = 'P',
         .W = 100,
@@ -120,7 +120,7 @@ void test_edf_release_tie(void)
     Scheduler sc;
     init(&sc, 100, EDF);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 200,
@@ -155,7 +155,7 @@ void test_edf_release_tie(void)
 
 
 // ---------------------------------------------------------
-// TEST 4: Tie by Task ID
+// TEST 4: Tie by SchedulerTask ID
 // ---------------------------------------------------------
 
 void test_edf_id_tie(void)
@@ -163,7 +163,7 @@ void test_edf_id_tie(void)
     Scheduler sc;
     init(&sc, 100, EDF);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 10,
         .type = 'P',
         .W = 100,
@@ -173,7 +173,7 @@ void test_edf_id_tie(void)
         .C = 1
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 5,
         .type = 'P',
         .W = 100,
@@ -200,7 +200,7 @@ void test_edf_id_tie(void)
     assert(selected >= 0);
     assert(sc.jobs[selected].task->id == 5);
 
-    printf("[SUCCESS] EDF tie by lowest Task ID\n");
+    printf("[SUCCESS] EDF tie by lowest SchedulerTask ID\n");
 }
 
 
@@ -213,7 +213,7 @@ void test_edf_index_tie(void)
     Scheduler sc;
     init(&sc, 100, EDF);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 100,

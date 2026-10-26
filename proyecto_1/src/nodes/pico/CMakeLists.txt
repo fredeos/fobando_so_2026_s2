@@ -1,38 +1,29 @@
 cmake_minimum_required(VERSION 3.13)
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 if(WIN32)
     set(USERHOME $ENV{USERPROFILE})
 else()
     set(USERHOME $ENV{HOME})
 endif()
-
 set(sdkVersion 2.3.1)
 set(toolchainVersion 15_2_Rel1)
 set(picotoolVersion 2.3.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
-
 if(EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
-
 set(PICO_BOARD pico CACHE STRING "Board type")
-
 include(pico_sdk_import.cmake)
-
 project(pico C CXX ASM)
-
 pico_sdk_init()
 
 option(PICO_LOCAL_TEST "Prueba autonoma RMS/EDF sin comunicacion" ON)
 set(LOCAL_ALGORITHM "RMS" CACHE STRING "RMS o EDF para la prueba local")
 set_property(CACHE LOCAL_ALGORITHM PROPERTY STRINGS RMS EDF)
 set(LOCAL_TICK_MS "1000" CACHE STRING "Duracion del tick local en ms")
-
-set(LOCAL_MISS_LED_PIN "25" CACHE STRING "GPIO LED de plazo perdido; 25=LED integrado Pico H, -1=desactivado")
+set(LOCAL_MISS_LED_PIN "25" CACHE STRING "GPIO de plazo perdido; -1 desactivado")
 
 if(PICO_LOCAL_TEST)
     if(NOT LOCAL_ALGORITHM MATCHES "^(RMS|EDF)$")
@@ -46,45 +37,29 @@ if(PICO_LOCAL_TEST)
        LOCAL_MISS_LED_PIN MATCHES "^(10|11|12|13|18)$")
         message(FATAL_ERROR "LOCAL_MISS_LED_PIN debe ser -1 o un GPIO libre de 0 a 28")
     endif()
-    add_executable(pico
-        main.c
-        gpio/gpio.c
-        src/calibrator.c
+    add_executable(pico main.c gpio/gpio.c src/calibrator.c
         ../../common/ut.c
-        ../scheduler/scheduler.c
-        ../scheduler/rms.c
-        ../scheduler/edf.c
-    )
-    target_include_directories(pico PRIVATE
-        ../../../include src ../scheduler
-    )
+        ../scheduler/scheduler.c ../scheduler/rms.c ../scheduler/edf.c)
     target_compile_definitions(pico PRIVATE
         LOCAL_MISS_LED_PIN=${LOCAL_MISS_LED_PIN}
         LOCAL_TICK_MS=${LOCAL_TICK_MS}
         LOCAL_USE_EDF=$<STREQUAL:${LOCAL_ALGORITHM},EDF>
-        PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
-    )
+        PICO_STDIO_USB_STDOUT_TIMEOUT_US=0)
 else()
-    # Se conserva la prueba de comunicacion anterior para el resto del grupo.
-    file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c")
+    file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c")
     add_executable(pico communication_main.c ${COMMON_SOURCES}
-        ../../../third_party/coreJSON/core_json.c gpio/gpio.c serial/serial.c)
-    target_include_directories(pico PRIVATE
-        ../../../include ../../../third_party/coreJSON)
+        src/calibrator.c
+        ../scheduler/task_conversion.c
+        ../scheduler/scheduler_runtime.c
+        ../scheduler/scheduler.c ../scheduler/rms.c ../scheduler/edf.c
+        ../../../third_party/coreJSON/core_json.c
+        gpio/gpio.c serial/serial.c)
 endif()
-
+target_include_directories(pico PRIVATE
+    src ../scheduler ../../../include ../../../third_party/coreJSON)
 target_compile_options(pico PRIVATE -Wall -Wextra)
 target_link_libraries(pico pico_stdlib)
-
-# -----------------------------------------------------------------------------------
-# USB serial configuration
-# -----------------------------------------------------------------------------------
-
 pico_enable_stdio_usb(pico 1)
 pico_enable_stdio_uart(pico 0)
-
-# -----------------------------------------------------------------------------------
-# Generate output binaries
-# -----------------------------------------------------------------------------------
-
 pico_add_extra_outputs(pico)

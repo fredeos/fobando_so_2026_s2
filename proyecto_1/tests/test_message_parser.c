@@ -117,6 +117,9 @@ static void test_message_types(void)
     assert(message.type == MSG_NACK);
     assert(message.data.reply.type == MSG_DEPLOY_TASK);
     assert(message.data.reply.reason == REJECT_INSUFFICIENT_CAPACITY);
+    message = parse("NACK",
+        "{\"message_type\":\"CALIBRATE_REQUEST\",\"reason\":7}");
+    assert(message.data.reply.reason == REJECT_CALIBRATION_FAILED);
 }
 
 /*
@@ -247,12 +250,136 @@ static void test_numeric_limits(void)
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":2147483648}}",
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":-2147483649}}",
         "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":0}}",
-        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":7}}",
+        "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":10}}",
         "{\"type\":\"DEPLOY_TASK\",\"node_id\":1,\"request_id\":1,\"data\":{\"task\":{\"id\":1,\"type\":\"P\",\"work\":0,\"period\":1,\"deadline\":1,\"criticality\":0},\"cost_ticks\":1}}"
     };
 
     for (size_t i = 0u; i < sizeof(out_of_range) / sizeof(out_of_range[0]); ++i)
         reject(out_of_range[i], MESSAGE_PARSE_OUT_OF_RANGE);
+}
+
+/* Comprueba que el JSON producido conserva el sobre común del Message. */
+static void assert_round_trip(const Message *source)
+{
+    char json[MESSAGE_MAX_BYTES + 1u];
+    size_t length = 0u;
+    Message parsed;
+
+    assert(message_serialize(source, json, sizeof(json), &length)
+           == MESSAGE_SERIALIZE_OK);
+    assert(length <= MESSAGE_MAX_BYTES);
+    assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+    assert(parsed.type == source->type);
+    assert(parsed.node_id == source->node_id);
+    assert(parsed.request_id == source->request_id);
+}
+
+/* Incluye variantes de datos usadas por mensajes Host-nodo y nodo-Host. */
+static void test_message_serialization(void)
+{
+    Message message = {
+        .type = MSG_CONFIG, .node_id = 2u, .request_id = 7u,
+        .data.config = {
+            .algorithm = MESSAGE_SCHED_EDF,
+            .tick_ms = 10u,
+            .report_every_ticks = 20u
+        }
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_CALIBRATE_REQUEST, .node_id = 2u, .request_id = 8u,
+        .data.sample_ticks = 50u
+    };
+    assert_round_trip(&message);
+    message.type = MSG_CALIBRATE_RESPONSE;
+    message.data.ut_per_tick = 100u;
+    assert_round_trip(&message);
+    {
+        char json[MESSAGE_MAX_BYTES + 1u];
+        size_t length = 0u;
+        Message parsed;
+        assert(message_serialize(&message, json, sizeof(json), &length)
+               == MESSAGE_SERIALIZE_OK);
+        assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+        assert(parsed.data.ut_per_tick == 100u);
+    }
+
+    message = (Message){
+        .type = MSG_DEPLOY_TASK, .node_id = 2u, .request_id = 9u,
+        .data.deploy_task = {
+            .task = {.id = 8u, .type = TASK_SPORADIC, .work = 40u,
+                .period = 20u, .deadline = 15u, .criticality = -1},
+            .cost_ticks = 3u
+        }
+    };
+    assert_round_trip(&message);
+
+    message = (Message){.type = MSG_START, .node_id = 2u, .request_id = 10u};
+    assert_round_trip(&message);
+    message.type = MSG_STOP;
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_EVENT, .node_id = 2u, .request_id = 11u,
+        .data.event = {.type = EVENT_TASK_SWITCH, .task_id = 8u,
+            .job_id = 3u, .tick = UINT64_C(9007199254740993),
+            .duration_ticks = 2u, .detail = -7}
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_TICK_REPORT, .node_id = 2u, .request_id = 12u,
+        .data.tick_report = {.tick = UINT64_MAX, .task_id = 8u}
+    };
+    assert_round_trip(&message);
+    message = (Message){
+        .type = MSG_TRIGGER_SPORADIC, .node_id = 2u, .request_id = 13u,
+        .data.task_id = 8u
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_ACK, .node_id = 2u, .request_id = 14u,
+        .data.reply = {.type = MSG_DEPLOY_TASK}
+    };
+    assert_round_trip(&message);
+    message.type = MSG_NACK;
+    message.data.reply.reason = REJECT_CALIBRATION_FAILED;
+    assert_round_trip(&message);
+    {
+        char json[MESSAGE_MAX_BYTES + 1u];
+        size_t length = 0u;
+        Message parsed;
+        assert(message_serialize(&message, json, sizeof(json), &length)
+               == MESSAGE_SERIALIZE_OK);
+        assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+        assert(parsed.data.reply.reason == REJECT_CALIBRATION_FAILED);
+    }
+    message.data.reply.type = MSG_DEPLOY_TASK;
+    message.data.reply.reason = REJECT_INSUFFICIENT_CAPACITY;
+    assert_round_trip(&message);
+    message.data.reply.type = MSG_START;
+    message.data.reply.reason = REJECT_INVALID_STATE;
+    assert_round_trip(&message);
+    message.data.reply.reason = REJECT_NO_TASKS;
+    assert_round_trip(&message);
+
+    char buffer[MESSAGE_MAX_BYTES + 1u];
+    size_t length = 123u;
+    const Message start = {.type = MSG_START};
+    memset(buffer, 0xA5, sizeof(buffer));
+    assert(message_serialize(&start, buffer, 4u, &length)
+           == MESSAGE_SERIALIZE_TOO_LARGE);
+    assert(length == 123u && (unsigned char)buffer[0] == 0xA5u);
+    assert(message_serialize(NULL, buffer, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_ARGUMENT);
+    assert(message_serialize(&start, NULL, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_ARGUMENT);
+
+    Message invalid = {.type = MSG_CALIBRATE_REQUEST};
+    assert(message_serialize(&invalid, buffer, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_MESSAGE);
 }
 
 int main(void)
@@ -261,6 +388,7 @@ int main(void)
     test_input_boundaries();
     test_invalid_messages();
     test_numeric_limits();
+    test_message_serialization();
 
     for (int result = MESSAGE_PARSE_OK; result <= MESSAGE_PARSE_UNKNOWN_TYPE; ++result)
         assert(message_parse_result_string((MessageParseResult)result)[0] != '\0');

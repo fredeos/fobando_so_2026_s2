@@ -8,7 +8,7 @@
 #include "common/task.h"
 
 /* Capacidad máxima de tareas por nodo */
-#define NODE_MAX_TASKS 32u
+#define NODE_MAX_TASKS TASK_MAX_PER_NODE
 
 /* Estados posibles de un nodo */
 typedef enum {

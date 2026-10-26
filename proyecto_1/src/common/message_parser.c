@@ -298,7 +298,7 @@ static MessageParseResult read_reply(const JSONPair_t *data, Message *out)
 
     PARSE_TRY(read_u32(&fields[1], true, &reason));
 
-    if (reason > REJECT_SPORADIC_NODE_FAILED)
+    if (reason > REJECT_NO_TASKS)
         return MESSAGE_PARSE_OUT_OF_RANGE;
 
     out->data.reply.reason = (RejectReason)reason;

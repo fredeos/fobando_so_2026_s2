@@ -1,18 +1,34 @@
+# main.c conserva la prueba local. communication_main.c contiene feature/edf.
+# Se compila un solo app_main() por firmware.
 if(ESP_LOCAL_TEST)
-    set(NODE_SOURCES "main.c" "gpio/gpio.c" "../src/calibrator.c"
+    set(NODE_SOURCES
+        "main.c" "gpio/gpio.c" "../src/calibrator.c"
         "../../../common/ut.c"
         "../../scheduler/scheduler.c"
         "../../scheduler/rms.c"
         "../../scheduler/edf.c")
 else()
+    # No usar CONFIGURE_DEPENDS en el registro temprano de ESP-IDF.
     file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../../common/*.c")
-    set(NODE_SOURCES "communication_main.c" ${COMMON_SOURCES}
+    list(FILTER COMMON_SOURCES EXCLUDE REGEX "/message_serializer\\.c$")
+    list(FILTER COMMON_SOURCES EXCLUDE REGEX "/task_store\\.c$")
+    set(NODE_SOURCES
+        "communication_main.c"
+        ${COMMON_SOURCES}
+        "../../../common/message_serializer.c"
+        "../../../common/task_store.c"
+        "../src/calibrator.c"
+        "../../scheduler/task_conversion.c"
+        "../../scheduler/scheduler_runtime.c"
+        "../../scheduler/scheduler.c"
+        "../../scheduler/rms.c"
+        "../../scheduler/edf.c"
         "../../../../third_party/coreJSON/core_json.c"
         "gpio/gpio.c" "serial/serial.c")
 endif()
 
-# La expansión temprana de requisitos de ESP-IDF no recibe opciones del proyecto.
-# Declarar las dependencias aquí para ambos modos, sin condicionar los requisitos.
+# Los requisitos se declaran incondicionalmente: ESP-IDF los evalúa también
+# en una fase temprana que no recibe las opciones particulares del proyecto.
 idf_component_register(
     SRCS ${NODE_SOURCES}
     INCLUDE_DIRS "." "../src" "../../scheduler" "../../../../include"

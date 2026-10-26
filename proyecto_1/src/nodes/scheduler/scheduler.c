@@ -62,7 +62,7 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
  * and checking that the scheduler has enough space. Only one sporadic task
  * is allowed per scheduler, so its index is stored for future event releases.
  */
-bool add_task(Task *task, Scheduler *sc)
+bool add_task(SchedulerTask *task, Scheduler *sc)
 {
     if (sc == NULL || task == NULL) {
         return false;
@@ -156,7 +156,7 @@ bool release_job(Scheduler *sc, uint32_t task_index) {
         return false;
     }
 
-    Task *task = &sc->tasks[task_index];
+    SchedulerTask *task = &sc->tasks[task_index];
 
     // Reserve an available slot before creating the new job.
     int job_index = get_free_index(sc);
@@ -194,7 +194,7 @@ uint32_t check_periodic_releases(Scheduler *sc) {
 
     for (uint32_t i = 0; i < sc->task_count; i++) {
 
-        Task *current_task = &sc->tasks[i];
+        SchedulerTask *current_task = &sc->tasks[i];
 
         // Sporadic tasks are released only when an event is registered.
         if (current_task->type != 'P') {
@@ -438,7 +438,7 @@ bool scheduler_register_sporadic_event(Scheduler *sc)
     }
 
     uint32_t task_index = sc->sporadic_task_index;
-    Task *task = &sc->tasks[task_index];
+    SchedulerTask *task = &sc->tasks[task_index];
 
     // Reject events that occur before the task's minimum inter-arrival time.
     if (sc->sporadic_has_released) {

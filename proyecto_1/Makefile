@@ -51,9 +51,15 @@ TASK_PARSER_TEST := $(OUT_DIR)/test_task_parser
 FAILOVER_TEST := $(OUT_DIR)/test_failover
 MANUAL_TEST := $(OUT_DIR)/test_manual_tasks
 MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
+TASK_STORE_TEST := $(OUT_DIR)/test_task_store
+TASK_CONVERSION_TEST := $(OUT_DIR)/test_task_conversion
 EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
 REPORT_TEST := $(OUT_DIR)/test_report
 REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
+SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
+RMS_TEST := $(OUT_DIR)/test_rms
+EDF_TEST := $(OUT_DIR)/test_edf
+SCHEDULER_RUNTIME_TEST := $(OUT_DIR)/test_scheduler_runtime
 
 # ============================================================
 # COMPILER FLAGS
@@ -131,6 +137,9 @@ FAILOVER_TEST_OBJ := $(BUILD_DIR)/tests/test_failover.o
 
 MANUAL_TEST_OBJ := $(BUILD_DIR)/tests/test_manual_tasks.o
 MESSAGE_PARSER_TEST_OBJ := $(BUILD_DIR)/tests/test_message_parser.o
+TASK_STORE_TEST_OBJ := $(BUILD_DIR)/tests/test_task_store.o
+TASK_CONVERSION_TEST_OBJ := $(BUILD_DIR)/tests/test_task_conversion.o
+TASK_CONVERSION_OBJ := $(BUILD_DIR)/nodes/scheduler/task_conversion.o
 EVENT_QUEUE_TEST_OBJ := $(BUILD_DIR)/tests/test_event_queue.o
 REPORT_TEST_OBJ := $(BUILD_DIR)/tests/test_report.o
 REPORT_SESSION_TEST_OBJ := $(BUILD_DIR)/tests/test_report_session.o
@@ -153,6 +162,8 @@ UT_OBJ := $(BUILD_DIR)/nodes/scheduler/ut.o
 EDF_TEST_OBJ := $(BUILD_DIR)/nodes/node_tests/test_edf.o
 
 EDF_OBJ := $(BUILD_DIR)/nodes/scheduler/edf.o
+SCHEDULER_RUNTIME_TEST_OBJ := $(BUILD_DIR)/tests/test_scheduler_runtime.o
+SCHEDULER_RUNTIME_OBJ := $(BUILD_DIR)/nodes/scheduler/scheduler_runtime.o
 
 TEST_OBJS := \
     $(FOUNDATION_TEST_OBJ) \
@@ -162,9 +173,12 @@ TEST_OBJS := \
     $(FAILOVER_TEST_OBJ) \
     $(MANUAL_TEST_OBJ) \
     $(MESSAGE_PARSER_TEST_OBJ) \
+    $(TASK_STORE_TEST_OBJ) \
+    $(TASK_CONVERSION_TEST_OBJ) \
     $(EVENT_QUEUE_TEST_OBJ) \
     $(REPORT_TEST_OBJ) \
-    $(REPORT_SESSION_TEST_OBJ)
+    $(REPORT_SESSION_TEST_OBJ) \
+    $(SCHEDULER_RUNTIME_TEST_OBJ)
 	
 
 # ============================================================
@@ -179,7 +193,8 @@ DEPS := $(sort \
     $(RMS_TEST_OBJ:.o=.d) \
     $(RMS_OBJ:.o=.d) \
     $(EDF_TEST_OBJ:.o=.d) \
-    $(EDF_OBJ:.o=.d))
+    $(EDF_OBJ:.o=.d) \
+    $(SCHEDULER_RUNTIME_OBJ:.o=.d))
 
 # ============================================================
 # PHONY TARGETS
@@ -225,8 +240,11 @@ $(BUILD_DIR)/tests/%.o: tests/%.c
 # FOUNDATION TEST
 # ============================================================
 
+# protocol.o también referencia conversión de enteros y la interfaz serial.
 $(FOUNDATION_TEST): $(FOUNDATION_TEST_OBJ) \
-                    $(BUILD_DIR)/common/protocol.o
+                    $(BUILD_DIR)/common/protocol.o \
+                    $(BUILD_DIR)/common/conversion.o \
+                    $(BUILD_DIR)/host/serial/serial.o
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -319,7 +337,33 @@ $(EDF_TEST): $(EDF_TEST_OBJ) \
 # Parser de contenido, independiente del protocolo serial
 $(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
                         $(BUILD_DIR)/common/message_parser.o \
+                        $(BUILD_DIR)/common/message_serializer.o \
                         $(CORE_JSON_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(TASK_STORE_TEST): $(TASK_STORE_TEST_OBJ) \
+                    $(BUILD_DIR)/common/task_store.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(TASK_CONVERSION_OBJ): $(SRC_DIR)/nodes/scheduler/task_conversion.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TASK_CONVERSION_TEST): $(TASK_CONVERSION_TEST_OBJ) \
+                         $(TASK_CONVERSION_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
+$(SCHEDULER_RUNTIME_TEST): $(SCHEDULER_RUNTIME_TEST_OBJ) \
+                           $(SCHEDULER_RUNTIME_OBJ) \
+                           $(TASK_CONVERSION_OBJ) \
+                           $(SCHEDULER_OBJ) \
+                           $(RMS_OBJ) \
+                           $(EDF_OBJ) \
+                           $(UT_OBJ) \
+                           $(BUILD_DIR)/common/task_store.o
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -347,6 +391,9 @@ test: $(FOUNDATION_TEST) \
       $(RMS_TEST) \
       $(EDF_TEST) \
       $(MESSAGE_PARSER_TEST) \
+      $(TASK_STORE_TEST) \
+      $(TASK_CONVERSION_TEST) \
+      $(SCHEDULER_RUNTIME_TEST) \
       $(EVENT_QUEUE_TEST) \
       $(REPORT_TEST) \
       $(REPORT_SESSION_TEST)
@@ -357,6 +404,9 @@ test: $(FOUNDATION_TEST) \
 	./$(FAILOVER_TEST)
 	./$(MANUAL_TEST)
 	./$(MESSAGE_PARSER_TEST)
+	./$(TASK_STORE_TEST)
+	./$(TASK_CONVERSION_TEST)
+	./$(SCHEDULER_RUNTIME_TEST)
 	./$(EVENT_QUEUE_TEST)
 	./$(REPORT_TEST)
 	./$(REPORT_SESSION_TEST)

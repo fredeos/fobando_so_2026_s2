@@ -9,6 +9,8 @@
 
 /* Límite del contenido JSON, independiente de las cabeceras de transporte */
 #define MESSAGE_MAX_BYTES 256u
+#define CALIBRATION_DEFAULT_SAMPLES 5u
+#define CALIBRATION_MAX_SAMPLES 100u
 
 /* Algoritmo local solicitado al nodo, sin dependencias del Host */
 typedef enum {
@@ -26,6 +28,13 @@ typedef enum {
     MESSAGE_PARSE_OUT_OF_RANGE,
     MESSAGE_PARSE_UNKNOWN_TYPE
 } MessageParseResult;
+
+typedef enum {
+    MESSAGE_SERIALIZE_OK = 0,
+    MESSAGE_SERIALIZE_INVALID_ARGUMENT,
+    MESSAGE_SERIALIZE_INVALID_MESSAGE,
+    MESSAGE_SERIALIZE_TOO_LARGE
+} MessageSerializeResult;
 
 /*
  * Mensaje interpretado, compartido por Host, ESP32 y Pico.
@@ -85,6 +94,18 @@ MessageParseResult message_parse(
     const char *text,
     size_t length,
     Message *out
+);
+
+/*
+ * Serializa un mensaje usando el mismo esquema que message_parse().
+ * capacity incluye espacio para el terminador NUL; *length recibe la
+ * longitud JSON sin NUL. El buffer y length solo se modifican al tener éxito.
+ */
+MessageSerializeResult message_serialize(
+    const Message *message,
+    char *buffer,
+    size_t capacity,
+    size_t *length
 );
 
 /* Devuelve una descripción constante del resultado, sin reservar memoria */

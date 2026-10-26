@@ -52,7 +52,7 @@ void test_add_task(void)
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task1 = {
+    SchedulerTask task1 = {
         .id = 1,
         .type = 'P',
         .W = 250,
@@ -62,7 +62,7 @@ void test_add_task(void)
         .C = 3
     };
 
-    Task task2 = {
+    SchedulerTask task2 = {
         .id = 2,
         .type = 'P',
         .W = 400,
@@ -86,7 +86,7 @@ void test_add_task(void)
     assert(sc.tasks[1].T == 20);
 
     // Reject tasks with invalid periods.
-    Task invalid_task = {
+    SchedulerTask invalid_task = {
         .id = 3,
         .type = 'P',
         .W = 100,
@@ -103,7 +103,7 @@ void test_add_task(void)
     assert(!add_task(NULL, &sc));
     assert(!add_task(&task1, NULL));
 
-    printf("[SUCCESS] Task registration\n");
+    printf("[SUCCESS] SchedulerTask registration\n");
 }
 
 
@@ -117,7 +117,7 @@ void test_max_tasks(void)
     init(&sc, 100, RMS);
 
     for (uint32_t i = 0; i < MAX_TASKS; i++) {
-        Task task = {
+        SchedulerTask task = {
             .id = i + 1,
             .type = 'P',
             .W = 100,
@@ -132,7 +132,7 @@ void test_max_tasks(void)
 
     assert(sc.task_count == MAX_TASKS);
 
-    Task extra = {
+    SchedulerTask extra = {
         .id = MAX_TASKS + 1,
         .type = 'P',
         .W = 100,
@@ -193,7 +193,7 @@ void test_release_job(void)
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 250,
@@ -242,7 +242,7 @@ void test_free_job(void)
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 100,
@@ -291,7 +291,7 @@ void test_periodic_releases(void)
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task taskA = {
+    SchedulerTask taskA = {
         .id = 1,
         .type = 'P',
         .W = 200,
@@ -301,7 +301,7 @@ void test_periodic_releases(void)
         .C = 2
     };
 
-    Task taskB = {
+    SchedulerTask taskB = {
         .id = 2,
         .type = 'P',
         .W = 300,
@@ -311,7 +311,7 @@ void test_periodic_releases(void)
         .C = 3
     };
 
-    Task taskS = {
+    SchedulerTask taskS = {
         .id = 3,
         .type = 'S',
         .W = 100,
@@ -349,9 +349,9 @@ void test_periodic_releases(void)
                (unsigned)released);
     }
 
-    // Task A: ticks 0, 5, 10, 15, 20.
-    // Task B: ticks 0, 10, 20.
-    // Task S: no automatic releases.
+    // SchedulerTask A: ticks 0, 5, 10, 15, 20.
+    // SchedulerTask B: ticks 0, 10, 20.
+    // SchedulerTask S: no automatic releases.
     assert(sc.job_count == 8);
     assert(sc.free_count == MAX_JOBS - 8);
 
@@ -368,7 +368,7 @@ void test_max_jobs(void)
     Scheduler sc;
     init(&sc, 100, RMS);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 100,
@@ -480,7 +480,7 @@ static void test_deadline_miss(void)
     Scheduler sc;
     init(&sc, 1, EDF);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 3,
@@ -523,7 +523,7 @@ static void test_deadline_no_miss(void)
     Scheduler sc;
     init(&sc, 1, EDF);
 
-    Task task = {
+    SchedulerTask task = {
         .id = 1,
         .type = 'P',
         .W = 2,
@@ -564,7 +564,7 @@ static void test_deadline_miss_continues(void)
     Scheduler sc;
     init(&sc, 1, EDF);
 
-    Task task_a = {
+    SchedulerTask task_a = {
         .id = 1,
         .type = 'P',
         .W = 3,
@@ -574,7 +574,7 @@ static void test_deadline_miss_continues(void)
         .C = 3
     };
 
-    Task task_b = {
+    SchedulerTask task_b = {
         .id = 2,
         .type = 'P',
         .W = 1,
@@ -634,7 +634,7 @@ static bool run_scheduler_test(
     init(&sc, 1, type);
 
     // Define periodic tasks A, B, and C.
-    Task tasks[] = {
+    SchedulerTask tasks[] = {
         {.id = 1, .type = 'P', .W = 3, .T = 6, .D = 6, .criticality = 1, .C = 3},
         {.id = 2, .type = 'P', .W = 2, .T = 5, .D = 5, .criticality = 1, .C = 2},
         {.id = 3, .type = 'P', .W = 1, .T = 12, .D = 12, .criticality = 1, .C = 1}
@@ -725,7 +725,7 @@ static bool run_scheduler_test(
 }
 
 // -----------------------------------------------------------------------------------
-// Sporadic Task Tests
+// Sporadic SchedulerTask Tests
 // -----------------------------------------------------------------------------------
 
 // Verifies sporadic releases and the minimum inter-arrival interval.
@@ -734,7 +734,7 @@ static void test_sporadic_release(void)
     Scheduler sc;
     init(&sc, 1, EDF);
 
-    Task sporadic_task = {
+    SchedulerTask sporadic_task = {
         .id = 10,
         .type = 'S',
         .W = 2,
@@ -784,7 +784,7 @@ static void test_sporadic_response_latency(void)
     Scheduler sc;
     init(&sc, 1, EDF);
 
-    Task sporadic_task = {
+    SchedulerTask sporadic_task = {
         .id = 10,
         .type = 'S',
         .W = 2,
