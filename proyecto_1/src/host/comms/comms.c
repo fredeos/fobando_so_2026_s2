@@ -69,7 +69,7 @@ comms_status_t comms_setup_handler(
         comms_handler,
         handler
     );
-    if (code < 0) return COMMS_ERROR;
+    if (code != 0) return COMMS_ERROR;
     pthread_detach(handler_thread);
     // << Return >>
     return COMMS_OK;
@@ -89,14 +89,21 @@ comms_status_t comms_stop_handler(
 comms_status_t comms_request_send(
     comms_handler_t* handler,
     const char* message,
-    uint8_t priorirty
+    uint8_t priority
 ){
-    if (handler->sent.set)
-        return COMMS_BUSY;
-    
+    if (handler == NULL || message == NULL || handler->sent.content == NULL)
+        return COMMS_INVALID_ARG;
+
     uint32_t size = strlen(message) + 1;
+    if (size > COMMS_MESSAGE_CAPACITY || size > PROTOCOL_PAYLOAD_BYTES)
+        return COMMS_INVALID_ARG;
+
     pthread_mutex_lock(&handler->mutex);   // lock
-    handler->sent.priority = priorirty;
+    if (handler->sent.set) {
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_BUSY;
+    }
+    handler->sent.priority = priority;
     handler->sent.size = size;
     memcpy(
         handler->sent.content,
@@ -224,7 +231,7 @@ void* comms_handler(void* arg){
         status = COMMS_ALIVE;
         // [Message configuration]
         if (stage == 0){
-            char* msg = NULL;
+            const char* msg = NULL;
             bool msg_set = false;
             uint32_t size = 0;
             uint8_t priority = 0;
@@ -327,7 +334,8 @@ void* comms_handler(void* arg){
                             // + Reset flags
                             hd->recv.rdy = true;
                         }
-                        if (msg_save){
+                        if (msg_save && hd->recv.content != NULL &&
+                            rx_frame.length <= MESSAGE_MAX_BYTES){
                             // + Copy frame contents
                             hd->recv.size = rx_frame.length;
                             hd->recv.priority = rx_frame.relevance;
@@ -336,6 +344,7 @@ void* comms_handler(void* arg){
                                 rx_frame.payload,
                                 rx_frame.length
                             );
+                            hd->recv.content[rx_frame.length] = '\0';
                         }
                         hd->transactions++;
                         pthread_mutex_unlock(&hd->mutex); // unlock
@@ -348,7 +357,10 @@ void* comms_handler(void* arg){
             }
         }
     }
+    pthread_mutex_lock(&hd->mutex);
     hd->running = false;
+    hd->online = false;
+    pthread_mutex_unlock(&hd->mutex);
     if (!setup_fail) {
         printf("Closing file descriptor for %s device(%d)\n", hd->dev, hd->id);
         close(hd->fd);

@@ -51,6 +51,9 @@ MESSAGE_PARSER_TEST := $(OUT_DIR)/test_message_parser
 EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
 REPORT_TEST := $(OUT_DIR)/test_report
 REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
+SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
+RMS_TEST := $(OUT_DIR)/test_rms
+EDF_TEST := $(OUT_DIR)/test_edf
 
 # ============================================================
 # COMPILER FLAGS
@@ -222,7 +225,9 @@ $(BUILD_DIR)/tests/%.o: tests/%.c
 # ============================================================
 
 $(FOUNDATION_TEST): $(FOUNDATION_TEST_OBJ) \
-                    $(BUILD_DIR)/common/protocol.o
+                    $(BUILD_DIR)/common/protocol.o \
+                    $(BUILD_DIR)/common/conversion.o \
+                    $(BUILD_DIR)/host/serial/serial.o
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
@@ -315,6 +320,7 @@ $(EDF_TEST): $(EDF_TEST_OBJ) \
 # Parser de contenido, independiente del protocolo serial
 $(MESSAGE_PARSER_TEST): $(MESSAGE_PARSER_TEST_OBJ) \
                         $(BUILD_DIR)/common/message_parser.o \
+                        $(BUILD_DIR)/common/message_serializer.o \
                         $(CORE_JSON_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)

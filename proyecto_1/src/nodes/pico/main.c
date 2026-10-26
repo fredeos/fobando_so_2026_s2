@@ -63,6 +63,7 @@ int main(void) {
 
 #include <stdio.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "pico/stdlib.h"
 
@@ -113,12 +114,15 @@ int main(void)
 
 
 #include <string.h>
+#include <stdio.h>
 
 #include "pico/stdlib.h"
 
 #include "serial/pico.h"
 #include "serial/serial.h"
 #include "common/protocol.h"
+#include "common/message_parser.h"
+#include "common/messages.h"
 #include "gpio/gpio.h"
 
 #define LED0 26
@@ -126,7 +130,60 @@ int main(void)
 #define LED2 33
 #define LED3 32
 
-#define MESSAGE_LEN 80
+#define NODE_ID 2u
+#define MESSAGE_LEN (PROTOCOL_PAYLOAD_BYTES + 1u)
+
+static bool prepare_response(
+    const protocol_frame_t *received,
+    char *response,
+    size_t response_capacity,
+    uint32_t *response_length
+)
+{
+    char request[MESSAGE_LEN];
+    size_t request_length = received->length;
+
+    if (request_length > PROTOCOL_PAYLOAD_BYTES)
+        return false;
+    memcpy(request, received->payload, request_length);
+    request[request_length] = '\0';
+    if (request_length > 0u && request[request_length - 1u] == '\0')
+        --request_length;
+
+    Message incoming;
+    if (message_parse(request, request_length, &incoming) == MESSAGE_PARSE_OK) {
+        if (incoming.type != MSG_CONFIG || incoming.node_id != NODE_ID)
+            return false;
+
+        Message reply = {
+            .type = MSG_ACK,
+            .node_id = NODE_ID,
+            .request_id = incoming.request_id,
+            .data.reply = {.type = MSG_CONFIG}
+        };
+        size_t json_length = 0u;
+        if (message_serialize(&reply, response, response_capacity,
+                              &json_length) != MESSAGE_SERIALIZE_OK) {
+            return false;
+        }
+        *response_length = (uint32_t)json_length;
+        return true;
+    }
+
+    const char *legacy = "Pico didn't understand message";
+    if (request_length == 4u && memcmp(request, "PING", 4u) == 0)
+        legacy = "PONG from Pico";
+    else if (request_length == 5u && memcmp(request, "MARCO", 5u) == 0 &&
+             received->relevance > 0u)
+        legacy = "POLO from Pico";
+
+    size_t legacy_length = strlen(legacy) + 1u;
+    if (legacy_length > response_capacity)
+        return false;
+    memcpy(response, legacy, legacy_length);
+    *response_length = (uint32_t)legacy_length;
+    return true;
+}
 
 void main(void){
     bool setup_fail = false;
@@ -168,11 +225,6 @@ void main(void){
     board_gpio_write(LED2, GPIO_LOW);
     board_gpio_write(LED3, GPIO_LOW);
     // << Setup basic messages >>
-    const char *pong = "PONG from Pico";
-    const char *default_msg = "Pico didn't understand message";
-    const char *polo = "POLO from Pico";
-    
-    char message [MESSAGE_LEN];
     char response[MESSAGE_LEN];
     // << Procedure loop >>
     int state = 0;
@@ -193,33 +245,26 @@ void main(void){
             );
             // [Check RX]
             if (rx.complete){
-                // [Check message]
-                const char *msg = default_msg;
+                uint32_t response_length = 0u;
                 if (rx.valid){
-                    // (Read buffer to frame)
                     protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
                         &rx_frame,
                         rx.buffer,
                         sizeof(rx.buffer)
                     );
-                    // (Load to message)
-                    memcpy(
-                        message,
-                        rx_frame.payload,
-                        rx_frame.length
-                    );
-                    // (Check message)
-                    if (strcmp(message, "PING") == 0 && rx_frame.relevance == 0)
-                        msg = pong;
-                    else if (strcmp(message, "MARCO") == 0 && rx_frame.relevance > 0)
-                        msg = polo;
+                    if (rx_frame_errno == PROTOCOL_OK)
+                        (void)prepare_response(&rx_frame, response,
+                            sizeof(response), &response_length);
                 }
-                // [Setup response]
-                uint32_t size = strlen(msg) + 1; // copy response until '\0'
+                if (response_length == 0u) {
+                    const char *fallback = "Pico didn't understand message";
+                    response_length = (uint32_t)strlen(fallback) + 1u;
+                    memcpy(response, fallback, response_length);
+                }
 
                 tx_frame.relevance = 0;
-                tx_frame.length = size;
-                memcpy(tx_frame.payload, msg, size);
+                tx_frame.length = response_length;
+                memcpy(tx_frame.payload, response, response_length);
 
                 protocol_errno_t tx_frame_errno = protocol_set_frame_to_buffer(
                     &tx_frame,

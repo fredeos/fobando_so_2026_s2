@@ -255,12 +255,109 @@ static void test_numeric_limits(void)
         reject(out_of_range[i], MESSAGE_PARSE_OUT_OF_RANGE);
 }
 
+static void assert_round_trip(const Message *source)
+{
+    char json[MESSAGE_MAX_BYTES + 1u];
+    size_t length = 0u;
+    Message parsed;
+
+    assert(message_serialize(source, json, sizeof(json), &length)
+           == MESSAGE_SERIALIZE_OK);
+    assert(length <= MESSAGE_MAX_BYTES);
+    assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+    assert(parsed.type == source->type);
+    assert(parsed.node_id == source->node_id);
+    assert(parsed.request_id == source->request_id);
+}
+
+static void test_message_serialization(void)
+{
+    Message message = {
+        .type = MSG_CONFIG, .node_id = 2u, .request_id = 7u,
+        .data.config = {
+            .algorithm = MESSAGE_SCHED_EDF,
+            .tick_ms = 10u,
+            .report_every_ticks = 20u
+        }
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_CALIBRATE_REQUEST, .node_id = 2u, .request_id = 8u,
+        .data.sample_ticks = 50u
+    };
+    assert_round_trip(&message);
+    message.type = MSG_CALIBRATE_RESPONSE;
+    message.data.ut_per_tick = 100u;
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_DEPLOY_TASK, .node_id = 2u, .request_id = 9u,
+        .data.deploy_task = {
+            .task = {.id = 8u, .type = TASK_SPORADIC, .work = 40u,
+                .period = 20u, .deadline = 15u, .criticality = -1},
+            .cost_ticks = 3u
+        }
+    };
+    assert_round_trip(&message);
+
+    message = (Message){.type = MSG_START, .node_id = 2u, .request_id = 10u};
+    assert_round_trip(&message);
+    message.type = MSG_STOP;
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_EVENT, .node_id = 2u, .request_id = 11u,
+        .data.event = {.type = EVENT_TASK_SWITCH, .task_id = 8u,
+            .job_id = 3u, .tick = UINT64_C(9007199254740993),
+            .duration_ticks = 2u, .detail = -7}
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_TICK_REPORT, .node_id = 2u, .request_id = 12u,
+        .data.tick_report = {.tick = UINT64_MAX, .task_id = 8u}
+    };
+    assert_round_trip(&message);
+    message = (Message){
+        .type = MSG_TRIGGER_SPORADIC, .node_id = 2u, .request_id = 13u,
+        .data.task_id = 8u
+    };
+    assert_round_trip(&message);
+
+    message = (Message){
+        .type = MSG_ACK, .node_id = 2u, .request_id = 14u,
+        .data.reply = {.type = MSG_DEPLOY_TASK}
+    };
+    assert_round_trip(&message);
+    message.type = MSG_NACK;
+    message.data.reply.reason = REJECT_INSUFFICIENT_CAPACITY;
+    assert_round_trip(&message);
+
+    char buffer[MESSAGE_MAX_BYTES + 1u];
+    size_t length = 123u;
+    const Message start = {.type = MSG_START};
+    memset(buffer, 0xA5, sizeof(buffer));
+    assert(message_serialize(&start, buffer, 4u, &length)
+           == MESSAGE_SERIALIZE_TOO_LARGE);
+    assert(length == 123u && (unsigned char)buffer[0] == 0xA5u);
+    assert(message_serialize(NULL, buffer, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_ARGUMENT);
+    assert(message_serialize(&start, NULL, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_ARGUMENT);
+
+    Message invalid = {.type = MSG_CALIBRATE_REQUEST};
+    assert(message_serialize(&invalid, buffer, sizeof(buffer), &length)
+           == MESSAGE_SERIALIZE_INVALID_MESSAGE);
+}
+
 int main(void)
 {
     test_message_types();
     test_input_boundaries();
     test_invalid_messages();
     test_numeric_limits();
+    test_message_serialization();
 
     for (int result = MESSAGE_PARSE_OK; result <= MESSAGE_PARSE_UNKNOWN_TYPE; ++result)
         assert(message_parse_result_string((MessageParseResult)result)[0] != '\0');

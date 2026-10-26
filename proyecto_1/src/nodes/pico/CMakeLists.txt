@@ -27,7 +27,7 @@ project(pico C CXX ASM)
 
 pico_sdk_init()
 
-file(GLOB COMMON_SOURCES
+file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/../../common/*.c"
 )
 

@@ -8,8 +8,11 @@
 #include <pthread.h>
 
 #include "common/protocol.h"
+#include "common/message_parser.h"
 #include "serial/serial.h"
 #include "./../serial/posix.h"
+
+#define COMMS_MESSAGE_CAPACITY (MESSAGE_MAX_BYTES + 1u)
 
 /*
  * Communications status codes
@@ -134,7 +137,7 @@ comms_status_t comms_stop_handler(
 comms_status_t comms_request_send(
     comms_handler_t* handler,
     const char* message,
-    uint8_t priorirty
+    uint8_t priority
 );
 
 /*

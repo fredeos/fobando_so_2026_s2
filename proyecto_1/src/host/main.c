@@ -1,148 +1,172 @@
 #define _DEFAULT_SOURCE
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
-#include "serial/serial.h"
-#include "serial/posix.h"
-#include "common/protocol.h"
+#include "common/message_parser.h"
+#include "host/config.h"
 #include "comms/comms.h"
 
-#define BUFFER_LEN 80
 #define EXPECTED_DEVICES 2
-#define TICK_SIZE   10
-#define TICK_LIMIT  10
+#define HANDSHAKE_TIMEOUT_SECONDS 30
+
+static bool wait_for_ack(
+    comms_handler_t *handler,
+    uint32_t node_id,
+    uint32_t request_id,
+    const char *device
+)
+{
+    time_t start = time(NULL);
+    for (;;) {
+        char response[COMMS_MESSAGE_CAPACITY];
+        size_t response_size = 0u;
+        bool ready;
+
+        pthread_mutex_lock(&handler->mutex);
+        ready = handler->recv.rdy;
+        if (ready) {
+            response_size = handler->recv.size;
+            memcpy(response, handler->recv.content, response_size);
+            response[response_size] = '\0';
+            handler->recv.rdy = false;
+        }
+        pthread_mutex_unlock(&handler->mutex);
+
+        if (ready) {
+            if (response_size > 0u && response[response_size - 1u] == '\0')
+                --response_size;
+
+            Message reply;
+            MessageParseResult parsed = message_parse(
+                response, response_size, &reply
+            );
+            if (parsed == MESSAGE_PARSE_OK &&
+                reply.type == MSG_ACK &&
+                reply.node_id == node_id &&
+            reply.request_id == request_id &&
+                reply.data.reply.type == MSG_CONFIG) {
+                printf("CONFIG confirmado por nodo %u (%s).\n", node_id, device);
+                return true;
+            }
+
+            if (parsed != MESSAGE_PARSE_OK) {
+                fprintf(stderr, "Respuesta no JSON válida de nodo %u (%s): %s\n",
+                    node_id, device, message_parse_result_string(parsed));
+            } else {
+                fprintf(stderr, "Respuesta inesperada de nodo %u (%s): tipo %d.\n",
+                    node_id, device, (int)reply.type);
+            }
+        }
+
+        if (time(NULL) - start >= HANDSHAKE_TIMEOUT_SECONDS) {
+            fprintf(stderr, "Timeout esperando ACK de nodo %u en %s.\n",
+                node_id, device);
+            return false;
+        }
+        struct timespec pause = {.tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+}
+
+static void stop_handlers(comms_handler_t *handlers, size_t count)
+{
+    for (size_t i = 0u; i < count; ++i)
+        comms_stop_handler(&handlers[i]);
+
+    for (size_t i = 0u; i < count; ++i) {
+        for (;;) {
+            pthread_mutex_lock(&handlers[i].mutex);
+            bool running = handlers[i].running;
+            pthread_mutex_unlock(&handlers[i].mutex);
+            if (!running)
+                break;
+            struct timespec pause = {.tv_nsec = 10000000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+}
 
 int main(int argc, char *argv[])
 {
-    /* Modo aislado para verificar reportes y cierre sin hardware ni protocolo */
-    if (argc >= 2 && strcmp(argv[1], "--report-demo") == 0) {
-        if (argc > 3) {
-            fprintf(stderr, "Usage: %s --report-demo [output_directory]\n", argv[0]);
-            return 1;
-        }
-        char directory[128];
-        if (argc == 2 && mkdir("output", 0775) != 0 && errno != EEXIST) {
-            perror("output");
-            return 1;
-        }
-        snprintf(directory, sizeof(directory), "output/report_%ld_%ld", (long)time(NULL), (long)getpid());
-        return report_demo_run(argc == 3 ? argv[2] : directory);
-    }
-
     if (argc != 1 + EXPECTED_DEVICES) {
-        fprintf(stderr, "Usage: %s /dev/ttyUSB0 | --report-demo [output_directory]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ESP32 serial port> <Pico serial port>\n", argv[0]);
         return 1;
     }
-    // << Configure communication interface >>
-    bool is_online[EXPECTED_DEVICES];
-    int  offline = 0;
-    char response[EXPECTED_DEVICES][BUFFER_LEN];
-    char message [EXPECTED_DEVICES][BUFFER_LEN];
 
-    comms_handler_t handler[EXPECTED_DEVICES];
-    for (int i = 0; i < EXPECTED_DEVICES; i++){
-        comms_init_handler(
-            i,
-            &handler[i],
-            argv[1+i],
-            0,
-            TICK_SIZE,
-            TICK_LIMIT
+    HostConfig config;
+    char error[256];
+    if (!config_load("config/system.conf", &config, error, sizeof(error))) {
+        fprintf(stderr, "No se pudo cargar config/system.conf: %s\n", error);
+        return 1;
+    }
+
+    const char *devices[EXPECTED_DEVICES] = {argv[1], argv[2]};
+    const uint32_t node_ids[EXPECTED_DEVICES] = {1u, 2u};
+    comms_handler_t handlers[EXPECTED_DEVICES] = {0};
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
+    char received[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
+    bool setup_ok[EXPECTED_DEVICES] = {false, false};
+    bool acked[EXPECTED_DEVICES] = {false, false};
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (comms_init_handler((int)i, &handlers[i], devices[i], 0u,
+                               config.tick_ms, config.missed_reports_limit)
+            != COMMS_OK) {
+            fprintf(stderr, "No se pudo inicializar el enlace %s.\n", devices[i]);
+            stop_handlers(handlers, i);
+            return 1;
+        }
+        handlers[i].sent.content = sent[i];
+        handlers[i].recv.content = received[i];
+
+        Message request = {
+            .type = MSG_CONFIG,
+            .node_id = node_ids[i],
+            .request_id = 1u,
+            .data.config = {
+                .algorithm = config.algorithm == SCHED_EDF
+                    ? MESSAGE_SCHED_EDF : MESSAGE_SCHED_RMS,
+                .tick_ms = config.tick_ms,
+                .report_every_ticks = config.report_every_ticks
+            }
+        };
+        size_t json_length = 0u;
+        MessageSerializeResult serialized = message_serialize(
+            &request, sent[i], sizeof(sent[i]), &json_length
         );
+        if (serialized != MESSAGE_SERIALIZE_OK) {
+            fprintf(stderr, "No se pudo serializar CONFIG para nodo %u (error %d).\n",
+                node_ids[i], (int)serialized);
+            stop_handlers(handlers, i + 1u);
+            return 1;
+        }
 
-        handler[i].sent.content = message[i];
-        handler[i].recv.content = response[i];
-
-        is_online[i] = true;
-
-        comms_setup_handler(&handler[i]);
+        if (comms_request_send(&handlers[i], sent[i], 0u) != COMMS_OK) {
+            fprintf(stderr, "No se pudo preparar CONFIG para nodo %u.\n", node_ids[i]);
+            stop_handlers(handlers, i + 1u);
+            return 1;
+        }
+        printf("Enviando CONFIG a nodo %u por %s (%zu bytes JSON).\n",
+            node_ids[i], devices[i], json_length);
+        setup_ok[i] = comms_setup_handler(&handlers[i]) == COMMS_OK;
+        if (!setup_ok[i]) {
+            fprintf(stderr, "No se pudo iniciar el enlace %s.\n", devices[i]);
+            stop_handlers(handlers, i + 1u);
+            return 1;
+        }
     }
-    // << Program variables >>
-    int turn = 0;
 
-    int count[EXPECTED_DEVICES] = {0};
-    const char* marco = "MARCO";
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
+        acked[i] = wait_for_ack(&handlers[i], node_ids[i], 1u, devices[i]);
 
-    // << Loop procedure >>
-    printf("Start of procedure...\n");
-    while (1){
-        pthread_mutex_lock(&handler[turn].mutex);   // lock
-        bool went_online  = !is_online[turn] && handler[turn].online;
-        bool went_offline = is_online[turn] && !handler[turn].online;
-
-        if (went_online) {
-            printf("Device(%d) connected!\n", turn);
-            offline--;
-            printf("Remaining: %d\n", offline);
-        }
-        if (went_offline) {
-            printf("Device(%d) disconnected!\n", turn);
-            offline++;
-            printf("Remaining: %d\n", offline);
-        }
-
-        if (went_online || went_offline)
-            is_online[turn] = handler[turn].online;
-        pthread_mutex_unlock(&handler[turn].mutex);  // unlock
-
-        if (offline == EXPECTED_DEVICES){
-            printf("All devices disconnected\n");
-            break;
-        }
-        
-        if(is_online[turn]){
-
-            if(count[turn] == 2){
-                comms_request_send(
-                    &handler[turn],
-                    marco,
-                    1
-                );
-            } else if (count[turn] == 7){
-                printf("Stopping device(%d)...\n", turn);
-                comms_stop_handler(&handler[turn]);
-                printf("Device(%d) stopped\n", turn);
-                count[turn]++;
-            }
-
-            if (handler[turn].sent.rdy){
-                printf("Sent: %s [to device(%d) with %u priority]\n", 
-                    handler[turn].sent.content,
-                    turn,
-                    handler[turn].sent.priority
-                );
-                comms_acquire_send(&handler[turn]);
-            }
-
-            if (handler[turn].recv.rdy){
-                printf("Received: %s [from device(%d) with %u priority]\n",
-                    handler[turn].recv.content,
-                    turn,
-                    handler[turn].recv.priority
-                );
-                comms_acquire_receive(&handler[turn]);
-                count[turn]++;
-            }
-        }
-
-        turn++;
-        if (turn == EXPECTED_DEVICES) turn = 0;
+    stop_handlers(handlers, EXPECTED_DEVICES);
+    if (!acked[0] || !acked[1]) {
+        fprintf(stderr, "Intercambio CONFIG incompleto; revise conexiones y firmware.\n");
+        return 1;
     }
-    // << End of program >>
-    printf("End of procedure...\n");
-    printf("Closing all handlers...\n");
-    for (int i = 0; i < EXPECTED_DEVICES; i++){
-        comms_stop_handler(&handler[i]);
-        while (handler[i].running);
-    }
-    printf("All handlers closed...\n");
+
+    puts("CONFIG/ACK completado en ambos dispositivos.");
     return 0;
 }
