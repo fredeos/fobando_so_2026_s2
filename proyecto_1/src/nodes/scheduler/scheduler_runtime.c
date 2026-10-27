@@ -65,6 +65,44 @@ bool scheduler_runtime_start(
     return true;
 }
 
+RejectReason scheduler_runtime_add_task(
+    SchedulerRuntime *runtime,
+    TaskStore *store,
+    const Task *task,
+    uint32_t cost_ticks
+)
+{
+    if (runtime == NULL || store == NULL ||
+        (runtime->prepared &&
+         store->count != runtime->scheduler.task_count))
+        return REJECT_INVALID_STATE;
+
+    RejectReason reason = task_store_add(store, task, cost_ticks);
+    if (reason != REJECT_NONE || !runtime->prepared)
+        return reason;
+
+    if (runtime->scheduler.task_count >= MAX_TASKS) {
+        --store->count;
+        return REJECT_INSUFFICIENT_CAPACITY;
+    }
+
+    if (task->type == TASK_SPORADIC &&
+        runtime->scheduler.sporadic_task_index != UINT32_MAX) {
+        --store->count;
+        return REJECT_SPORADIC_LIMIT;
+    }
+
+    SchedulerTask scheduler_task;
+    if (!scheduler_task_from_stored(&store->tasks[store->count - 1u],
+                                    &scheduler_task) ||
+        !add_task(&scheduler_task, &runtime->scheduler)) {
+        --store->count;
+        return REJECT_INVALID_TASK;
+    }
+
+    return REJECT_NONE;
+}
+
 void scheduler_runtime_stop(SchedulerRuntime *runtime)
 {
     if (runtime != NULL)

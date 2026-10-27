@@ -37,6 +37,16 @@ static uint64_t next_tick_us;
 static TaskStore deployed_tasks;
 static SchedulerRuntime scheduler_runtime;
 
+#define NODE_REPORT_QUEUE_CAPACITY 128u
+static Event node_report_queue[NODE_REPORT_QUEUE_CAPACITY];
+static size_t report_head;
+static size_t report_tail;
+static size_t report_count;
+static Event pending_slice;
+static bool pending_slice_valid;
+static uint32_t report_every_ticks = 1u;
+static uint32_t previous_selected_task = UINT32_MAX;
+
 /**
  * @brief Agrega un evento a la cola de reportes del nodo.
  *
@@ -457,16 +467,8 @@ static bool prepare_response(
         }
 
         if (incoming.type == MSG_DEPLOY_TASK) {
-            if (scheduler_runtime.prepared) {
-                return serialize_reply(&incoming, MSG_NACK,
-                    REJECT_INVALID_STATE, 0u, response, response_capacity,
-                    response_length);
-            }
-            /*
-             * El Host ya hizo la prueba de admisión. Este paso valida límites
-             * locales, guarda la tarea y confirma el almacenamiento con ACK.
-             */
-            RejectReason reason = task_store_add(
+            RejectReason reason = scheduler_runtime_add_task(
+                &scheduler_runtime,
                 &deployed_tasks,
                 &incoming.data.deploy_task.task,
                 incoming.data.deploy_task.cost_ticks

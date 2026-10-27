@@ -27,6 +27,14 @@ bool scheduler_runtime_start(
     RejectReason *reason
 );
 
+/* Stores a task and appends it to an already prepared scheduler if needed. */
+RejectReason scheduler_runtime_add_task(
+    SchedulerRuntime *runtime,
+    TaskStore *store,
+    const Task *task,
+    uint32_t cost_ticks
+);
+
 /* Pauses execution without discarding tasks, jobs, or scheduler time. */
 void scheduler_runtime_stop(SchedulerRuntime *runtime);
 

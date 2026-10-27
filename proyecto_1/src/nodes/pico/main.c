@@ -359,16 +359,8 @@ static bool prepare_response(
         }
 
         if (incoming.type == MSG_DEPLOY_TASK) {
-            if (scheduler_runtime.prepared) {
-                return serialize_reply(&incoming, MSG_NACK,
-                    REJECT_INVALID_STATE, 0u, response, response_capacity,
-                    response_length);
-            }
-            /*
-             * Guarda Task y cost_ticks ya calculado por el Host. El ACK confirma
-             * almacenamiento, no admisión local ni inicio del scheduler.
-             */
-            RejectReason reason = task_store_add(
+            RejectReason reason = scheduler_runtime_add_task(
+                &scheduler_runtime,
                 &deployed_tasks,
                 &incoming.data.deploy_task.task,
                 incoming.data.deploy_task.cost_ticks

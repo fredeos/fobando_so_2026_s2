@@ -29,12 +29,8 @@ int main(void)
     assert(converted.C == 7u);
 
     stored.task.criticality = -1;
-    SchedulerTask unchanged = {
-        .id = 99u, .type = 'P', .W = 8u, .T = 9u, .D = 10u,
-        .criticality = 11u, .C = 12u
-    };
-    assert(!scheduler_task_from_stored(&stored, &unchanged));
-    assert(unchanged.id == 99u && unchanged.W == 8u && unchanged.C == 12u);
+    assert(scheduler_task_from_stored(&stored, &converted));
+    assert(converted.criticality == -1);
 
     stored.task.criticality = INT_MAX;
     stored.cost_ticks = 0u;

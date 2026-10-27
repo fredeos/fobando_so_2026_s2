@@ -14,6 +14,7 @@
 
 #include "common/message_parser.h"
 #include "host/config.h"
+#include "host/manual_tasks.h"
 #include "host/statistics.h"
 #include "host/task_parser.h"
 #include "comms/comms.h"
@@ -43,6 +44,8 @@ typedef struct {
     bool initialized[EXPECTED_DEVICES];
     bool handler_started[EXPECTED_DEVICES];
     bool running[EXPECTED_DEVICES];
+    Planner planner;
+    uint32_t next_deploy_request_id;
     size_t initialized_count;
 } SerialReportSession;
 
@@ -378,6 +381,7 @@ static bool wait_for_calibration(
  * @return true si llegó una respuesta correlacionada antes del timeout.
  */
 static bool wait_for_task_deploy(
+    EventQueue *queue,
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
@@ -414,6 +418,28 @@ static bool wait_for_task_deploy(
                     ? reply.data.reply.reason : REJECT_NONE;
                 comms_acquire_send(handler);
                 return true;
+            }
+
+            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
+                (reply.type == MSG_EVENT || reply.type == MSG_TICK_REPORT)) {
+                Event event = reply.type == MSG_EVENT
+                    ? reply.data.event
+                    : (Event){
+                        .type = EVENT_TICK_REPORT,
+                        .source = EVENT_SOURCE_NODE,
+                        .node_id = reply.node_id,
+                        .tick = reply.data.tick_report.tick,
+                        .task_id = reply.data.tick_report.task_id
+                    };
+                event.host_time_ns = host_time_ns();
+                record_node_event_tick(&event);
+                size_t index = node_id == 1u ? 0u : node_id == 2u ? 1u :
+                    EXPECTED_DEVICES;
+                if (index < EXPECTED_DEVICES)
+                    node_reports_drained[index] = false;
+                if (!publish_report_event(queue, &event))
+                    return false;
+                continue;
             }
 
             if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
@@ -838,18 +864,145 @@ static uint32_t take_control_request_id(uint32_t *next_request_id)
     return request_id;
 }
 
+static void handle_manual_task_command(
+    EventQueue *queue,
+    const char *task_text,
+    Planner *planner,
+    uint32_t *next_deploy_request_id,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    const char *devices[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+)
+{
+    if (next_deploy_request_id == NULL ||
+        *next_deploy_request_id >= FIRST_CONTROL_REQUEST_ID) {
+        puts("Se agotaron los request_id para desplegar tareas.");
+        return;
+    }
+
+    Task task;
+    char error[128];
+    if (!manual_task_parse(task_text, &task, error, sizeof(error))) {
+        printf("Tarea manual inválida: %s. Formato: "
+               "add id,P|S,W,T,D,criticidad\n", error);
+        return;
+    }
+
+    ManualTaskRequest manual = {0};
+    if (!manual_task_submit(planner, &task, &manual)) {
+        fprintf(stderr, "No se pudo procesar la tarea manual.\n");
+        return;
+    }
+
+    const PlannerDecision *decision = &manual.decision;
+    if (!decision->accepted) {
+        Event event = {
+            .type = EVENT_TASK_REJECTED,
+            .source = EVENT_SOURCE_HOST,
+            .node_id = decision->node_id,
+            .task_id = task.id,
+            .detail = decision->reason,
+            .task = task,
+            .host_time_ns = host_time_ns()
+        };
+        if (publish_report_event(queue, &event))
+            printf("Tarea %" PRIu32 " no admitida por el planificador: %s.\n",
+                task.id, report_reject_reason(decision->reason));
+        return;
+    }
+
+    size_t node_index = 0u;
+    while (node_index < EXPECTED_DEVICES &&
+           node_ids[node_index] != decision->node_id)
+        ++node_index;
+    if (node_index == EXPECTED_DEVICES) {
+        fprintf(stderr, "El planificador asignó la tarea a un nodo desconocido.\n");
+        if (!manual_task_cancel(planner, &manual))
+            fprintf(stderr, "No se pudo liberar la reserva de la tarea manual.\n");
+        return;
+    }
+
+    uint32_t request_id = (*next_deploy_request_id)++;
+    Message request = {
+        .type = MSG_DEPLOY_TASK,
+        .node_id = decision->node_id,
+        .request_id = request_id,
+        .data.deploy_task = {
+            .task = task,
+            .cost_ticks = decision->cost_ticks
+        }
+    };
+    if (!send_message(&handlers[node_index], sent[node_index], &request,
+                      decision->node_id, "DEPLOY_TASK")) {
+        if (!manual_task_cancel(planner, &manual))
+            fprintf(stderr, "No se pudo liberar la reserva de la tarea manual.\n");
+        return;
+    }
+
+    bool accepted = false;
+    RejectReason reason = REJECT_NONE;
+    if (!wait_for_task_deploy(queue, &handlers[node_index], decision->node_id,
+                              request_id, devices[node_index],
+                              &accepted, &reason)) {
+        event_queue_mark_incomplete(queue);
+        fprintf(stderr,
+            "Estado de la tarea %" PRIu32 " incierto; no se liberó la reserva "
+            "porque el nodo pudo haberla almacenado.\n", task.id);
+        return;
+    }
+
+    Event event = {
+        .type = accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
+        .source = accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
+        .node_id = decision->node_id,
+        .task_id = task.id,
+        .cost_ticks = accepted ? decision->cost_ticks : 0u,
+        .detail = accepted ? REJECT_NONE : reason,
+        .task = task,
+        .host_time_ns = host_time_ns()
+    };
+    if (accepted) {
+        if (!manual_task_confirm(&manual)) {
+            fprintf(stderr, "No se pudo confirmar la tarea manual %" PRIu32 ".\n",
+                task.id);
+            event_queue_mark_incomplete(queue);
+            return;
+        }
+    } else if (!manual_task_cancel(planner, &manual)) {
+        fprintf(stderr,
+            "No se pudo revertir la reserva de la tarea manual %" PRIu32 ".\n",
+            task.id);
+        event_queue_mark_incomplete(queue);
+        return;
+    }
+
+    if (!publish_report_event(queue, &event))
+        return;
+    if (accepted) {
+        printf("Tarea %" PRIu32 " almacenada en nodo %" PRIu32
+               " (costo %" PRIu32 " tick(s)).\n",
+            task.id, decision->node_id, decision->cost_ticks);
+    } else {
+        printf("Nodo %" PRIu32 " rechazó tarea %" PRIu32 ": %s.\n",
+            decision->node_id, task.id, report_reject_reason(reason));
+    }
+}
+
 /**
  * @brief Lee comandos interactivos y controla los schedulers remotos.
  *
- * Acepta `start`/`stop` para ambos nodos, `start 1`/`stop 1` para ESP32,
- * `start 2`/`stop 2` para Pico, y `q` para solicitar cierre. Las respuestas
- * se procesan independientemente por nodo mientras llegan los reportes.
+ * Acepta `add` para desplegar una tarea manual durante la sesión,
+ * `start`/`stop` para ambos nodos, comandos individuales por nodo y `q`.
+ * Las respuestas se procesan mientras llegan los reportes.
  *
  * @param node_ids Identificadores de los nodos.
  * @param devices  Rutas o nombres de los dispositivos seriales.
  * @param handlers Enlaces de comunicación que permanecen abiertos durante
  *                 la consola.
  * @param sent     Buffers JSON de envío, uno por dispositivo.
+ * @param planner  Planificador que conserva las asignaciones de la sesión.
+ * @param next_deploy_request_id Siguiente identificador de despliegue.
  */
 static void run_control_console(
     EventQueue *queue,
@@ -857,14 +1010,18 @@ static void run_control_console(
     const char *devices[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
     char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
-    bool running[EXPECTED_DEVICES]
+    bool running[EXPECTED_DEVICES],
+    Planner *planner,
+    uint32_t *next_deploy_request_id
 )
 {
-    char line[64];
+    char line[320];
     size_t used = 0u;
+    bool line_overflow = false;
     uint32_t next_request_id = FIRST_CONTROL_REQUEST_ID;
 
-    puts("Comandos: start [1|2], stop [1|2], q.");
+    puts("Comandos: add id,P|S,W,T,D,criticidad, "
+         "start [1|2], stop [1|2], q.");
     fputs("> ", stdout);
     fflush(stdout);
     while (!event_queue_stop_requested(queue)) {
@@ -901,13 +1058,30 @@ static void run_control_console(
             break;
         }
         if (character != '\n' && character != '\r') {
-            if (used + 1u < sizeof(line))
+            if (!line_overflow && used + 1u < sizeof(line))
                 line[used++] = character;
+            else
+                line_overflow = true;
+            continue;
+        }
+        if (line_overflow) {
+            puts("Comando demasiado largo; se ignoró la línea.");
+            used = 0u;
+            line_overflow = false;
+            fputs("> ", stdout);
+            fflush(stdout);
             continue;
         }
         line[used] = '\0';
         used = 0u;
-        if (strcmp(line, "start") == 0) {
+        if (strncmp(line, "add ", 4u) == 0) {
+            handle_manual_task_command(
+                queue, line + 4u, planner, next_deploy_request_id,
+                node_ids, devices, handlers, sent
+            );
+        } else if (strcmp(line, "add") == 0) {
+            puts("Formato: add id,P|S,W,T,D,criticidad");
+        } else if (strcmp(line, "start") == 0) {
             uint32_t request_id = take_control_request_id(&next_request_id);
             (void)send_control_to_nodes(queue, MSG_START, request_id,
                 node_ids, devices, handlers, sent, running,
@@ -935,7 +1109,7 @@ static void run_control_console(
             event_queue_request_stop(queue);
             break;
         } else if (line[0] != '\0') {
-            puts("Comando inválido. Usa start [1|2], stop [1|2] o q.");
+            puts("Comando inválido. Usa add, start [1|2], stop [1|2] o q.");
         }
         fputs("> ", stdout);
         fflush(stdout);
@@ -962,6 +1136,8 @@ static void run_control_console(
 static bool plan_and_deploy_tasks(
     EventQueue *queue,
     const HostConfig *config,
+    Planner *planner,
+    uint32_t *next_deploy_request_id,
     const uint32_t node_ids[EXPECTED_DEVICES],
     const char *devices[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
@@ -971,9 +1147,13 @@ static bool plan_and_deploy_tasks(
 {
     TaskList tasks = {0};
     PlannerDecision *decisions = NULL;
-    Planner planner;
     bool success = false;
     char error[256];
+
+    if (planner == NULL || next_deploy_request_id == NULL) {
+        fprintf(stderr, "Estado inválido para planificar las tareas.\n");
+        goto cleanup;
+    }
 
     /* Carga CSV y crea el plan a partir de las capacidades medidas en esta sesión. */
     if (!task_parser_load(config->tasks_file, &tasks, error, sizeof(error))) {
@@ -993,18 +1173,18 @@ static bool plan_and_deploy_tasks(
         }
     }
 
-    if (!planner_init(&planner, config->algorithm, config->heuristic)) {
+    if (!planner_init(planner, config->algorithm, config->heuristic)) {
         fprintf(stderr, "No se pudo inicializar el planificador.\n");
         goto cleanup;
     }
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (!planner_add_node(&planner, node_ids[i], ut_per_tick[i])) {
+        if (!planner_add_node(planner, node_ids[i], ut_per_tick[i])) {
             fprintf(stderr, "No se pudo registrar el nodo %u en el planificador.\n",
                 node_ids[i]);
             goto cleanup;
         }
     }
-    if (!planner_plan_batch(&planner, tasks.items, tasks.count, decisions)) {
+    if (!planner_plan_batch(planner, tasks.items, tasks.count, decisions)) {
         fprintf(stderr, "No se pudo planificar el lote de tareas.\n");
         goto cleanup;
     }
@@ -1016,7 +1196,7 @@ static bool plan_and_deploy_tasks(
      * correlaciona cada despliegue. Se envía y confirma de una en una para
      * reutilizar con seguridad el buffer de envío de cada controlador.
      */
-    uint32_t request_id = FIRST_DEPLOY_REQUEST_ID;
+    *next_deploy_request_id = FIRST_DEPLOY_REQUEST_ID;
     size_t deployed_count = 0u;
 
     for (size_t i = 0u; i < tasks.count; ++i) {
@@ -1047,6 +1227,11 @@ static bool plan_and_deploy_tasks(
             goto cleanup;
         }
 
+        if (*next_deploy_request_id >= FIRST_CONTROL_REQUEST_ID) {
+            fprintf(stderr, "Se agotaron los request_id para desplegar tareas.\n");
+            goto cleanup;
+        }
+        uint32_t request_id = (*next_deploy_request_id)++;
         Message request = {
             .type = MSG_DEPLOY_TASK,
             .node_id = decision->node_id,
@@ -1063,7 +1248,7 @@ static bool plan_and_deploy_tasks(
 
         bool accepted = false;
         RejectReason reason = REJECT_NONE;
-        if (!wait_for_task_deploy(&handlers[node_index], decision->node_id,
+        if (!wait_for_task_deploy(queue, &handlers[node_index], decision->node_id,
                                   request_id, devices[node_index],
                                   &accepted, &reason)) {
             goto cleanup;
@@ -1087,7 +1272,7 @@ static bool plan_and_deploy_tasks(
                 decision->task_id, decision->node_id, decision->cost_ticks);
         } else {
             /* Deshacer la reserva del Planner para reflejar el NACK del MCU. */
-            if (!planner_remove_task(&planner, decision->node_id,
+            if (!planner_remove_task(planner, decision->node_id,
                                      decision->task_id)) {
                 fprintf(stderr,
                     "No se pudo revertir la asignación local de tarea %" PRIu32 ".\n",
@@ -1109,8 +1294,6 @@ static bool plan_and_deploy_tasks(
                 decision->node_id, decision->task_id,
                 report_reject_reason(reason));
         }
-        if (request_id != UINT32_MAX)
-            ++request_id;
     }
 
     printf("Despliegue terminado: %zu de %zu tarea(s) almacenada(s); "
@@ -1313,7 +1496,9 @@ static int serial_report_worker_run(EventQueue *queue, void *context)
     }
 
     bool deployed = plan_and_deploy_tasks(
-        queue, &session->config, session->node_ids, session->devices,
+        queue, &session->config, &session->planner,
+        &session->next_deploy_request_id,
+        session->node_ids, session->devices,
         session->handlers, session->sent, ut_per_tick
     );
     if (!deployed) {
@@ -1322,7 +1507,9 @@ static int serial_report_worker_run(EventQueue *queue, void *context)
 
     puts("CONFIG, calibración y despliegue de tareas completados.");
     run_control_console(queue, session->node_ids, session->devices,
-                        session->handlers, session->sent, session->running);
+                        session->handlers, session->sent, session->running,
+                        &session->planner,
+                        &session->next_deploy_request_id);
     return 0;
 }
 

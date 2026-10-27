@@ -18,6 +18,7 @@ typedef struct Scheduler {
     void (*on_task_completed)(uint32_t task_id, uint32_t job_id, uint32_t tick);
     void (*on_deadline_miss)(uint32_t task_id, uint32_t job_id, uint32_t tick);
     SchedulerTask tasks[MAX_TASKS];
+    uint32_t task_release_origin[MAX_TASKS];
     Job jobs[MAX_JOBS];
     uint32_t free_index[MAX_JOBS];
     uint32_t free_count;

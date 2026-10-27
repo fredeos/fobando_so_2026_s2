@@ -97,6 +97,7 @@ bool add_task(SchedulerTask *task, Scheduler *sc)
         sc->sporadic_task_index = sc->task_count;
     }
 
+    sc->task_release_origin[sc->task_count] = sc->current_tick;
     sc->task_count++;
 
     return true;
@@ -207,8 +208,9 @@ uint32_t check_periodic_releases(Scheduler *sc) {
             continue;
         }
 
-        // Release a periodic job whenever its period is reached.
-        if (sc->current_tick % current_task->T == 0) {
+        // Anchor each task's period to when it was registered.
+        if ((sc->current_tick - sc->task_release_origin[i]) %
+            current_task->T == 0u) {
             if (release_job(sc, i)) {
                 released++;
             }

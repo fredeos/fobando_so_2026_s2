@@ -11,8 +11,7 @@ bool scheduler_task_from_stored(
     const Task *source = &stored->task;
     if ((source->type != TASK_PERIODIC && source->type != TASK_SPORADIC) ||
         source->work == 0u || source->period == 0u ||
-        source->deadline == 0u || source->criticality < 0 ||
-        stored->cost_ticks == 0u) {
+        source->deadline == 0u || stored->cost_ticks == 0u) {
         return false;
     }
 
@@ -22,7 +21,7 @@ bool scheduler_task_from_stored(
         .W = source->work,
         .T = source->period,
         .D = source->deadline,
-        .criticality = (uint32_t)source->criticality,
+        .criticality = source->criticality,
         .C = stored->cost_ticks
     };
     *out = converted;

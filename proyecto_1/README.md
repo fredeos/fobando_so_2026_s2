@@ -67,8 +67,24 @@ Usa las variables exportadas; sin ellas, usa `/dev/ttyUSB0` y `/dev/ttyACM0`.
 No es necesario ejecutar `stty` ni el script de diagnóstico previo.
 
 El host realiza CONFIG, calibración y despliegue del CSV. Esperar a que aparezca
-la consola `>`. La sesión genera los reportes al cerrarse en una carpeta nueva
-dentro de `output/`. Entonces escribir, **dentro del host**, no en Bash:
+la consola `>`. Durante la ejecución se pueden agregar tareas manuales una por
+comando. Usar el formato `add id,P|S,W,T,D,criticidad`; por ejemplo:
+
+```text
+add 31,P,20,50,40,2
+add 32,S,10,100,80,-1
+```
+
+`P` indica periódica y `S` esporádica; `W` es trabajo en UT, `T` el período o
+intervalo mínimo en ticks, `D` el plazo relativo en ticks y la criticidad puede
+ser negativa. Cada tarea pasa por el mismo planificador de admisión y asignación
+que el CSV, se despliega al nodo asignado y se incluye en el reporte tras su
+ACK. El ID debe ser único entre las tareas ya admitidas. El scheduler no se
+detiene ni reinicia al agregar una tarea; las tareas periódicas nuevas comienzan
+su fase de liberación desde el tick en que son registradas.
+
+La sesión genera los reportes al cerrarse en una carpeta nueva dentro de
+`output/`. Escribir los comandos **dentro del host**, no en Bash:
 
 ```text
 start
@@ -78,6 +94,7 @@ Comandos disponibles:
 
 | Comando | Acción |
 |---|---|
+| `add id,P|S,W,T,D,criticidad` | Admitir y desplegar una tarea manual durante la sesión |
 | `start` / `stop` | Iniciar o pausar ambos nodos |
 | `start 1` / `stop 1` | Controlar solo ESP32 |
 | `start 2` / `stop 2` | Controlar solo Pico |

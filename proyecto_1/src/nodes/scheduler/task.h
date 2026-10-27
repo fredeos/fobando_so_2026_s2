@@ -16,7 +16,7 @@ typedef struct SchedulerTask
     uint32_t W; // UT quantity
     uint32_t T; // period of time
     uint32_t D; // relative end time
-    uint32_t criticality; // how important the task is
+    int32_t criticality; // how important the task is
     uint32_t C; // tick equivalent
 } SchedulerTask;
 

@@ -246,7 +246,7 @@ static void test_numeric_limits(void)
         "{\"type\":\"CALIBRATE_RESPONSE\",\"node_id\":1,\"request_id\":1,\"data\":{\"ut_per_tick\":0}}",
         "{\"type\":\"CALIBRATE_REQUEST\",\"node_id\":1,\"request_id\":1,\"data\":{\"sample_ticks\":0}}",
         "{\"type\":\"TICK_REPORT\",\"node_id\":1,\"request_id\":1,\"data\":{\"tick\":18446744073709551616,\"task_id\":0}}",
-        "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":16,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":0}}",
+        "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":17,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":0}}",
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":2147483648}}",
         "{\"type\":\"EVENT\",\"node_id\":1,\"request_id\":1,\"data\":{\"event_type\":1,\"task_id\":0,\"job_id\":0,\"tick\":0,\"duration_ticks\":0,\"detail\":-2147483649}}",
         "{\"type\":\"NACK\",\"node_id\":1,\"request_id\":1,\"data\":{\"message_type\":\"START\",\"reason\":0}}",
@@ -327,6 +327,23 @@ static void test_message_serialization(void)
             .duration_ticks = 2u, .detail = -7}
     };
     assert_round_trip(&message);
+
+    message.data.event = (Event){
+        .type = EVENT_TICK_REPORT,
+        .source = EVENT_SOURCE_NODE,
+        .node_id = 2u,
+        .tick = 100u
+    };
+    {
+        char json[MESSAGE_MAX_BYTES + 1u];
+        size_t length = 0u;
+        Message parsed;
+        assert(message_serialize(&message, json, sizeof(json), &length)
+               == MESSAGE_SERIALIZE_OK);
+        assert(message_parse(json, length, &parsed) == MESSAGE_PARSE_OK);
+        assert(parsed.data.event.type == EVENT_TICK_REPORT);
+        assert(parsed.data.event.tick == 100u);
+    }
 
     message = (Message){
         .type = MSG_TICK_REPORT, .node_id = 2u, .request_id = 12u,
