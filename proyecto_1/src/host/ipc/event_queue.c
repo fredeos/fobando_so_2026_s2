@@ -3,102 +3,42 @@
 #include "host/event_queue.h"
 
 #include <errno.h>
-#include <pthread.h>
+#include <fcntl.h>
+#include <semaphore.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
-/* Todos los datos de coordinación y los eventos residen en memoria compartida */
+#define EVENT_QUEUE_SHM_NAME_SIZE 64u
+
+/* La cola y sus semáforos viven en el objeto POSIX compartido entre procesos. */
 struct EventQueue {
-    pthread_mutex_t mutex;
-    pthread_cond_t readable;
-    pthread_cond_t writable;
+    sem_t mutex;
+    sem_t readable;
+    sem_t writable;
     atomic_bool stop_requested;
     atomic_bool incomplete;
+    atomic_bool failed;
     bool closed;
-    bool failed;
     size_t head;
     size_t count;
+    char shm_name[EVENT_QUEUE_SHM_NAME_SIZE];
     Event events[EVENT_QUEUE_CAPACITY];
 };
 
-/*
- * Recuperar el mutex si un proceso terminó dentro de la región crítica.
- * La cola se marca fallida porque no se puede asegurar la integridad del anillo.
- */
-static int recover_lock(EventQueue *queue, int result)
-{
-    if (result == EOWNERDEAD) {
-        queue->failed = true;
-        queue->closed = true;
-        atomic_store(&queue->stop_requested, true);
-        atomic_store(&queue->incomplete, true);
-        result = pthread_mutex_consistent(&queue->mutex);
-        pthread_cond_broadcast(&queue->readable);
-        pthread_cond_broadcast(&queue->writable);
-    }
+static unsigned long long queue_sequence;
 
-    return result;
-}
-
-/* Inicializar recursos con atributos explícitos para procesos distintos */
-EventQueue *event_queue_create(void)
-{
-    EventQueue *queue = mmap(NULL, sizeof(*queue), PROT_READ | PROT_WRITE,
-                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (queue == MAP_FAILED)
-        return NULL;
-
-    pthread_mutexattr_t mutex_attr;
-    pthread_condattr_t cond_attr;
-    bool have_mutex_attr = false, have_cond_attr = false;
-    bool have_mutex = false, have_readable = false;
-
-    if (pthread_mutexattr_init(&mutex_attr) != 0)
-        goto fail;
-    have_mutex_attr = true;
-    if (pthread_condattr_init(&cond_attr) != 0)
-        goto fail;
-    have_cond_attr = true;
-
-    if (pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED) != 0 ||
-        pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST) != 0 ||
-        pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED) != 0 ||
-        pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) != 0)
-        goto fail;
-
-    if (pthread_mutex_init(&queue->mutex, &mutex_attr) != 0)
-        goto fail;
-    have_mutex = true;
-    if (pthread_cond_init(&queue->readable, &cond_attr) != 0)
-        goto fail;
-    have_readable = true;
-    if (pthread_cond_init(&queue->writable, &cond_attr) != 0)
-        goto fail;
-
-    pthread_mutexattr_destroy(&mutex_attr);
-    pthread_condattr_destroy(&cond_attr);
-    atomic_init(&queue->stop_requested, false);
-    atomic_init(&queue->incomplete, false);
-    return queue;
-
-fail:
-    if (have_readable) pthread_cond_destroy(&queue->readable);
-    if (have_mutex) pthread_mutex_destroy(&queue->mutex);
-    if (have_cond_attr) pthread_condattr_destroy(&cond_attr);
-    if (have_mutex_attr) pthread_mutexattr_destroy(&mutex_attr);
-    munmap(queue, sizeof(*queue));
-    return NULL;
-}
-
-/* Usar un único vencimiento absoluto aunque haya despertares espurios */
 static bool deadline_for(int timeout_ms, struct timespec *deadline)
 {
     if (timeout_ms < -1)
         return false;
     if (timeout_ms == -1)
         return true;
-    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0)
+    if (clock_gettime(CLOCK_REALTIME, deadline) != 0)
         return false;
     deadline->tv_sec += timeout_ms / 1000;
     deadline->tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
@@ -109,76 +49,208 @@ static bool deadline_for(int timeout_ms, struct timespec *deadline)
     return true;
 }
 
-static int wait_condition(EventQueue *queue, pthread_cond_t *condition,
-                          int timeout_ms, const struct timespec *deadline)
+static int semaphore_wait(sem_t *semaphore, int timeout_ms,
+                          const struct timespec *deadline)
 {
-    int result = timeout_ms == -1
-        ? pthread_cond_wait(condition, &queue->mutex)
-        : pthread_cond_timedwait(condition, &queue->mutex, deadline);
-    return recover_lock(queue, result);
+    int result;
+    do {
+        if (timeout_ms == -1)
+            result = sem_wait(semaphore);
+        else if (timeout_ms == 0)
+            result = sem_trywait(semaphore);
+        else
+            result = sem_timedwait(semaphore, deadline);
+    } while (result != 0 && errno == EINTR);
+
+    if (result == 0)
+        return 0;
+    if ((timeout_ms == 0 && errno == EAGAIN) ||
+        (timeout_ms > 0 && errno == ETIMEDOUT))
+        return ETIMEDOUT;
+    return errno;
 }
 
-/* Publicar sin sobrescribir los eventos que todavía no consumió reportes */
+static void wake_waiters(EventQueue *queue)
+{
+    (void)sem_post(&queue->readable);
+    for (size_t i = 0u; i < EVENT_QUEUE_CAPACITY; ++i)
+        (void)sem_post(&queue->writable);
+}
+
+static void mark_failed(EventQueue *queue)
+{
+    atomic_store(&queue->failed, true);
+    atomic_store(&queue->incomplete, true);
+    atomic_store(&queue->stop_requested, true);
+    wake_waiters(queue);
+}
+
+static bool make_shared_name(char *name, size_t capacity)
+{
+    int written = snprintf(name, capacity, "/so_event_queue_%ld_%llu",
+                           (long)getpid(), queue_sequence++);
+    return written > 0 && (size_t)written < capacity;
+}
+
+EventQueue *event_queue_create(void)
+{
+    char name[EVENT_QUEUE_SHM_NAME_SIZE];
+    if (!make_shared_name(name, sizeof(name)))
+        return NULL;
+
+    int descriptor = shm_open(name, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+    if (descriptor < 0)
+        return NULL;
+
+    if (ftruncate(descriptor, (off_t)sizeof(EventQueue)) != 0) {
+        close(descriptor);
+        shm_unlink(name);
+        return NULL;
+    }
+
+    EventQueue *queue = mmap(NULL, sizeof(*queue), PROT_READ | PROT_WRITE,
+                             MAP_SHARED, descriptor, 0);
+    int map_errno = errno;
+    close(descriptor);
+    if (queue == MAP_FAILED) {
+        shm_unlink(name);
+        errno = map_errno;
+        return NULL;
+    }
+
+    memset(queue, 0, sizeof(*queue));
+    memcpy(queue->shm_name, name, strlen(name) + 1u);
+    bool mutex_ready = false;
+    bool readable_ready = false;
+    bool writable_ready = false;
+    if (sem_init(&queue->mutex, 1, 1u) != 0)
+        goto fail;
+    mutex_ready = true;
+    if (sem_init(&queue->readable, 1, 0u) != 0)
+        goto fail;
+    readable_ready = true;
+    if (sem_init(&queue->writable, 1, EVENT_QUEUE_CAPACITY) != 0)
+        goto fail;
+    writable_ready = true;
+
+    atomic_init(&queue->stop_requested, false);
+    atomic_init(&queue->incomplete, false);
+    atomic_init(&queue->failed, false);
+    queue->closed = false;
+    queue->head = 0u;
+    queue->count = 0u;
+    return queue;
+
+fail:
+    if (writable_ready) sem_destroy(&queue->writable);
+    if (readable_ready) sem_destroy(&queue->readable);
+    if (mutex_ready) sem_destroy(&queue->mutex);
+    munmap(queue, sizeof(*queue));
+    shm_unlink(name);
+    return NULL;
+}
+
 EventQueueResult event_queue_push(EventQueue *queue, const Event *event, int timeout_ms)
 {
     struct timespec deadline;
-    if (queue == NULL || event == NULL || !deadline_for(timeout_ms, &deadline))
-        return EVENT_QUEUE_ERROR;
-    if (recover_lock(queue, pthread_mutex_lock(&queue->mutex)) != 0)
+    if (queue == NULL || event == NULL ||
+        !deadline_for(timeout_ms, &deadline))
         return EVENT_QUEUE_ERROR;
 
-    EventQueueResult result = EVENT_QUEUE_OK;
-    while (!queue->closed && !queue->failed && queue->count == EVENT_QUEUE_CAPACITY) {
-        int status = wait_condition(queue, &queue->writable, timeout_ms, &deadline);
-        if (status != 0) {
-            result = status == ETIMEDOUT ? EVENT_QUEUE_TIMEOUT : EVENT_QUEUE_ERROR;
-            goto done;
-        }
+    int status = semaphore_wait(&queue->writable, timeout_ms, &deadline);
+    if (status == ETIMEDOUT)
+        return EVENT_QUEUE_TIMEOUT;
+    if (status != 0) {
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
     }
 
-    if (queue->failed) result = EVENT_QUEUE_ERROR;
-    else if (queue->closed) result = EVENT_QUEUE_CLOSED;
+    status = semaphore_wait(&queue->mutex, -1, NULL);
+    if (status != 0) {
+        (void)sem_post(&queue->writable);
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
+    }
+
+    EventQueueResult result = EVENT_QUEUE_OK;
+    if (atomic_load(&queue->failed))
+        result = EVENT_QUEUE_ERROR;
+    else if (queue->closed)
+        result = EVENT_QUEUE_CLOSED;
     else {
         size_t tail = (queue->head + queue->count) % EVENT_QUEUE_CAPACITY;
         queue->events[tail] = *event;
         ++queue->count;
-        pthread_cond_signal(&queue->readable);
     }
 
-done:
-    pthread_mutex_unlock(&queue->mutex);
-    return result;
+    (void)sem_post(&queue->mutex);
+    if (result != EVENT_QUEUE_OK) {
+        (void)sem_post(&queue->writable);
+        return result;
+    }
+    if (sem_post(&queue->readable) != 0) {
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
+    }
+    return EVENT_QUEUE_OK;
 }
 
-/* Consumir hasta que el propietario cierre la cola y se agoten los eventos */
 EventQueueResult event_queue_pop(EventQueue *queue, Event *event, int timeout_ms)
 {
     struct timespec deadline;
-    if (queue == NULL || event == NULL || !deadline_for(timeout_ms, &deadline))
-        return EVENT_QUEUE_ERROR;
-    if (recover_lock(queue, pthread_mutex_lock(&queue->mutex)) != 0)
+    if (queue == NULL || event == NULL ||
+        !deadline_for(timeout_ms, &deadline))
         return EVENT_QUEUE_ERROR;
 
-    EventQueueResult result = EVENT_QUEUE_OK;
-    while (!queue->closed && !queue->failed && queue->count == 0u) {
-        int status = wait_condition(queue, &queue->readable, timeout_ms, &deadline);
+    int status = semaphore_wait(&queue->readable, timeout_ms, &deadline);
+    if (status == ETIMEDOUT) {
+        status = semaphore_wait(&queue->mutex, -1, NULL);
         if (status != 0) {
-            result = status == ETIMEDOUT ? EVENT_QUEUE_TIMEOUT : EVENT_QUEUE_ERROR;
-            goto done;
+            mark_failed(queue);
+            return EVENT_QUEUE_ERROR;
         }
+        EventQueueResult result = EVENT_QUEUE_TIMEOUT;
+        if (atomic_load(&queue->failed))
+            result = EVENT_QUEUE_ERROR;
+        else if (queue->closed && queue->count == 0u)
+            result = EVENT_QUEUE_CLOSED;
+        if (sem_post(&queue->mutex) != 0) {
+            mark_failed(queue);
+            return EVENT_QUEUE_ERROR;
+        }
+        return result;
+    }
+    if (status != 0) {
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
     }
 
-    if (queue->failed) result = EVENT_QUEUE_ERROR;
-    else if (queue->count == 0u) result = EVENT_QUEUE_CLOSED;
+    status = semaphore_wait(&queue->mutex, -1, NULL);
+    if (status != 0) {
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
+    }
+
+    EventQueueResult result = EVENT_QUEUE_OK;
+    if (atomic_load(&queue->failed))
+        result = EVENT_QUEUE_ERROR;
+    else if (queue->count == 0u)
+        result = queue->closed ? EVENT_QUEUE_CLOSED : EVENT_QUEUE_ERROR;
     else {
         *event = queue->events[queue->head];
         queue->head = (queue->head + 1u) % EVENT_QUEUE_CAPACITY;
         --queue->count;
-        pthread_cond_signal(&queue->writable);
     }
 
-done:
-    pthread_mutex_unlock(&queue->mutex);
+    (void)sem_post(&queue->mutex);
+    if (result == EVENT_QUEUE_OK) {
+        if (sem_post(&queue->writable) != 0) {
+            mark_failed(queue);
+            return EVENT_QUEUE_ERROR;
+        }
+    } else if (result == EVENT_QUEUE_ERROR) {
+        mark_failed(queue);
+    }
     return result;
 }
 
@@ -208,26 +280,34 @@ bool event_queue_is_incomplete(const EventQueue *queue)
 
 EventQueueResult event_queue_close(EventQueue *queue)
 {
-    if (queue == NULL || recover_lock(queue, pthread_mutex_lock(&queue->mutex)) != 0)
+    if (queue == NULL)
         return EVENT_QUEUE_ERROR;
+
+    int status = semaphore_wait(&queue->mutex, -1, NULL);
+    if (status != 0) {
+        mark_failed(queue);
+        return EVENT_QUEUE_ERROR;
+    }
+
+    bool already_closed = queue->closed;
     queue->closed = true;
-    pthread_cond_broadcast(&queue->readable);
-    pthread_cond_broadcast(&queue->writable);
-    EventQueueResult result = queue->failed ? EVENT_QUEUE_ERROR : EVENT_QUEUE_OK;
-    pthread_mutex_unlock(&queue->mutex);
-    return result;
+    bool failed = atomic_load(&queue->failed);
+    (void)sem_post(&queue->mutex);
+
+    if (!already_closed)
+        wake_waiters(queue);
+    return failed ? EVENT_QUEUE_ERROR : EVENT_QUEUE_OK;
 }
 
 void event_queue_destroy(EventQueue *queue)
 {
     if (queue == NULL)
         return;
-    /* Un hijo terminado por señal puede dejar contadores internos de espera.
-     * Tras waitpid no quedan usuarios; munmap libera también ese caso anormal. */
-    if (!event_queue_is_incomplete(queue)) {
-        pthread_cond_destroy(&queue->readable);
-        pthread_cond_destroy(&queue->writable);
-        pthread_mutex_destroy(&queue->mutex);
-    }
+    char name[EVENT_QUEUE_SHM_NAME_SIZE];
+    memcpy(name, queue->shm_name, sizeof(name));
+    sem_destroy(&queue->readable);
+    sem_destroy(&queue->writable);
+    sem_destroy(&queue->mutex);
     munmap(queue, sizeof(*queue));
+    shm_unlink(name);
 }

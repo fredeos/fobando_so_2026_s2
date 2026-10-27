@@ -7,7 +7,7 @@
 static void init_handler(comms_handler_t *handler, uint8_t priority)
 {
     memset(handler, 0, sizeof(*handler));
-    assert(comms_init_handler(0, handler, "test-device", priority, 0u, 0u)
+    assert(comms_init_handler(0, handler, "test-device", priority, 0u)
            == COMMS_OK);
 }
 

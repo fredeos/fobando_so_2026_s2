@@ -14,8 +14,7 @@ comms_status_t comms_init_handler(
     comms_handler_t* handler,
     const char* dev,
     uint8_t priority,
-    unsigned int tick,
-    unsigned int tick_limit
+    uint32_t timeout_ms
 ){
     // << Exceptions >>
     if (handler == NULL || dev == NULL)
@@ -26,8 +25,7 @@ comms_status_t comms_init_handler(
 
     handler->status = COMMS_OK;
     
-    handler->tick = tick;
-    handler->tick_limit = tick_limit;
+    handler->timeout_ms = timeout_ms;
 
     handler->online  = false;
     handler->running = false;
@@ -310,11 +308,9 @@ void* comms_handler(void* arg){
 
     // << Thread variables >>
     comms_status_t status = COMMS_ALIVE;
-    uint64_t last = get_time_ms();
-    uint64_t ticks = 0;
+    uint64_t last_activity_ms = get_time_ms();
 
     int stage = 0;        // protocol stage transitions; MSG <-> TX <-> RX
-    int transactions = 0; // transactions done
 
     bool sent_pending  = false; // custom message is pending to be sent
     bool serial_refresh = true; // flag for interface refresh
@@ -342,29 +338,14 @@ void* comms_handler(void* arg){
                 protocol_rx_init(&rx, &rx_packet); // <- this will reset the RX state machine
                 serial_refresh = false;
                 stage = 0;
-                transactions = 0;
+                last_activity_ms = get_time_ms();
             }
         }
-        // [Transactions check]
-        /* Transactions check allows verifying if the handler has received transactions
-         * in the defined number of ticks. This allows checking the responsiveness of
-         * the connected device.
-        */
+        // [Connection timeout check]
         uint64_t now = get_time_ms();
-        bool on_tick = (now - last >= hd->tick);
-        if (on_tick){
-            ticks++;
-            last += hd->tick;
-        }
-
-        bool minimum = (transactions > 0);
-        bool full_ticks = (ticks >= hd->tick_limit);
-        if (full_ticks) {
-            ticks = 0;
-            transactions = 0;
-        }
-
-        bool timeout = (full_ticks && !minimum && !serial_refresh);
+        bool timeout = (hd->timeout_ms > 0u &&
+                        now - last_activity_ms >= hd->timeout_ms &&
+                        !serial_refresh);
         if (timeout) {
             printf("%s: Device(%d) disconnected by timeout!\n", hd->dev, hd->id);
             if (hd->fd >= 0) {
@@ -494,6 +475,7 @@ void* comms_handler(void* arg){
             } else status = COMMS_TX_BUSY;
             // (Check completion)
             if (tx.complete && tx.valid){
+                last_activity_ms = get_time_ms();
                 if (sent_pending) {
                     pthread_mutex_lock(&hd->mutex);   // lock
                     hd->sent.set = false;
@@ -501,8 +483,6 @@ void* comms_handler(void* arg){
                     pthread_mutex_unlock(&hd->mutex); // unlock
                     sent_pending = false;
                 }
-                // [Count transactions]
-                transactions++;
                 // [Move to RX]
                 stage = 2;
             }
@@ -553,8 +533,7 @@ void* comms_handler(void* arg){
                         }
                     }
                 }
-                // [Count transactions]
-                transactions++;
+                last_activity_ms = get_time_ms();
                 // [Move to message change]
                 stage = 0;
             }

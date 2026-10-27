@@ -90,6 +90,11 @@ al host sus eventos de ejecución y de plazo perdido por el mismo enlace serial;
 el Host los incorpora al reporte sin recalcular los plazos. Reiniciar ambas
 placas antes del siguiente intento.
 
+La cola interna que comunica los procesos del Host usa un objeto de memoria
+compartida POSIX (`shm_open`/`mmap`) y semáforos POSIX compartidos entre procesos.
+Al cerrar la sesión, el proceso propietario espera a sus procesos hijos, destruye
+los semáforos y elimina el objeto compartido.
+
 ## 3. Compilar y cargar el ESP32
 
 Se requiere una instalación funcional de ESP-IDF. La prueba actual usó v5.4.2.
@@ -163,6 +168,9 @@ Después de cargar ambas placas, seguir el apartado de ejecución diaria.
 
 - `config/system.conf`: algoritmo RMS/EDF, heurística y duración del tick.
   Actualmente `tick_ms=1000` equivale a un segundo nominal por tick.
+- `connection_timeout_ms` define en milisegundos cuánto espera el Host sin
+  actividad serial antes de cerrar y reconectar un enlace. Configúralo por
+  encima del tiempo que necesita la calibración; el valor actual es 6000 ms.
 - `config/tasks.csv`: tareas; W se expresa en UT y T/D en ticks.
 - Cambiar esos archivos requiere una sesión nueva del host con las placas
   reiniciadas. No requiere recompilar el firmware.

@@ -1198,8 +1198,7 @@ static int serial_report_worker_run(EventQueue *queue, void *context)
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
         if (comms_init_handler((int)i, &session->handlers[i],
                                session->devices[i], 0u,
-                               session->config.tick_ms,
-                               session->config.missed_reports_limit)
+                               session->config.connection_timeout_ms)
             != COMMS_OK) {
             fprintf(stderr, "No se pudo inicializar el enlace %s.\n",
                 session->devices[i]);

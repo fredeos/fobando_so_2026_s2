@@ -34,7 +34,7 @@ static void save(
     "port_esp32=/dev/ttyUSB0\n" \
     "port_pico=/dev/ttyACM0\n" \
     "report_every_ticks=10\n" \
-    "missed_reports_limit=3\n" \
+    "connection_timeout_ms=6000\n" \
     "tasks_file=config/tasks.csv\n"
 
 int main(void)
@@ -65,6 +65,7 @@ int main(void)
     );
 
     assert(config.tick_ms == 10u);
+    assert(config.connection_timeout_ms == 6000u);
 
     assert(
         strcmp(
@@ -150,7 +151,7 @@ int main(void)
         "port_esp32=/dev/ttyUSB0\n"
         "port_pico=/dev/ttyACM0\n"
         "report_every_ticks=10\n"
-        "missed_reports_limit=3\n"
+        "connection_timeout_ms=6000\n"
         "tasks_file=config/tasks.csv\n"
     );
 
@@ -179,7 +180,7 @@ int main(void)
         "port_esp32=/dev/ttyUSB0\n"
         "port_pico=/dev/ttyACM0\n"
         "report_every_ticks=10\n"
-        "missed_reports_limit=3\n"
+        "connection_timeout_ms=6000\n"
         "tasks_file=config/tasks.csv\n"
     );
 

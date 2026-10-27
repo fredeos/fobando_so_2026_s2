@@ -69,8 +69,7 @@ typedef struct {
 typedef struct {
     // << Information >>
     comms_status_t status;   // handler status for concrete debugging
-    uint64_t tick;       // tick size measured in miliseconds
-    uint64_t tick_limit; // number of ticks for connection integrity
+    uint32_t timeout_ms; // max time without communication before reconnecting
     bool online;      // device is conected
     bool running;     // thread is running
     bool active;      // thread is active
@@ -121,8 +120,7 @@ comms_status_t comms_init_handler(
     comms_handler_t* handler,
     const char* dev,
     uint8_t priority,
-    unsigned int tick,
-    unsigned int tick_limit
+    uint32_t timeout_ms
 );
 
 /*

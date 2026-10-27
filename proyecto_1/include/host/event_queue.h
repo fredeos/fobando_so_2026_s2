@@ -18,8 +18,9 @@ typedef enum {
 } EventQueueResult;
 
 /*
- * Crea una cola en mmap compartido, para heredarla mediante fork().
- * Usa mutex y condiciones POSIX compartidos entre procesos, sin espera activa.
+ * Crea una cola en memoria compartida POSIX (shm_open/mmap), para heredarla
+ * mediante fork(). Sincroniza productores y consumidores con semáforos POSIX
+ * compartidos entre procesos, sin espera activa.
  * Retorna NULL si no se pueden reservar o inicializar los recursos.
  */
 EventQueue *event_queue_create(void);
