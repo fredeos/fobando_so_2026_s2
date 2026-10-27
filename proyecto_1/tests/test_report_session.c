@@ -18,6 +18,68 @@ typedef struct {
     bool read_input;
 } TestWorker;
 
+typedef struct {
+    int markers;
+    size_t index;
+} CoordinatedWorker;
+
+typedef struct {
+    int markers;
+} CoordinatedSession;
+
+typedef struct {
+    char role;
+    pid_t pid;
+} ProcessMarker;
+
+static void record_process(int fd, char role)
+{
+    ProcessMarker marker = {.role = role, .pid = getpid()};
+    assert(write(fd, &marker, sizeof(marker)) == (ssize_t)sizeof(marker));
+}
+
+static int run_coordinated_worker(EventQueue *queue, void *context)
+{
+    CoordinatedWorker *worker = context;
+    record_process(worker->markers, (char)('0' + worker->index));
+    while (!event_queue_stop_requested(queue)) {
+        struct timespec pause = {.tv_nsec = 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int stop_coordinated_worker(EventQueue *queue, void *context)
+{
+    (void)queue;
+    (void)context;
+    return 0;
+}
+
+static int coordinate_test_session(EventQueue *queue, void *context)
+{
+    CoordinatedSession *session = context;
+    record_process(session->markers, 'C');
+    event_queue_request_stop(queue);
+    return 0;
+}
+
+static int setup_test_child(bool reporter, size_t worker_index, void *context)
+{
+    (void)worker_index;
+    CoordinatedSession *session = context;
+    if (reporter)
+        record_process(session->markers, 'R');
+    return 0;
+}
+
+static int setup_test_parent(void *context)
+{
+    CoordinatedSession *session = context;
+    record_process(session->markers, 'P');
+    return 0;
+}
+
 static int run_worker(EventQueue *queue, void *context)
 {
     TestWorker *worker = context;
@@ -127,9 +189,87 @@ static void test_session(unsigned mode)
     assert(unlink(path) == 0 && rmdir(directory) == 0);
 }
 
+static void test_coordinated_session(void)
+{
+    char directory[] = "/tmp/so_coordinated_session_test_XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    int markers[2];
+    assert(pipe(markers) == 0);
+
+    CoordinatedSession session = {.markers = markers[1]};
+    CoordinatedWorker contexts[] = {
+        {.markers = markers[1], .index = 0u},
+        {.markers = markers[1], .index = 1u}
+    };
+    ReportWorker workers[] = {
+        {.run = run_coordinated_worker, .stop = stop_coordinated_worker,
+            .context = &contexts[0]},
+        {.run = run_coordinated_worker, .stop = stop_coordinated_worker,
+            .context = &contexts[1]}
+    };
+    pid_t parent = getpid();
+    int result = report_session_run_coordinated(
+        directory, workers, 2u, coordinate_test_session,
+        setup_test_child, setup_test_parent, &session
+    );
+    close(markers[1]);
+    assert(result == 0);
+
+    ProcessMarker observed[5];
+    size_t count = 0u;
+    ssize_t length;
+    while ((length = read(markers[0], &observed[count], sizeof(observed[count]))) > 0) {
+        assert(length == (ssize_t)sizeof(observed[count]));
+        ++count;
+        assert(count <= sizeof(observed) / sizeof(observed[0]));
+    }
+    assert(length == 0);
+    close(markers[0]);
+    assert(count == 5u);
+
+    pid_t reporter = 0, first_worker = 0, second_worker = 0;
+    bool coordinator_seen = false, parent_setup_seen = false;
+    for (size_t i = 0u; i < count; ++i) {
+        switch (observed[i].role) {
+        case 'R':
+            reporter = observed[i].pid;
+            break;
+        case '0':
+            first_worker = observed[i].pid;
+            break;
+        case '1':
+            second_worker = observed[i].pid;
+            break;
+        case 'C':
+            assert(observed[i].pid == parent);
+            coordinator_seen = true;
+            break;
+        case 'P':
+            assert(observed[i].pid == parent);
+            parent_setup_seen = true;
+            break;
+        default:
+            assert(0);
+        }
+    }
+    assert(coordinator_seen && parent_setup_seen && reporter > 0 &&
+           first_worker > 0 && second_worker > 0);
+    assert(reporter != parent && first_worker != parent && second_worker != parent);
+    assert(reporter != first_worker && reporter != second_worker &&
+           first_worker != second_worker);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/events.csv", directory);
+    assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/report.html", directory);
+    assert(unlink(path) == 0);
+    assert(rmdir(directory) == 0);
+}
+
 int main(void)
 {
     for (unsigned mode = 0u; mode < 6u; ++mode) test_session(mode);
+    test_coordinated_session();
     puts("OK: graceful report session tests");
     return 0;
 }

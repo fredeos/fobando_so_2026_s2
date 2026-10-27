@@ -18,6 +18,14 @@ typedef struct {
     bool worker_reads_stdin;
 } ReportWorker;
 
+typedef int (*ReportCoordinatorRun)(EventQueue *events, void *context);
+/*
+ * Configures inherited child resources before work begins. reporter is true
+ * for the reporting process; otherwise worker_index identifies a worker.
+ */
+typedef int (*ReportChildSetup)(bool reporter, size_t worker_index, void *context);
+typedef int (*ReportParentSetup)(void *context);
+
 /*
  * Crea un proceso de reportes y un proceso por worker.
  * q, EOF, SIGINT o SIGTERM solicitan un cierre ordenado.
@@ -26,6 +34,23 @@ typedef struct {
  * Retorna 0 en un cierre completo y 1 si hubo errores.
  */
 int report_session_run(const char *directory, const ReportWorker *workers, size_t count);
+
+/*
+ * Runs the coordinator in the parent process while workers and reporter run
+ * as children. The coordinator can exchange application commands with workers
+ * and returns when the session should shut down.
+ * child_setup closes/configures resources inherited by each child process.
+ * parent_setup closes resources the parent does not need after forking.
+ */
+int report_session_run_coordinated(
+    const char *directory,
+    const ReportWorker *workers,
+    size_t count,
+    ReportCoordinatorRun coordinator,
+    ReportChildSetup child_setup,
+    ReportParentSetup parent_setup,
+    void *context
+);
 
 /* Demostración con dos nodos simulados; no abre ni controla dispositivos */
 int report_demo_run(const char *directory);

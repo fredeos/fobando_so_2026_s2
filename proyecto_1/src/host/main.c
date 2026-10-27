@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "host/report_session.h"
+#include "host/workers/node_worker.h"
 #include "host/event_queue.h"
 
 #include "common/message_parser.h"
@@ -35,58 +36,42 @@
 #define FIRST_DEPLOY_REQUEST_ID   3u
 #define FIRST_CONTROL_REQUEST_ID  0x80000000u
 
+/* Estado que el padre necesita para comunicarse con ambos workers. */
 typedef struct {
     HostConfig config;
     const char *devices[EXPECTED_DEVICES];
     uint32_t node_ids[EXPECTED_DEVICES];
-    comms_handler_t handlers[EXPECTED_DEVICES];
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
-    bool initialized[EXPECTED_DEVICES];
-    bool handler_started[EXPECTED_DEVICES];
-    bool running[EXPECTED_DEVICES];
+    int command_write_fd[EXPECTED_DEVICES];
+    int reply_read_fd[EXPECTED_DEVICES];
+    int pipe_fds[EXPECTED_DEVICES * 4u];
+    NodeWorkerContext workers[EXPECTED_DEVICES];
     Planner planner;
     uint32_t next_deploy_request_id;
-    size_t initialized_count;
-} SerialReportSession;
-
-static uint64_t latest_node_ticks[EXPECTED_DEVICES];
-static uint64_t node_stop_heartbeat_baseline[EXPECTED_DEVICES];
-static bool node_started_once[EXPECTED_DEVICES];
-static bool node_reports_drained[EXPECTED_DEVICES];
-static bool node_stop_pending[EXPECTED_DEVICES];
-
-static bool drain_node_reports(
-    EventQueue *queue,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    const bool required[EXPECTED_DEVICES]
-);
+} HostCoordinatorContext;
 
 /**
- * @brief Publica un evento en la cola compartida de reportes.
- *
- * Reintenta mientras la cola esté temporalmente llena y marca la sesión como
- * incompleta si no puede publicar el evento.
- *
- * @param queue Cola de eventos de la sesión.
- * @param event Evento que se agregará al reporte.
- *
- * @return true si el evento se publicó correctamente.
+ * @brief Publica un evento para que el proceso reporter lo consuma.
+ * Reintenta si la cola está llena temporalmente y marca la sesión incompleta
+ * cuando ya no es posible publicar.
  */
-static bool publish_report_event(EventQueue *queue, const Event *event)
+bool publish_report_event(EventQueue *queue, const Event *event)
 {
     EventQueueResult result;
     do {
-        result = event_queue_push(queue, event, 200);
-    } while (result == EVENT_QUEUE_TIMEOUT);
-    if (result != EVENT_QUEUE_OK) {
-        fprintf(stderr, "No se pudo publicar el evento en la cola de reportes (%d).\n",
-            (int)result);
-        event_queue_mark_incomplete(queue);
-        return false;
-    }
-    return true;
+        result = event_queue_push(queue, event, 100);
+    } while (result == EVENT_QUEUE_TIMEOUT && !event_queue_stop_requested(queue));
+    if (result == EVENT_QUEUE_OK)
+        return true;
+    event_queue_mark_incomplete(queue);
+    fprintf(stderr, "No se pudo publicar un evento en la cola compartida.\n");
+    return false;
 }
+
+uint64_t latest_node_ticks[EXPECTED_DEVICES];
+uint64_t node_stop_heartbeat_baseline[EXPECTED_DEVICES];
+bool node_started_once[EXPECTED_DEVICES];
+bool node_reports_drained[EXPECTED_DEVICES];
+bool node_stop_pending[EXPECTED_DEVICES];
 
 /**
  * @brief Actualiza el último tick conocido de un nodo a partir de un evento.
@@ -96,6 +81,7 @@ static bool publish_report_event(EventQueue *queue, const Event *event)
  *
  * @param event Evento recibido desde el nodo.
  */
+/* Guarda el tick final observado para etiquetar correctamente el cierre. */
 static void record_node_event_tick(const Event *event)
 {
     size_t index = event->node_id == 1u ? 0u : event->node_id == 2u ? 1u :
@@ -116,7 +102,7 @@ static void record_node_event_tick(const Event *event)
  *
  * @return Tiempo en nanosegundos, o cero si falla la lectura del reloj.
  */
-static uint64_t host_time_ns(void)
+uint64_t host_time_ns(void)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -132,7 +118,7 @@ static uint64_t host_time_ns(void)
  *
  * @return Tiempo en milisegundos, o cero si falla la lectura del reloj.
  */
-static uint64_t monotonic_time_ms(void)
+uint64_t monotonic_time_ms(void)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -153,7 +139,8 @@ static uint64_t monotonic_time_ms(void)
  *
  * @return true si el mensaje se serializó y quedó listo para enviarse.
  */
-static bool send_message(
+/* Serializa el protocolo de aplicación; comms se encarga del framing serial. */
+bool send_message(
     comms_handler_t *handler,
     char *buffer,
     const Message *message,
@@ -197,6 +184,7 @@ static bool send_message(
  *
  * @return true si la consulta terminó correctamente; false ante un error.
  */
+/* Una cola vacía no es error; un overflow sí puede implicar pérdida de datos. */
 static bool take_received_message(
     comms_handler_t *handler,
     char *buffer,
@@ -234,7 +222,7 @@ static bool take_received_message(
  *
  * @return true si llega el ACK esperado antes del timeout.
  */
-static bool wait_for_ack(
+bool wait_for_ack(
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
@@ -243,6 +231,7 @@ static bool wait_for_ack(
 {
     time_t start = time(NULL);
     for (;;) {
+        /* Consultar la FIFO del hilo serial; si está vacía, seguir esperando. */
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
@@ -304,7 +293,7 @@ static bool wait_for_ack(
  *
  * @return true si se recibió una calibración válida.
  */
-static bool wait_for_calibration(
+bool wait_for_calibration(
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
@@ -314,6 +303,7 @@ static bool wait_for_calibration(
 {
     time_t start = time(NULL);
     for (;;) {
+        /* Ignorar mensajes de otra solicitud: se correlaciona por nodo e ID. */
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
@@ -380,7 +370,7 @@ static bool wait_for_calibration(
  *
  * @return true si llegó una respuesta correlacionada antes del timeout.
  */
-static bool wait_for_task_deploy(
+bool wait_for_task_deploy(
     EventQueue *queue,
     comms_handler_t *handler,
     uint32_t node_id,
@@ -393,6 +383,7 @@ static bool wait_for_task_deploy(
     /* Solo una respuesta ACK/NACK con nodo, request_id y tipo coincidentes cierra la petición. */
     time_t start = time(NULL);
     for (;;) {
+        /* Mientras llega ACK/NACK, también pueden llegar eventos del scheduler. */
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
@@ -475,7 +466,7 @@ static bool wait_for_task_deploy(
  *
  * @return true si el nodo respondió ACK; false ante NACK, error o timeout.
  */
-static bool wait_for_control_reply(
+bool wait_for_control_reply(
     EventQueue *queue,
     comms_handler_t *handler,
     uint32_t node_id,
@@ -487,6 +478,7 @@ static bool wait_for_control_reply(
 {
     uint64_t start = monotonic_time_ms();
     for (;;) {
+        /* El worker serial pone las respuestas y reportes en la FIFO del handler. */
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
@@ -564,13 +556,18 @@ static bool wait_for_control_reply(
     }
 }
 
-static bool publish_bad_frame_reports(
+/**
+ * @brief Convierte el contador de tramas inválidas de cada handler en eventos.
+ * @return true si todos los eventos de error pudieron publicarse.
+ */
+bool publish_bad_frame_reports(
     EventQueue *queue,
     const uint32_t node_ids[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
     const bool enabled[EXPECTED_DEVICES]
 )
 {
+    /* El handler acumula errores; aquí se convierten en eventos del reporte. */
     bool success = true;
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
         if (!enabled[i])
@@ -607,13 +604,14 @@ static bool publish_bad_frame_reports(
  *
  * @return true si los mensajes disponibles se procesaron sin errores.
  */
-static bool pump_node_reports(
+bool pump_node_reports(
     EventQueue *queue,
     const uint32_t node_ids[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES]
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    const bool enabled[EXPECTED_DEVICES]
 )
 {
-    const bool enabled[EXPECTED_DEVICES] = {true, true};
+    /* Vaciar los mensajes disponibles sin bloquear al worker por una respuesta. */
     bool success = publish_bad_frame_reports(
         queue, node_ids, handlers, enabled
     );
@@ -695,158 +693,6 @@ static bool pump_node_reports(
 }
 
 /**
- * @brief Envía START o STOP a ambos nodos y espera sus respuestas.
- *
- * Envía a los dos enlaces antes de esperar cada ACK/NACK. El resultado de un
- * nodo no cancela ni revierte la operación del otro; se devuelve true solo
- * cuando ambos aceptaron el comando.
- *
- * @param type     Tipo de comando, MSG_START o MSG_STOP.
- * @param request_id Identificador común de correlación para este comando.
- * @param node_ids Identificadores de los nodos.
- * @param devices  Rutas o nombres de los dispositivos seriales.
- * @param handlers Enlaces de comunicación activos.
- * @param sent     Buffers JSON de envío, uno por dispositivo.
- *
- * @return true si ambos nodos aceptaron el comando.
- */
-static bool send_control_to_nodes(
-    EventQueue *queue,
-    MessageType type,
-    uint32_t request_id,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    const char *devices[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
-    bool running[EXPECTED_DEVICES],
-    unsigned int timeout_seconds
-)
-{
-    const char *name = type == MSG_START ? "START" : "STOP";
-    bool sent_to_node[EXPECTED_DEVICES] = {false, false};
-    bool all_accepted = true;
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        Message request = {
-            .type = type,
-            .node_id = node_ids[i],
-            .request_id = request_id
-        };
-        sent_to_node[i] = send_message(
-            &handlers[i], sent[i], &request, node_ids[i], name
-        );
-        if (!sent_to_node[i])
-            all_accepted = false;
-    }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (sent_to_node[i]) {
-            bool accepted = wait_for_control_reply(
-                queue, &handlers[i], node_ids[i], request_id, type, devices[i],
-                timeout_seconds
-            );
-            if (!accepted) {
-                all_accepted = false;
-                continue;
-            }
-            running[i] = type == MSG_START;
-            if (type == MSG_START) {
-                node_started_once[i] = true;
-                Event event = {
-                    .type = EVENT_NODE_STARTED,
-                    .source = EVENT_SOURCE_HOST,
-                    .node_id = node_ids[i],
-                    .tick = latest_node_ticks[i],
-                    .host_time_ns = host_time_ns()
-                };
-                if (!publish_report_event(queue, &event))
-                    all_accepted = false;
-            } else {
-                node_reports_drained[i] = false;
-                node_stop_pending[i] = node_started_once[i];
-                node_stop_heartbeat_baseline[i] =
-                    comms_heartbeat_count(&handlers[i]);
-            }
-        }
-    }
-    if (type == MSG_STOP) {
-        bool required[EXPECTED_DEVICES] = {
-            node_started_once[0], node_started_once[1]
-        };
-        if (!drain_node_reports(queue, node_ids, handlers, required))
-            all_accepted = false;
-    }
-    return all_accepted;
-}
-
-/**
- * @brief Envía START o STOP a un único nodo y espera su respuesta.
- *
- * @param type       Tipo de comando, MSG_START o MSG_STOP.
- * @param request_id Identificador de correlación del comando.
- * @param node_index Índice del enlace y nodo a controlar.
- * @param node_ids   Identificadores de los nodos.
- * @param devices    Rutas o nombres de los dispositivos seriales.
- * @param handlers   Enlaces de comunicación activos.
- * @param sent       Buffers JSON de envío, uno por dispositivo.
- *
- * @return true si el nodo seleccionado respondió ACK.
- */
-static bool send_control_to_node(
-    EventQueue *queue,
-    MessageType type,
-    uint32_t request_id,
-    size_t node_index,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    const char *devices[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
-    bool running[EXPECTED_DEVICES],
-    unsigned int timeout_seconds
-)
-{
-    const char *name = type == MSG_START ? "START" : "STOP";
-    Message request = {
-        .type = type,
-        .node_id = node_ids[node_index],
-        .request_id = request_id
-    };
-
-    if (!send_message(&handlers[node_index], sent[node_index], &request,
-                      node_ids[node_index], name)) {
-        return false;
-    }
-
-    bool accepted = wait_for_control_reply(
-        queue, &handlers[node_index], node_ids[node_index], request_id, type,
-        devices[node_index], timeout_seconds
-    );
-    if (!accepted)
-        return false;
-
-    running[node_index] = type == MSG_START;
-    if (type == MSG_START) {
-        node_started_once[node_index] = true;
-        Event event = {
-            .type = EVENT_NODE_STARTED,
-            .source = EVENT_SOURCE_HOST,
-            .node_id = node_ids[node_index],
-            .tick = latest_node_ticks[node_index],
-            .host_time_ns = host_time_ns()
-        };
-        return publish_report_event(queue, &event);
-    } else {
-        node_reports_drained[node_index] = false;
-        node_stop_pending[node_index] = node_started_once[node_index];
-        node_stop_heartbeat_baseline[node_index] =
-            comms_heartbeat_count(&handlers[node_index]);
-        bool required[EXPECTED_DEVICES] = {false, false};
-        required[node_index] = node_started_once[node_index];
-        return drain_node_reports(queue, node_ids, handlers, required);
-    }
-}
-
-/**
  * @brief Obtiene un request_id de control y prepara el siguiente.
  *
  * Los identificadores de control usan un rango separado de CONFIG,
@@ -864,464 +710,103 @@ static uint32_t take_control_request_id(uint32_t *next_request_id)
     return request_id;
 }
 
-static void handle_manual_task_command(
-    EventQueue *queue,
-    const char *task_text,
-    Planner *planner,
-    uint32_t *next_deploy_request_id,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    const char *devices[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
-)
-{
-    if (next_deploy_request_id == NULL ||
-        *next_deploy_request_id >= FIRST_CONTROL_REQUEST_ID) {
-        puts("Se agotaron los request_id para desplegar tareas.");
-        return;
-    }
-
-    Task task;
-    char error[128];
-    if (!manual_task_parse(task_text, &task, error, sizeof(error))) {
-        printf("Tarea manual inválida: %s. Formato: "
-               "add id,P|S,W,T,D,criticidad\n", error);
-        return;
-    }
-
-    ManualTaskRequest manual = {0};
-    if (!manual_task_submit(planner, &task, &manual)) {
-        fprintf(stderr, "No se pudo procesar la tarea manual.\n");
-        return;
-    }
-
-    const PlannerDecision *decision = &manual.decision;
-    if (!decision->accepted) {
-        Event event = {
-            .type = EVENT_TASK_REJECTED,
-            .source = EVENT_SOURCE_HOST,
-            .node_id = decision->node_id,
-            .task_id = task.id,
-            .detail = decision->reason,
-            .task = task,
-            .host_time_ns = host_time_ns()
-        };
-        if (publish_report_event(queue, &event))
-            printf("Tarea %" PRIu32 " no admitida por el planificador: %s.\n",
-                task.id, report_reject_reason(decision->reason));
-        return;
-    }
-
-    size_t node_index = 0u;
-    while (node_index < EXPECTED_DEVICES &&
-           node_ids[node_index] != decision->node_id)
-        ++node_index;
-    if (node_index == EXPECTED_DEVICES) {
-        fprintf(stderr, "El planificador asignó la tarea a un nodo desconocido.\n");
-        if (!manual_task_cancel(planner, &manual))
-            fprintf(stderr, "No se pudo liberar la reserva de la tarea manual.\n");
-        return;
-    }
-
-    uint32_t request_id = (*next_deploy_request_id)++;
-    Message request = {
-        .type = MSG_DEPLOY_TASK,
-        .node_id = decision->node_id,
-        .request_id = request_id,
-        .data.deploy_task = {
-            .task = task,
-            .cost_ticks = decision->cost_ticks
-        }
-    };
-    if (!send_message(&handlers[node_index], sent[node_index], &request,
-                      decision->node_id, "DEPLOY_TASK")) {
-        if (!manual_task_cancel(planner, &manual))
-            fprintf(stderr, "No se pudo liberar la reserva de la tarea manual.\n");
-        return;
-    }
-
-    bool accepted = false;
-    RejectReason reason = REJECT_NONE;
-    if (!wait_for_task_deploy(queue, &handlers[node_index], decision->node_id,
-                              request_id, devices[node_index],
-                              &accepted, &reason)) {
-        event_queue_mark_incomplete(queue);
-        fprintf(stderr,
-            "Estado de la tarea %" PRIu32 " incierto; no se liberó la reserva "
-            "porque el nodo pudo haberla almacenado.\n", task.id);
-        return;
-    }
-
-    Event event = {
-        .type = accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
-        .source = accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
-        .node_id = decision->node_id,
-        .task_id = task.id,
-        .cost_ticks = accepted ? decision->cost_ticks : 0u,
-        .detail = accepted ? REJECT_NONE : reason,
-        .task = task,
-        .host_time_ns = host_time_ns()
-    };
-    if (accepted) {
-        if (!manual_task_confirm(&manual)) {
-            fprintf(stderr, "No se pudo confirmar la tarea manual %" PRIu32 ".\n",
-                task.id);
-            event_queue_mark_incomplete(queue);
-            return;
-        }
-    } else if (!manual_task_cancel(planner, &manual)) {
-        fprintf(stderr,
-            "No se pudo revertir la reserva de la tarea manual %" PRIu32 ".\n",
-            task.id);
-        event_queue_mark_incomplete(queue);
-        return;
-    }
-
-    if (!publish_report_event(queue, &event))
-        return;
-    if (accepted) {
-        printf("Tarea %" PRIu32 " almacenada en nodo %" PRIu32
-               " (costo %" PRIu32 " tick(s)).\n",
-            task.id, decision->node_id, decision->cost_ticks);
-    } else {
-        printf("Nodo %" PRIu32 " rechazó tarea %" PRIu32 ": %s.\n",
-            decision->node_id, task.id, report_reject_reason(reason));
-    }
-}
-
 /**
- * @brief Lee comandos interactivos y controla los schedulers remotos.
+ * @brief Transfiere una estructura completa por un canal de proceso con timeout.
  *
- * Acepta `add` para desplegar una tarea manual durante la sesión,
- * `start`/`stop` para ambos nodos, comandos individuales por nodo y `q`.
- * Las respuestas se procesan mientras llegan los reportes.
- *
- * @param node_ids Identificadores de los nodos.
- * @param devices  Rutas o nombres de los dispositivos seriales.
- * @param handlers Enlaces de comunicación que permanecen abiertos durante
- *                 la consola.
- * @param sent     Buffers JSON de envío, uno por dispositivo.
- * @param planner  Planificador que conserva las asignaciones de la sesión.
- * @param next_deploy_request_id Siguiente identificador de despliegue.
+ * @param descriptor Extremo del pipe.
+ * @param data Buffer de entrada o salida.
+ * @param size Cantidad exacta de bytes por transferir.
+ * @param writing true para escribir y false para leer.
+ * @param timeout_ms Tiempo máximo de espera.
+ * @return true si se transfirieron todos los bytes.
  */
-static void run_control_console(
-    EventQueue *queue,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    const char *devices[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
-    bool running[EXPECTED_DEVICES],
-    Planner *planner,
-    uint32_t *next_deploy_request_id
+bool transfer_process_message(
+    int descriptor,
+    void *data,
+    size_t size,
+    bool writing,
+    int timeout_ms
 )
 {
-    char line[320];
-    size_t used = 0u;
-    bool line_overflow = false;
-    uint32_t next_request_id = FIRST_CONTROL_REQUEST_ID;
-
-    puts("Comandos: add id,P|S,W,T,D,criticidad, "
-         "start [1|2], stop [1|2], q.");
-    fputs("> ", stdout);
-    fflush(stdout);
-    while (!event_queue_stop_requested(queue)) {
-        (void)pump_node_reports(queue, node_ids, handlers);
-        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
-        int ready = poll(&input, 1u, 20);
+    unsigned char *bytes = data;
+    size_t transferred = 0u;
+    /* read/write pueden ser parciales; completar la estructura antes de retornar. */
+    uint64_t deadline = monotonic_time_ms() + (uint64_t)timeout_ms;
+    while (transferred < size) {
+        uint64_t now = monotonic_time_ms();
+        if (now >= deadline)
+            return false;
+        struct pollfd descriptor_event = {
+            .fd = descriptor,
+            .events = writing ? POLLOUT : POLLIN
+        };
+        int ready = poll(&descriptor_event, 1u,
+                         (int)(deadline - now));
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
-            perror("poll stdin");
-            event_queue_request_stop(queue);
-            break;
+            return false;
         }
-        if (ready == 0)
-            continue;
-        if (input.revents & (POLLERR | POLLNVAL)) {
-            fprintf(stderr, "Error leyendo comandos de control.\n");
-            event_queue_request_stop(queue);
-            break;
-        }
-        if (!(input.revents & (POLLIN | POLLHUP)))
-            continue;
-        char character;
-        ssize_t bytes = read(STDIN_FILENO, &character, 1u);
-        if (bytes == 0) {
-            event_queue_request_stop(queue);
-            break;
-        }
-        if (bytes < 0) {
-            if (errno == EINTR)
+        if (ready == 0 || (descriptor_event.revents & (POLLERR | POLLNVAL)))
+            return false;
+        ssize_t count = writing
+            ? write(descriptor, bytes + transferred, size - transferred)
+            : read(descriptor, bytes + transferred, size - transferred);
+        if (count < 0) {
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
-            perror("read stdin");
-            event_queue_request_stop(queue);
-            break;
+            return false;
         }
-        if (character != '\n' && character != '\r') {
-            if (!line_overflow && used + 1u < sizeof(line))
-                line[used++] = character;
-            else
-                line_overflow = true;
-            continue;
-        }
-        if (line_overflow) {
-            puts("Comando demasiado largo; se ignoró la línea.");
-            used = 0u;
-            line_overflow = false;
-            fputs("> ", stdout);
-            fflush(stdout);
-            continue;
-        }
-        line[used] = '\0';
-        used = 0u;
-        if (strncmp(line, "add ", 4u) == 0) {
-            handle_manual_task_command(
-                queue, line + 4u, planner, next_deploy_request_id,
-                node_ids, devices, handlers, sent
-            );
-        } else if (strcmp(line, "add") == 0) {
-            puts("Formato: add id,P|S,W,T,D,criticidad");
-        } else if (strcmp(line, "start") == 0) {
-            uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_nodes(queue, MSG_START, request_id,
-                node_ids, devices, handlers, sent, running,
-                HANDSHAKE_TIMEOUT_SECONDS);
-        } else if (strcmp(line, "stop") == 0) {
-            uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_nodes(queue, MSG_STOP, request_id,
-                node_ids, devices, handlers, sent, running,
-                HANDSHAKE_TIMEOUT_SECONDS);
-        } else if (strcmp(line, "start 1") == 0 ||
-                   strcmp(line, "start 2") == 0 ||
-                   strcmp(line, "stop 1") == 0 ||
-                   strcmp(line, "stop 2") == 0) {
-            const bool starting =
-                strcmp(line, "start 1") == 0 ||
-                strcmp(line, "start 2") == 0;
-            const size_t node_index = line[strlen(line) - 1u] == '1' ? 0u : 1u;
-            uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_node(
-                queue, starting ? MSG_START : MSG_STOP, request_id,
-                node_index, node_ids, devices, handlers, sent, running,
-                HANDSHAKE_TIMEOUT_SECONDS
-            );
-        } else if (strcmp(line, "q") == 0) {
-            event_queue_request_stop(queue);
-            break;
-        } else if (line[0] != '\0') {
-            puts("Comando inválido. Usa add, start [1|2], stop [1|2] o q.");
-        }
-        fputs("> ", stdout);
-        fflush(stdout);
+        if (count == 0)
+            return false;
+        transferred += (size_t)count;
     }
+    return true;
 }
 
 /**
- * @brief Carga, planifica y despliega las tareas admitidas por el Host.
+ * @brief Envía una orden al proceso dueño de un nodo y espera su resultado.
  *
- * Inicializa el Planner con las capacidades calibradas, asigna cada tarea,
- * envía DEPLOY_TASK al nodo correspondiente y espera su ACK/NACK. Si un nodo
- * rechaza una tarea, revierte su reserva local para mantener coherente el
- * planificador.
- *
- * @param config     Configuración del algoritmo, heurística y archivo CSV.
- * @param node_ids   Identificadores de los nodos disponibles.
- * @param devices    Rutas de los puertos seriales.
- * @param handlers   Enlaces de comunicación activos.
- * @param sent       Buffers JSON de envío, uno por dispositivo.
- * @param ut_per_tick Capacidades medidas de los nodos.
- *
- * @return true si la carga y el proceso de despliegue terminaron correctamente.
+ * @param context Contexto del proceso coordinador.
+ * @param node_index Índice del nodo destino.
+ * @param command Orden serializada para el worker.
+ * @param reply Resultado devuelto por el worker.
+ * @return true si hubo una respuesta válida dentro del timeout.
  */
-static bool plan_and_deploy_tasks(
+static bool request_node_worker(
     EventQueue *queue,
-    const HostConfig *config,
-    Planner *planner,
-    uint32_t *next_deploy_request_id,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    const char *devices[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
-    const uint32_t ut_per_tick[EXPECTED_DEVICES]
+    HostCoordinatorContext *context,
+    size_t node_index,
+    const NodeCommand *command,
+    NodeReply *reply
 )
 {
-    TaskList tasks = {0};
-    PlannerDecision *decisions = NULL;
-    bool success = false;
-    char error[256];
-
-    if (planner == NULL || next_deploy_request_id == NULL) {
-        fprintf(stderr, "Estado inválido para planificar las tareas.\n");
-        goto cleanup;
+    if (context == NULL || command == NULL || reply == NULL ||
+        node_index >= EXPECTED_DEVICES)
+        return false;
+    if (!transfer_process_message(context->command_write_fd[node_index],
+                                  (void *)command, sizeof(*command), true, 6000) ||
+        !transfer_process_message(context->reply_read_fd[node_index],
+                                  reply, sizeof(*reply), false, 12000)) {
+        fprintf(stderr, "No hubo respuesta del proceso del nodo %u.\n",
+            context->node_ids[node_index]);
+        event_queue_mark_incomplete(queue);
+        return false;
     }
-
-    /* Carga CSV y crea el plan a partir de las capacidades medidas en esta sesión. */
-    if (!task_parser_load(config->tasks_file, &tasks, error, sizeof(error))) {
-        fprintf(stderr, "No se pudo cargar %s: %s\n",
-            config->tasks_file, error);
-        goto cleanup;
-    }
-    if (tasks.count > FIRST_CONTROL_REQUEST_ID - FIRST_DEPLOY_REQUEST_ID) {
-        fprintf(stderr, "El archivo contiene demasiadas tareas para request_id.\n");
-        goto cleanup;
-    }
-    if (tasks.count > 0u) {
-        decisions = calloc(tasks.count, sizeof(*decisions));
-        if (decisions == NULL) {
-            fprintf(stderr, "No hay memoria para planificar las tareas.\n");
-            goto cleanup;
-        }
-    }
-
-    if (!planner_init(planner, config->algorithm, config->heuristic)) {
-        fprintf(stderr, "No se pudo inicializar el planificador.\n");
-        goto cleanup;
-    }
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (!planner_add_node(planner, node_ids[i], ut_per_tick[i])) {
-            fprintf(stderr, "No se pudo registrar el nodo %u en el planificador.\n",
-                node_ids[i]);
-            goto cleanup;
-        }
-    }
-    if (!planner_plan_batch(planner, tasks.items, tasks.count, decisions)) {
-        fprintf(stderr, "No se pudo planificar el lote de tareas.\n");
-        goto cleanup;
-    }
-
-    printf("Planificación: %zu tarea(s) cargada(s) desde %s.\n",
-        tasks.count, config->tasks_file);
-    /*
-     * task.id identifica la tarea; node_id define el destino y request_id
-     * correlaciona cada despliegue. Se envía y confirma de una en una para
-     * reutilizar con seguridad el buffer de envío de cada controlador.
-     */
-    *next_deploy_request_id = FIRST_DEPLOY_REQUEST_ID;
-    size_t deployed_count = 0u;
-
-    for (size_t i = 0u; i < tasks.count; ++i) {
-        PlannerDecision *decision = &decisions[i];
-        if (!decision->accepted) {
-            Event event = {
-                .type = EVENT_TASK_REJECTED,
-                .source = EVENT_SOURCE_HOST,
-                .node_id = decision->node_id,
-                .task_id = tasks.items[i].id,
-                .detail = decision->reason,
-                .task = tasks.items[i],
-                .host_time_ns = host_time_ns()
-            };
-            if (!publish_report_event(queue, &event))
-                goto cleanup;
-            printf("Tarea %" PRIu32 " no admitida por el planificador: %s.\n",
-                tasks.items[i].id, report_reject_reason(decision->reason));
-            continue;
-        }
-
-        size_t node_index = 0u;
-        while (node_index < EXPECTED_DEVICES &&
-               node_ids[node_index] != decision->node_id)
-            ++node_index;
-        if (node_index == EXPECTED_DEVICES) {
-            fprintf(stderr, "El planificador asignó la tarea a un nodo desconocido.\n");
-            goto cleanup;
-        }
-
-        if (*next_deploy_request_id >= FIRST_CONTROL_REQUEST_ID) {
-            fprintf(stderr, "Se agotaron los request_id para desplegar tareas.\n");
-            goto cleanup;
-        }
-        uint32_t request_id = (*next_deploy_request_id)++;
-        Message request = {
-            .type = MSG_DEPLOY_TASK,
-            .node_id = decision->node_id,
-            .request_id = request_id,
-            .data.deploy_task = {
-                .task = tasks.items[i],
-                .cost_ticks = decision->cost_ticks
-            }
-        };
-        if (!send_message(&handlers[node_index], sent[node_index], &request,
-                          decision->node_id, "DEPLOY_TASK")) {
-            goto cleanup;
-        }
-
-        bool accepted = false;
-        RejectReason reason = REJECT_NONE;
-        if (!wait_for_task_deploy(queue, &handlers[node_index], decision->node_id,
-                                  request_id, devices[node_index],
-                                  &accepted, &reason)) {
-            goto cleanup;
-        }
-
-        if (accepted) {
-            ++deployed_count;
-            Event event = {
-                .type = EVENT_TASK_ACCEPTED,
-                .source = EVENT_SOURCE_HOST,
-                .node_id = decision->node_id,
-                .task_id = decision->task_id,
-                .cost_ticks = decision->cost_ticks,
-                .task = tasks.items[i],
-                .host_time_ns = host_time_ns()
-            };
-            if (!publish_report_event(queue, &event))
-                goto cleanup;
-            printf("Tarea %" PRIu32 " almacenada en nodo %" PRIu32
-                   " (costo %" PRIu32 " tick(s)).\n",
-                decision->task_id, decision->node_id, decision->cost_ticks);
-        } else {
-            /* Deshacer la reserva del Planner para reflejar el NACK del MCU. */
-            if (!planner_remove_task(planner, decision->node_id,
-                                     decision->task_id)) {
-                fprintf(stderr,
-                    "No se pudo revertir la asignación local de tarea %" PRIu32 ".\n",
-                    decision->task_id);
-                goto cleanup;
-            }
-            Event event = {
-                .type = EVENT_TASK_REJECTED,
-                .source = EVENT_SOURCE_NODE,
-                .node_id = decision->node_id,
-                .task_id = decision->task_id,
-                .detail = reason,
-                .task = tasks.items[i],
-                .host_time_ns = host_time_ns()
-            };
-            if (!publish_report_event(queue, &event))
-                goto cleanup;
-            printf("Nodo %" PRIu32 " rechazó tarea %" PRIu32 ": %s.\n",
-                decision->node_id, decision->task_id,
-                report_reject_reason(reason));
-        }
-    }
-
-    printf("Despliegue terminado: %zu de %zu tarea(s) almacenada(s); "
-           "las tareas no se han iniciado.\n",
-        deployed_count, tasks.count);
-    success = true;
-
-cleanup:
-    free(decisions);
-    task_list_free(&tasks);
-    return success;
+    return true;
 }
 
 /**
- * @brief Solicita el cierre de los enlaces y espera que terminen sus hilos.
- *
- * Primero detiene todos los handlers y después revisa bajo mutex el estado de
- * cada hilo hasta que finalice.
- *
- * @param handlers Arreglo de handlers de comunicación.
- * @param count    Cantidad de handlers que deben cerrarse.
+ * @brief Detiene los hilos seriales indicados y espera a que terminen.
+ * Solo opera sobre handlers locales al proceso que llama esta función.
  */
-static void stop_handlers(
+void stop_handlers(
     comms_handler_t *handlers,
     const bool *handler_started,
     size_t count
 )
 {
+    /* Primero solicitar el cierre a todos; después esperar a cada hilo. */
     for (size_t i = 0u; i < count; ++i) {
         if (handler_started[i])
             comms_stop_handler(&handlers[i]);
@@ -1343,219 +828,470 @@ static void stop_handlers(
 }
 
 /**
- * @brief Espera a que los nodos requeridos confirmen el vaciado de sus reportes.
+ * @brief Cierra en cada hijo los extremos de pipes que no le pertenecen.
  *
- * Procesa los eventos pendientes mientras espera un PONG por nodo y falla si
- * no se confirma el drenado dentro del límite de espera.
+ * El reporter no usa los canales de control. Cada worker conserva únicamente
+ * su extremo de lectura de órdenes y su extremo de escritura de respuestas.
  *
- * @param queue Cola donde se publicarán los reportes recibidos.
- * @param node_ids Identificadores de los nodos.
- * @param handlers Enlaces seriales que se inspeccionarán.
- * @param required Indica qué nodos deben confirmar el drenado.
- *
- * @return true si todos los nodos requeridos confirmaron el vaciado.
+ * @param reporter true si la configuración se ejecuta en el proceso reporter.
+ * @param worker_index Índice del worker; se ignora en el proceso reporter.
+ * @param opaque Contexto del coordinador con todos los descriptores heredados.
+ * @return Cero si se cerraron todos los extremos que no se necesitan.
  */
-static bool drain_node_reports(
-    EventQueue *queue,
-    const uint32_t node_ids[EXPECTED_DEVICES],
-    comms_handler_t handlers[EXPECTED_DEVICES],
-    const bool required[EXPECTED_DEVICES]
+static int prepare_child_pipe_descriptors(
+    bool reporter,
+    size_t worker_index,
+    void *opaque
 )
 {
-    uint64_t start = monotonic_time_ms();
-    for (;;) {
-        bool drained = true;
-        for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-            if (required[i] && !node_reports_drained[i])
-                drained = false;
-        }
-        if (drained)
-            return true;
-        (void)pump_node_reports(queue, node_ids, handlers);
-        if (monotonic_time_ms() - start >= 2000u)
-            break;
-        struct timespec pause = {.tv_nsec = 10000000L};
-        nanosleep(&pause, NULL);
+    /* Cada hijo conserva solo sus dos pipes; el reporter no conserva ninguno. */
+    HostCoordinatorContext *context = opaque;
+    if (context == NULL || (!reporter && worker_index >= EXPECTED_DEVICES))
+        return 1;
+
+    int retained[2] = {-1, -1};
+    /* Mantener abiertos únicamente los extremos que el proceso usará. */
+    if (!reporter) {
+        retained[0] = context->workers[worker_index].command_read_fd;
+        retained[1] = context->workers[worker_index].reply_write_fd;
     }
 
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (required[i] && !node_reports_drained[i]) {
-            fprintf(stderr, "No se vació la cola de eventos del nodo %u antes del cierre.\n",
-                node_ids[i]);
-            return false;
+    bool success = true;
+    for (size_t i = 0u; i < EXPECTED_DEVICES * 4u; ++i) {
+        int fd = context->pipe_fds[i];
+        if (fd < 0 || fd == retained[0] || fd == retained[1])
+            continue;
+        if (close(fd) != 0) {
+            perror("close inherited node pipe");
+            success = false;
         }
+    }
+    return success ? 0 : 1;
+}
+
+/**
+ * @brief Cierra en el proceso coordinador los extremos usados solo por hijos.
+ *
+ * El coordinador conserva los extremos que escriben órdenes y leen respuestas.
+ *
+ * @param opaque Contexto con todos los descriptores de pipes.
+ * @return Cero si se cerraron correctamente los extremos no usados.
+ */
+static int close_parent_pipe_descriptors(void *opaque)
+{
+    /* El padre no debe mantener abiertos los extremos que pertenecen a hijos. */
+    HostCoordinatorContext *context = opaque;
+    if (context == NULL)
+        return 1;
+
+    bool success = true;
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        size_t command_read = i * 4u;
+        size_t reply_write = command_read + 3u;
+        if (context->pipe_fds[command_read] >= 0) {
+            if (close(context->pipe_fds[command_read]) != 0)
+                success = false;
+            context->pipe_fds[command_read] = -1;
+        }
+        if (context->pipe_fds[reply_write] >= 0) {
+            if (close(context->pipe_fds[reply_write]) != 0)
+                success = false;
+            context->pipe_fds[reply_write] = -1;
+        }
+    }
+    return success ? 0 : 1;
+}
+
+/**
+ * @brief Solicita a un worker que almacene una tarea ya admitida.
+ *
+ * @param queue Cola donde se publican rechazos y eventos del nodo.
+ * @param context Contexto IPC del coordinador.
+ * @param decision Resultado de asignación y admisión.
+ * @param task Definición de la tarea por desplegar.
+ * @param reply Resultado del ACK/NACK del nodo.
+ * @return true si el worker respondió a la solicitud.
+ */
+static bool coordinator_deploy_task(
+    EventQueue *queue,
+    HostCoordinatorContext *context,
+    const PlannerDecision *decision,
+    const Task *task,
+    NodeReply *reply
+)
+{
+    /* La decisión ya tiene nodo destino; convertirla en orden IPC para ese worker. */
+    size_t index = 0u;
+    while (index < EXPECTED_DEVICES &&
+           context->node_ids[index] != decision->node_id)
+        ++index;
+    if (index == EXPECTED_DEVICES)
+        return false;
+    NodeCommand command = {
+        .type = NODE_COMMAND_DEPLOY,
+        .message = {
+            .type = MSG_DEPLOY_TASK,
+            .node_id = decision->node_id,
+            .request_id = context->next_deploy_request_id++,
+            .data.deploy_task = {
+                .task = *task,
+                .cost_ticks = decision->cost_ticks
+            }
+        }
+    };
+    return request_node_worker(queue, context, index, &command, reply);
+}
+
+/**
+ * @brief Planifica y despliega el CSV usando los workers independientes.
+ *
+ * @param queue Cola IPC de reportes.
+ * @param context Configuración, planner y canales de los nodos.
+ * @param tasks_path Ruta del CSV configurado.
+ * @param capacities Capacidades calibradas en UT por tick.
+ * @return true si el lote se procesó y se completó el despliegue.
+ */
+static bool coordinator_deploy_initial_tasks(
+    EventQueue *queue,
+    HostCoordinatorContext *context,
+    const char *tasks_path,
+    const uint32_t capacities[EXPECTED_DEVICES]
+)
+{
+    /* Cargar CSV, planificar con capacidades calibradas y desplegar en orden. */
+    TaskList tasks = {0};
+    PlannerDecision *decisions = NULL;
+    char error[256];
+    bool success = false;
+    if (!task_parser_load(tasks_path, &tasks, error, sizeof(error))) {
+        fprintf(stderr, "No se pudo cargar %s: %s\n", tasks_path, error);
+        goto cleanup;
+    }
+    if (tasks.count > FIRST_CONTROL_REQUEST_ID - FIRST_DEPLOY_REQUEST_ID) {
+        fprintf(stderr, "El archivo contiene demasiadas tareas para request_id.\n");
+        goto cleanup;
+    }
+    if (tasks.count > 0u) {
+        decisions = calloc(tasks.count, sizeof(*decisions));
+        if (decisions == NULL) {
+            fprintf(stderr, "No hay memoria para planificar las tareas.\n");
+            goto cleanup;
+        }
+    }
+    if (!planner_init(&context->planner, context->config.algorithm,
+                      context->config.heuristic)) {
+        fprintf(stderr, "No se pudo inicializar el planificador.\n");
+        goto cleanup;
+    }
+    /* El Planner usa las capacidades reportadas por cada worker al arrancar. */
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (!planner_add_node(&context->planner, context->node_ids[i],
+                              capacities[i])) {
+            fprintf(stderr, "No se pudo registrar el nodo %u.\n",
+                context->node_ids[i]);
+            goto cleanup;
+        }
+    }
+    if (!planner_plan_batch(&context->planner, tasks.items, tasks.count,
+                            decisions)) {
+        fprintf(stderr, "No se pudo planificar el lote de tareas.\n");
+        goto cleanup;
+    }
+
+    context->next_deploy_request_id = FIRST_DEPLOY_REQUEST_ID;
+    printf("Planificación: %zu tarea(s) cargada(s) desde %s.\n",
+        tasks.count, tasks_path);
+    /* Registrar rechazos locales; enviar al nodo solo las tareas admitidas. */
+    for (size_t i = 0u; i < tasks.count; ++i) {
+        const PlannerDecision *decision = &decisions[i];
+        if (!decision->accepted) {
+            Event rejected = {
+                .type = EVENT_TASK_REJECTED,
+                .source = EVENT_SOURCE_HOST,
+                .task_id = tasks.items[i].id,
+                .detail = decision->reason,
+                .task = tasks.items[i],
+                .host_time_ns = host_time_ns()
+            };
+            if (!publish_report_event(queue, &rejected))
+                goto cleanup;
+            printf("Tarea %" PRIu32 " no admitida: %s.\n",
+                tasks.items[i].id, report_reject_reason(decision->reason));
+            continue;
+        }
+
+        NodeReply reply;
+        if (!coordinator_deploy_task(queue, context, decision,
+                                     &tasks.items[i], &reply) || !reply.ok) {
+            fprintf(stderr, "Falló el despliegue de la tarea %" PRIu32 ".\n",
+                decision->task_id);
+            goto cleanup;
+        }
+        Event event = {
+            .type = reply.accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
+            .source = reply.accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
+            .node_id = decision->node_id,
+            .task_id = decision->task_id,
+            .cost_ticks = reply.accepted ? decision->cost_ticks : 0u,
+            .detail = reply.accepted ? REJECT_NONE : reply.reason,
+            .task = tasks.items[i],
+            .host_time_ns = host_time_ns()
+        };
+        if (!reply.accepted &&
+            !planner_remove_task(&context->planner, decision->node_id,
+                                 decision->task_id)) {
+            fprintf(stderr, "No se pudo revertir la reserva de la tarea.\n");
+            goto cleanup;
+        }
+        if (!publish_report_event(queue, &event))
+            goto cleanup;
+        printf("Tarea %" PRIu32 " %s en nodo %" PRIu32 ".\n",
+            decision->task_id, reply.accepted ? "almacenada" : "rechazada",
+            decision->node_id);
+    }
+    success = true;
+
+cleanup:
+    free(decisions);
+    task_list_free(&tasks);
+    return success;
+}
+
+/**
+ * @brief Admite manualmente una tarea y solicita su despliegue en ejecución.
+ *
+ * @param queue Cola IPC de reportes.
+ * @param context Estado del coordinador.
+ * @param text Definición textual id,P|S,W,T,D,criticidad.
+ */
+static void coordinator_add_manual_task(
+    EventQueue *queue,
+    HostCoordinatorContext *context,
+    const char *text
+)
+{
+    /* Reservar primero en Planner; confirmar o revertir según ACK/NACK remoto. */
+    Task task;
+    char error[128];
+    if (!manual_task_parse(text, &task, error, sizeof(error))) {
+        printf("Tarea manual inválida: %s. Formato: "
+               "add id,P|S,W,T,D,criticidad\n", error);
+        return;
+    }
+    ManualTaskRequest request = {0};
+    if (!manual_task_submit(&context->planner, &task, &request)) {
+        fprintf(stderr, "No se pudo procesar la tarea manual.\n");
+        return;
+    }
+    const PlannerDecision *decision = &request.decision;
+    if (!decision->accepted) {
+        Event rejected = {
+            .type = EVENT_TASK_REJECTED,
+            .source = EVENT_SOURCE_HOST,
+            .task_id = task.id,
+            .detail = decision->reason,
+            .task = task,
+            .host_time_ns = host_time_ns()
+        };
+        if (publish_report_event(queue, &rejected))
+            printf("Tarea %" PRIu32 " no admitida: %s.\n",
+                task.id, report_reject_reason(decision->reason));
+        return;
+    }
+
+    NodeReply reply;
+    if (!coordinator_deploy_task(queue, context, decision, &task, &reply) ||
+        !reply.ok) {
+        event_queue_mark_incomplete(queue);
+        fprintf(stderr, "Resultado incierto al desplegar tarea %" PRIu32 ".\n",
+            task.id);
+        return;
+    }
+    if (!reply.accepted) {
+        if (!manual_task_cancel(&context->planner, &request))
+            event_queue_mark_incomplete(queue);
+    } else if (!manual_task_confirm(&request)) {
+        event_queue_mark_incomplete(queue);
+        fprintf(stderr, "No se pudo confirmar la tarea manual.\n");
+        return;
+    }
+    Event event = {
+        .type = reply.accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
+        .source = reply.accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
+        .node_id = decision->node_id,
+        .task_id = task.id,
+        .cost_ticks = reply.accepted ? decision->cost_ticks : 0u,
+        .detail = reply.accepted ? REJECT_NONE : reply.reason,
+        .task = task,
+        .host_time_ns = host_time_ns()
+    };
+    if (publish_report_event(queue, &event))
+        printf("Tarea %" PRIu32 " %s en nodo %" PRIu32 ".\n",
+            task.id, reply.accepted ? "almacenada" : "rechazada",
+            decision->node_id);
+}
+
+/**
+ * @brief Envía START o STOP a un worker y espera el resultado remoto.
+ *
+ * @param queue Cola IPC para eventos recibidos durante la espera.
+ * @param context Contexto de comunicación con los workers.
+ * @param type Tipo de orden de control.
+ * @param index Índice del nodo.
+ * @param request_id Identificador correlativo.
+ * @return true si el nodo confirmó la orden.
+ */
+static bool coordinator_control_node(
+    EventQueue *queue,
+    HostCoordinatorContext *context,
+    MessageType type,
+    size_t index,
+    uint32_t request_id
+)
+{
+    /* El padre nunca usa el puerto: manda la orden al proceso dueño del nodo. */
+    NodeCommand command = {
+        .type = type == MSG_START ? NODE_COMMAND_START : NODE_COMMAND_STOP,
+        .message = {
+            .type = type,
+            .node_id = context->node_ids[index],
+            .request_id = request_id
+        }
+    };
+    NodeReply reply;
+    if (!request_node_worker(queue, context, index, &command, &reply))
+        return false;
+    if (!reply.ok) {
+        fprintf(stderr, "%s no confirmado por nodo %u.\n",
+            type == MSG_START ? "START" : "STOP", context->node_ids[index]);
+        return false;
     }
     return true;
 }
 
 /**
- * @brief Configura los nodos, calibra capacidades y despliega las tareas.
+ * @brief Coordina los dos workers, el despliegue y la consola de usuario.
  *
- * Al completar el despliegue inicia la consola interactiva de control. La
- * función se ejecuta en el worker propietario de los enlaces seriales.
+ * Esta función corre en el proceso Host padre: los enlaces seriales y su
+ * recepción pertenecen exclusivamente a los procesos workers por nodo.
  *
- * @param queue Cola compartida para publicar los eventos de la sesión.
- * @param context Contexto de sesión serial recibido por ReportWorker.
- *
- * @return Código cero si la configuración y el despliegue terminan bien.
+ * @param queue Cola compartida de reportes.
+ * @param opaque Contexto con los dos canales IPC y el planificador.
+ * @return Cero ante cierre normal solicitado con q.
  */
-static int serial_report_worker_run(EventQueue *queue, void *context)
+static int host_coordinator_run(EventQueue *queue, void *opaque)
 {
-    SerialReportSession *session = context;
-    memset(latest_node_ticks, 0, sizeof(latest_node_ticks));
-    memset(node_stop_heartbeat_baseline, 0,
-           sizeof(node_stop_heartbeat_baseline));
-    memset(node_started_once, 0, sizeof(node_started_once));
-    memset(node_reports_drained, 0, sizeof(node_reports_drained));
-    memset(node_stop_pending, 0, sizeof(node_stop_pending));
-    bool acked[EXPECTED_DEVICES] = {false, false};
-    bool calibrated[EXPECTED_DEVICES] = {false, false};
-    uint32_t ut_per_tick[EXPECTED_DEVICES] = {0u, 0u};
-
+    /* El padre espera a que ambos workers completen CONFIG y calibración. */
+    HostCoordinatorContext *context = opaque;
+    /* La capacidad de ambos nodos es requisito para asignar las tareas del CSV. */
+    uint32_t capacities[EXPECTED_DEVICES] = {0u, 0u};
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (comms_init_handler((int)i, &session->handlers[i],
-                               session->devices[i], 0u,
-                               session->config.connection_timeout_ms)
-            != COMMS_OK) {
-            fprintf(stderr, "No se pudo inicializar el enlace %s.\n",
-                session->devices[i]);
+        /* El worker notifica al padre su capacidad después de calibrar. */
+        NodeReply startup;
+        if (!transfer_process_message(context->reply_read_fd[i], &startup,
+                                      sizeof(startup), false, 12000) ||
+            !startup.ok || startup.ut_per_tick == 0u) {
+            fprintf(stderr, "Falló la preparación del proceso del nodo %u.\n",
+                context->node_ids[i]);
+            event_queue_mark_incomplete(queue);
             return 1;
         }
-        session->initialized[i] = true;
-        session->initialized_count = i + 1u;
-        session->handlers[i].sent.content = session->sent[i];
-
-        Message request = {
-            .type = MSG_CONFIG,
-            .node_id = session->node_ids[i],
-            .request_id = 1u,
-            .data.config = {
-                .algorithm = session->config.algorithm == SCHED_EDF
-                    ? MESSAGE_SCHED_EDF : MESSAGE_SCHED_RMS,
-                .tick_ms = session->config.tick_ms,
-                .report_every_ticks = session->config.report_every_ticks
-            }
-        };
-        if (!send_message(&session->handlers[i], session->sent[i], &request,
-                          session->node_ids[i], "CONFIG")) {
-            return 1;
-        }
-        if (comms_setup_handler(&session->handlers[i]) != COMMS_OK) {
-            fprintf(stderr, "No se pudo iniciar el enlace %s.\n",
-                session->devices[i]);
-            return 1;
-        }
-        session->handler_started[i] = true;
+        capacities[i] = startup.ut_per_tick;
     }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
-        acked[i] = wait_for_ack(&session->handlers[i], session->node_ids[i],
-                                1u, session->devices[i]);
-
-    if (!acked[0] || !acked[1]) {
-        fprintf(stderr, "Intercambio CONFIG incompleto; revise conexiones y firmware.\n");
+    /* Con ambas capacidades conocidas, planificar y desplegar el lote inicial. */
+    if (!coordinator_deploy_initial_tasks(
+            queue, context, context->config.tasks_file, capacities))
         return 1;
-    }
 
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        Message request = {
-            .type = MSG_CALIBRATE_REQUEST,
-            .node_id = session->node_ids[i],
-            .request_id = CALIBRATION_REQUEST_ID,
-            .data.sample_ticks = CALIBRATION_DEFAULT_SAMPLES
-        };
-        if (!send_message(&session->handlers[i], session->sent[i], &request,
-                          session->node_ids[i],
-                          "CALIBRATE_REQUEST")) {
+    uint32_t next_control_request_id = FIRST_CONTROL_REQUEST_ID;
+    /* Este buffer arma una línea de consola sin bloquear el procesamiento de la sesión. */
+    char line[320];
+    size_t used = 0u;
+    bool overflow = false;
+    puts("Procesos activos: Host coordinador, reporter, worker ESP32 y worker Pico.");
+    puts("Comandos: add id,P|S,W,T,D,criticidad, start [1|2], stop [1|2], q.");
+    fputs("> ", stdout);
+    fflush(stdout);
+    /* El coordinador lee la consola; los puertos seriales solo los tocan workers. */
+    /* La consola vive en el padre; los workers siguen atendiendo serial en paralelo. */
+    while (!event_queue_stop_requested(queue)) {
+        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
+        int ready = poll(&input, 1u, 100);
+        if (ready < 0) {
+            if (errno == EINTR)
+                return 0;
+            perror("poll stdin");
+            event_queue_mark_incomplete(queue);
             return 1;
         }
-    }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        calibrated[i] = wait_for_calibration(
-            &session->handlers[i], session->node_ids[i],
-            CALIBRATION_REQUEST_ID, session->devices[i], &ut_per_tick[i]
-        );
-    }
-
-    if (!calibrated[0] || !calibrated[1]) {
-        fprintf(stderr, "Calibración incompleta; revise los firmwares y la conexión.\n");
-        return 1;
-    }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        Event event = {
-            .type = EVENT_NODE_CALIBRATED,
-            .source = EVENT_SOURCE_HOST,
-            .node_id = session->node_ids[i],
-            .ut_per_tick = ut_per_tick[i],
-            .host_time_ns = host_time_ns()
-        };
-        if (!publish_report_event(queue, &event))
-            return 1;
-    }
-
-    bool deployed = plan_and_deploy_tasks(
-        queue, &session->config, &session->planner,
-        &session->next_deploy_request_id,
-        session->node_ids, session->devices,
-        session->handlers, session->sent, ut_per_tick
-    );
-    if (!deployed) {
-        return 1;
-    }
-
-    puts("CONFIG, calibración y despliegue de tareas completados.");
-    run_control_console(queue, session->node_ids, session->devices,
-                        session->handlers, session->sent, session->running,
-                        &session->planner,
-                        &session->next_deploy_request_id);
-    return 0;
-}
-
-/**
- * @brief Detiene los nodos activos, drena sus eventos y cierra los enlaces.
- *
- * @param queue Cola compartida donde se publican los últimos eventos.
- * @param context Contexto de sesión serial recibido por ReportWorker.
- *
- * @return Código cero si el cierre y el drenado terminaron correctamente.
- */
-static int serial_report_worker_stop(EventQueue *queue, void *context)
-{
-    SerialReportSession *session = context;
-    bool success = true;
-    uint32_t request_id = FIRST_CONTROL_REQUEST_ID;
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (!session->initialized[i] || !session->handler_started[i] ||
-            !session->running[i])
+        if (ready == 0)
             continue;
-        if (!send_control_to_node(
-                queue, MSG_STOP, request_id++, i, session->node_ids,
-                session->devices, session->handlers, session->sent,
-                session->running, 1u)) {
-            Event event = {
-                .type = EVENT_NODE_FAILED,
-                .source = EVENT_SOURCE_HOST,
-                .node_id = session->node_ids[i],
-                .host_time_ns = host_time_ns()
-            };
-            (void)publish_report_event(queue, &event);
-            success = false;
+        if (input.revents & (POLLERR | POLLNVAL)) {
+            fprintf(stderr, "Error leyendo comandos de control.\n");
+            return 1;
         }
+        char character;
+        ssize_t bytes = read(STDIN_FILENO, &character, 1u);
+        if (bytes == 0)
+            return 0;
+        if (bytes < 0) {
+            if (errno == EINTR)
+                return 0;
+            perror("read stdin");
+            return 1;
+        }
+        if (character != '\n' && character != '\r') {
+            if (!overflow && used + 1u < sizeof(line))
+                line[used++] = character;
+            else
+                overflow = true;
+            continue;
+        }
+        if (overflow) {
+            puts("Comando demasiado largo; se ignoró la línea.");
+            used = 0u;
+            overflow = false;
+            fputs("> ", stdout);
+            fflush(stdout);
+            continue;
+        }
+        line[used] = '\0';
+        used = 0u;
+        /* q termina el coordinador; report_session inicia el cierre ordenado. */
+        if (strcmp(line, "q") == 0)
+            return 0;
+        if (strncmp(line, "add ", 4u) == 0) {
+            /* Las tareas manuales también pasan por planificación y admisión. */
+            coordinator_add_manual_task(queue, context, line + 4u);
+        } else if (strcmp(line, "start") == 0 ||
+                   strcmp(line, "stop") == 0) {
+            MessageType type = line[0] == 's' && line[1] == 't' &&
+                line[2] == 'a' ? MSG_START : MSG_STOP;
+            bool success = true;
+            for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
+                if (!coordinator_control_node(queue, context, type, i,
+                        take_control_request_id(&next_control_request_id)))
+                    success = false;
+            if (!success)
+                event_queue_mark_incomplete(queue);
+        } else if (strcmp(line, "start 1") == 0 ||
+                   strcmp(line, "start 2") == 0 ||
+                   strcmp(line, "stop 1") == 0 ||
+                   strcmp(line, "stop 2") == 0) {
+            bool starting = line[0] == 's' && line[1] == 't' &&
+                line[2] == 'a';
+            size_t index = line[strlen(line) - 1u] == '1' ? 0u : 1u;
+            if (!coordinator_control_node(
+                    queue, context, starting ? MSG_START : MSG_STOP, index,
+                    take_control_request_id(&next_control_request_id)))
+                event_queue_mark_incomplete(queue);
+        } else if (line[0] != '\0') {
+            puts("Comando inválido. Usa add, start [1|2], stop [1|2] o q.");
+        }
+        fputs("> ", stdout);
+        fflush(stdout);
     }
-    bool required[EXPECTED_DEVICES] = {
-        node_started_once[0], node_started_once[1]
-    };
-    if (!drain_node_reports(queue, session->node_ids, session->handlers, required))
-        success = false;
-    stop_handlers(session->handlers, session->handler_started,
-                  session->initialized_count);
-    if (!publish_bad_frame_reports(
-            queue, session->node_ids, session->handlers,
-            session->handler_started))
-        success = false;
-    return success ? 0 : 1;
+    return 0;
 }
 
 /**
@@ -1571,6 +1307,7 @@ static int serial_report_worker_stop(EventQueue *queue, void *context)
  */
 int main(int argc, char *argv[])
 {
+    /* La demo no abre dispositivos; el modo normal necesita ambos puertos. */
     if (argc >= 2 && strcmp(argv[1], "--report-demo") == 0) {
         if (argc > 3) {
             fprintf(stderr, "Usage: %s --report-demo [output_directory]\n", argv[0]);
@@ -1586,21 +1323,61 @@ int main(int argc, char *argv[])
         return report_demo_run(argc == 3 ? argv[2] : directory);
     }
 
+    /* La ejecución real requiere exactamente un puerto por dispositivo. */
     if (argc != 1 + EXPECTED_DEVICES) {
         fprintf(stderr, "Usage: %s <ESP32 serial port> <Pico serial port>\n", argv[0]);
         return 1;
     }
 
-    SerialReportSession session = {0};
+    /* Cargar configuración y describir los dos nodos que se controlarán. */
+    HostCoordinatorContext context = {0};
     char error[256];
-    if (!config_load("config/system.conf", &session.config, error, sizeof(error))) {
+    if (!config_load("config/system.conf", &context.config, error, sizeof(error))) {
         fprintf(stderr, "No se pudo cargar config/system.conf: %s\n", error);
         return 1;
     }
-    session.devices[0] = argv[1];
-    session.devices[1] = argv[2];
-    session.node_ids[0] = 1u;
-    session.node_ids[1] = 2u;
+    context.devices[0] = argv[1];
+    context.devices[1] = argv[2];
+    context.node_ids[0] = 1u;
+    context.node_ids[1] = 2u;
+
+    /* Crear un canal de órdenes y otro de respuestas por cada worker. */
+    int command_pipes[EXPECTED_DEVICES][2];
+    int reply_pipes[EXPECTED_DEVICES][2];
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        command_pipes[i][0] = -1;
+        command_pipes[i][1] = -1;
+        reply_pipes[i][0] = -1;
+        reply_pipes[i][1] = -1;
+    }
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        /* Los hijos heredarán todos los extremos; su callback cierra los ajenos. */
+        if (pipe(command_pipes[i]) != 0 || pipe(reply_pipes[i]) != 0) {
+            perror("pipe node worker");
+            for (size_t j = 0u; j < EXPECTED_DEVICES; ++j) {
+                if (command_pipes[j][0] >= 0) close(command_pipes[j][0]);
+                if (command_pipes[j][1] >= 0) close(command_pipes[j][1]);
+                if (reply_pipes[j][0] >= 0) close(reply_pipes[j][0]);
+                if (reply_pipes[j][1] >= 0) close(reply_pipes[j][1]);
+            }
+            return 1;
+        }
+        /* El padre conserva write/read; el worker conserva read/write. */
+        context.command_write_fd[i] = command_pipes[i][1];
+        context.reply_read_fd[i] = reply_pipes[i][0];
+        context.pipe_fds[i * 4u] = command_pipes[i][0];
+        context.pipe_fds[i * 4u + 1u] = command_pipes[i][1];
+        context.pipe_fds[i * 4u + 2u] = reply_pipes[i][0];
+        context.pipe_fds[i * 4u + 3u] = reply_pipes[i][1];
+        context.workers[i].index = i;
+        context.workers[i].command_read_fd = command_pipes[i][0];
+        context.workers[i].reply_write_fd = reply_pipes[i][1];
+        context.workers[i].serial.config = context.config;
+        for (size_t node = 0u; node < EXPECTED_DEVICES; ++node) {
+            context.workers[i].serial.devices[node] = context.devices[node];
+            context.workers[i].serial.node_ids[node] = context.node_ids[node];
+        }
+    }
 
     if (mkdir("output", 0775) != 0 && errno != EEXIST) {
         perror("output");
@@ -1614,14 +1391,33 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    ReportWorker worker = {
-        .run = serial_report_worker_run,
-        .stop = serial_report_worker_stop,
-        .context = &session,
-        .worker_reads_stdin = true
+    /* La sesión bifurca un worker por nodo y un reporter; main queda coordinando. */
+    ReportWorker workers[EXPECTED_DEVICES] = {
+        {
+            .run = node_worker_run,
+            .stop = node_worker_stop,
+            .context = &context.workers[0]
+        },
+        {
+            .run = node_worker_run,
+            .stop = node_worker_stop,
+            .context = &context.workers[1]
+        }
     };
     printf("Generando reporte de sesión en %s; use q para finalizar.\n", directory);
-    int result = report_session_run(directory, &worker, 1u);
+    /* La sesión crea los cuatro procesos y administra su cierre/reporte. */
+    int result = report_session_run_coordinated(
+        directory, workers, EXPECTED_DEVICES, host_coordinator_run,
+        prepare_child_pipe_descriptors, close_parent_pipe_descriptors,
+        &context
+    );
+    /* Tras esperar a los hijos, el padre libera los descriptores heredados. */
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        close(command_pipes[i][0]);
+        close(command_pipes[i][1]);
+        close(reply_pipes[i][0]);
+        close(reply_pipes[i][1]);
+    }
     if (result == 0)
         printf("Sesión cerrada. Reporte HTML y CSV en %s.\n", directory);
     else

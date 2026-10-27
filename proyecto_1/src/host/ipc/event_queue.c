@@ -32,6 +32,10 @@ struct EventQueue {
 
 static unsigned long long queue_sequence;
 
+/**
+ * @brief Calcula el límite absoluto que usarán las esperas con timeout.
+ * @return false si el timeout no es válido o falla la lectura del reloj.
+ */
 static bool deadline_for(int timeout_ms, struct timespec *deadline)
 {
     if (timeout_ms < -1)
@@ -49,6 +53,10 @@ static bool deadline_for(int timeout_ms, struct timespec *deadline)
     return true;
 }
 
+/**
+ * @brief Espera un semáforo sin espera, con timeout o indefinidamente.
+ * @return Cero si lo adquirió; ETIMEDOUT si venció el plazo; errno ante error.
+ */
 static int semaphore_wait(sem_t *semaphore, int timeout_ms,
                           const struct timespec *deadline)
 {
@@ -70,6 +78,7 @@ static int semaphore_wait(sem_t *semaphore, int timeout_ms,
     return errno;
 }
 
+/** @brief Despierta lectores y escritores bloqueados durante el cierre/error. */
 static void wake_waiters(EventQueue *queue)
 {
     (void)sem_post(&queue->readable);
@@ -77,6 +86,7 @@ static void wake_waiters(EventQueue *queue)
         (void)sem_post(&queue->writable);
 }
 
+/** @brief Marca la cola como fallida/incompleta y libera a quienes esperan. */
 static void mark_failed(EventQueue *queue)
 {
     atomic_store(&queue->failed, true);
@@ -85,6 +95,7 @@ static void mark_failed(EventQueue *queue)
     wake_waiters(queue);
 }
 
+/** @brief Construye un nombre POSIX único para la memoria compartida de la cola. */
 static bool make_shared_name(char *name, size_t capacity)
 {
     int written = snprintf(name, capacity, "/so_event_queue_%ld_%llu",
@@ -92,6 +103,10 @@ static bool make_shared_name(char *name, size_t capacity)
     return written > 0 && (size_t)written < capacity;
 }
 
+/**
+ * @brief Crea la cola en memoria compartida y sus semáforos entre procesos.
+ * @return Puntero compartido inicializado o NULL si falla la preparación.
+ */
 EventQueue *event_queue_create(void)
 {
     char name[EVENT_QUEUE_SHM_NAME_SIZE];
@@ -108,6 +123,7 @@ EventQueue *event_queue_create(void)
         return NULL;
     }
 
+    /* MAP_SHARED hace que los cambios sean visibles para los procesos hijos. */
     EventQueue *queue = mmap(NULL, sizeof(*queue), PROT_READ | PROT_WRITE,
                              MAP_SHARED, descriptor, 0);
     int map_errno = errno;
@@ -123,6 +139,7 @@ EventQueue *event_queue_create(void)
     bool mutex_ready = false;
     bool readable_ready = false;
     bool writable_ready = false;
+    /* pshared=1 habilita sincronización entre procesos, no solo entre hilos. */
     if (sem_init(&queue->mutex, 1, 1u) != 0)
         goto fail;
     mutex_ready = true;
@@ -150,6 +167,10 @@ fail:
     return NULL;
 }
 
+/**
+ * @brief Inserta una copia del evento al final de la cola acotada.
+ * @return OK al insertar, TIMEOUT si no hay espacio, u otro estado ante cierre/error.
+ */
 EventQueueResult event_queue_push(EventQueue *queue, const Event *event, int timeout_ms)
 {
     struct timespec deadline;
@@ -157,6 +178,7 @@ EventQueueResult event_queue_push(EventQueue *queue, const Event *event, int tim
         !deadline_for(timeout_ms, &deadline))
         return EVENT_QUEUE_ERROR;
 
+    /* Reservar espacio antes de tomar el mutex evita bloquear a otros productores. */
     int status = semaphore_wait(&queue->writable, timeout_ms, &deadline);
     if (status == ETIMEDOUT)
         return EVENT_QUEUE_TIMEOUT;
@@ -178,6 +200,7 @@ EventQueueResult event_queue_push(EventQueue *queue, const Event *event, int tim
     else if (queue->closed)
         result = EVENT_QUEUE_CLOSED;
     else {
+        /* Calcular el final circular y copiar el evento como una unidad. */
         size_t tail = (queue->head + queue->count) % EVENT_QUEUE_CAPACITY;
         queue->events[tail] = *event;
         ++queue->count;
@@ -195,6 +218,10 @@ EventQueueResult event_queue_push(EventQueue *queue, const Event *event, int tim
     return EVENT_QUEUE_OK;
 }
 
+/**
+ * @brief Extrae el evento más antiguo y libera un espacio para productores.
+ * @return OK con evento, TIMEOUT si no llegó uno, CLOSED tras drenar al cerrar.
+ */
 EventQueueResult event_queue_pop(EventQueue *queue, Event *event, int timeout_ms)
 {
     struct timespec deadline;
@@ -202,6 +229,7 @@ EventQueueResult event_queue_pop(EventQueue *queue, Event *event, int timeout_ms
         !deadline_for(timeout_ms, &deadline))
         return EVENT_QUEUE_ERROR;
 
+    /* Esperar que exista un evento; después el mutex protege índices y contador. */
     int status = semaphore_wait(&queue->readable, timeout_ms, &deadline);
     if (status == ETIMEDOUT) {
         status = semaphore_wait(&queue->mutex, -1, NULL);
@@ -237,6 +265,7 @@ EventQueueResult event_queue_pop(EventQueue *queue, Event *event, int timeout_ms
     else if (queue->count == 0u)
         result = queue->closed ? EVENT_QUEUE_CLOSED : EVENT_QUEUE_ERROR;
     else {
+        /* Retirar por FIFO y avanzar el índice circular de lectura. */
         *event = queue->events[queue->head];
         queue->head = (queue->head + 1u) % EVENT_QUEUE_CAPACITY;
         --queue->count;
@@ -254,30 +283,40 @@ EventQueueResult event_queue_pop(EventQueue *queue, Event *event, int timeout_ms
     return result;
 }
 
+/** @brief Solicita que los workers salgan de sus bucles de trabajo. */
 void event_queue_request_stop(EventQueue *queue)
 {
+    /* Los productores consultan esta bandera para salir de sus bucles. */
     if (queue != NULL)
         atomic_store(&queue->stop_requested, true);
 }
 
+/** @brief Consulta si se solicitó terminar la sesión de productores. */
 bool event_queue_stop_requested(const EventQueue *queue)
 {
     return queue == NULL || atomic_load(&queue->stop_requested);
 }
 
+/** @brief Marca el resultado de sesión como incompleto y solicita el cierre. */
 void event_queue_mark_incomplete(EventQueue *queue)
 {
+    /* El cierre por error también debe reflejarse en el resultado del reporte. */
     if (queue != NULL) {
         atomic_store(&queue->incomplete, true);
         event_queue_request_stop(queue);
     }
 }
 
+/** @brief Consulta si algún proceso reportó pérdida o fallo durante la sesión. */
 bool event_queue_is_incomplete(const EventQueue *queue)
 {
     return queue == NULL || atomic_load(&queue->incomplete);
 }
 
+/**
+ * @brief Impide nuevas inserciones y despierta lectores para drenar o terminar.
+ * Los eventos ya encolados permanecen disponibles para event_queue_pop.
+ */
 EventQueueResult event_queue_close(EventQueue *queue)
 {
     if (queue == NULL)
@@ -299,6 +338,7 @@ EventQueueResult event_queue_close(EventQueue *queue)
     return failed ? EVENT_QUEUE_ERROR : EVENT_QUEUE_OK;
 }
 
+/** @brief Destruye semáforos, mapeo y nombre POSIX de la cola compartida. */
 void event_queue_destroy(EventQueue *queue)
 {
     if (queue == NULL)

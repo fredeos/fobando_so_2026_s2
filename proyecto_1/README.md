@@ -108,10 +108,19 @@ el Host los incorpora al reporte sin recalcular los plazos. Las tramas completas
 con CRC inválido se descartan y se contabilizan en el reporte. Reiniciar ambas
 placas antes del siguiente intento.
 
+La sesión del Host se divide explícitamente en cuatro procesos: el coordinador
+principal, el reporter, un worker serial para el ESP32 y otro para el Pico. El
+coordinador admite y despliega tareas y procesa `add`, `start`, `stop` y `q`;
+cada worker es el único propietario de su enlace serial. Los workers publican
+eventos en la cola compartida y reciben órdenes del coordinador mediante pipes.
+El reporter consume esa cola y genera los archivos de salida.
+
 La cola interna que comunica los procesos del Host usa un objeto de memoria
 compartida POSIX (`shm_open`/`mmap`) y semáforos POSIX compartidos entre procesos.
-Al cerrar la sesión, el proceso propietario espera a sus procesos hijos, destruye
-los semáforos y elimina el objeto compartido.
+Los hijos cierran los extremos de pipes que no utilizan para que la terminación
+inesperada de un worker sea detectable. Al cerrar la sesión, el proceso
+propietario espera a sus procesos hijos, destruye los semáforos y elimina el
+objeto compartido.
 
 ## 3. Compilar y cargar el ESP32
 
