@@ -181,7 +181,10 @@ protocol_errno_t protocol_tx_poll(
             packet,
             &rd
         );
-        if (rd_errno == SERIAL_FAILURE){
+        if (rd_errno == SERIAL_DISCONNECT){
+            errno = PROTOCOL_SERIAL_EIO;
+            serial_restart_packet(packet);
+        } else if (rd_errno == SERIAL_FAILURE){
             errno = PROTOCOL_ERROR;
             serial_restart_packet(packet);
         }
@@ -194,7 +197,10 @@ protocol_errno_t protocol_tx_poll(
             packet,
             &wd
         );
-        if (wd_errno == SERIAL_FAILURE){
+        if (wd_errno == SERIAL_DISCONNECT){
+            errno = PROTOCOL_SERIAL_EIO;
+            serial_restart_packet(packet);
+        } else if (wd_errno == SERIAL_FAILURE){
             errno = PROTOCOL_ERROR;
             serial_restart_packet(packet);
         }
@@ -406,7 +412,6 @@ protocol_errno_t protocol_rx_init(
     rx->rd_busy = false;
     rx->wd_busy = false;
     rx->offset = 0;
-    rx->count = 0;
     // << Retorno >>
     return PROTOCOL_OK;
 }
@@ -428,7 +433,10 @@ protocol_errno_t protocol_rx_poll(
             packet,
             &rd
         );
-        if (rd_errno == SERIAL_FAILURE){
+        if (rd_errno == SERIAL_DISCONNECT){
+            errno = PROTOCOL_SERIAL_EIO;
+            serial_restart_packet(packet);
+        } else if (rd_errno == SERIAL_FAILURE){
             errno = PROTOCOL_ERROR;
             serial_restart_packet(packet);
         }
@@ -441,7 +449,10 @@ protocol_errno_t protocol_rx_poll(
             packet,
             &wd
         );
-        if (wd_errno == SERIAL_FAILURE){
+        if (wd_errno == SERIAL_DISCONNECT){
+            errno = PROTOCOL_SERIAL_EIO;
+            serial_restart_packet(packet);
+        } else if (wd_errno == SERIAL_FAILURE){
             errno = PROTOCOL_ERROR;
             serial_restart_packet(packet);
         }
@@ -455,7 +466,6 @@ protocol_errno_t protocol_rx_poll(
     switch (rx->state){
         case (PROTOCOL_RX_INIT): {
             // [Inicializar RX]
-            rx->count = 0;
             rx->complete = false;
             rx->valid = false;
             rx->ack_state = PROTOCOL_ACK_UNKNOWN;

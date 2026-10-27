@@ -20,7 +20,8 @@ typedef enum {
     SERIAL_FAILURE = -1,
     SERIAL_NO_DATA = -2,
     SERIAL_INVALID_ARG = -3,
-    SERIAL_INVALID_MODE = -4
+    SERIAL_INVALID_MODE = -4,
+    SERIAL_DISCONNECT = -5
 } serial_errno_t;
 
 /* 

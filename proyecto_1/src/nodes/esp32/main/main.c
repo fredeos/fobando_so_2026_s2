@@ -369,6 +369,7 @@ void app_main(void){
             // [Check RX]
             if (rx.complete){
                 uint32_t response_length = 0u;
+                tx_frame.relevance = 0;
                 if (rx.valid){
                     protocol_errno_t rx_frame_errno = protocol_set_buffer_to_frame(
                         &rx_frame,

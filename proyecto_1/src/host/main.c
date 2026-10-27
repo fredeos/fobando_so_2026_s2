@@ -11,34 +11,19 @@
 #include "host/statistics.h"
 #include "host/task_parser.h"
 #include "comms/comms.h"
+#include "timing/timing.h"
 
-#define EXPECTED_DEVICES 2
-#define HANDSHAKE_TIMEOUT_SECONDS 30
-#define CALIBRATION_REQUEST_ID 2u
-#define FIRST_DEPLOY_REQUEST_ID 3u
-#define FIRST_CONTROL_REQUEST_ID UINT32_C(0x80000000)
+#define BUFFER_LEN 80      // message buffer len
+#define EXPECTED_DEVICES 2 // expected devices
 
-/**
- * @brief Serializa y encola un mensaje para enviarlo a un nodo.
- *
- * Usa el buffer asociado al dispositivo y reporta errores de serialización o
- * de preparación del transporte.
- *
- * @param handler     Enlace de comunicación del dispositivo.
- * @param buffer      Buffer JSON dedicado a ese enlace.
- * @param message     Mensaje común que se enviará.
- * @param node_id     Identificador del nodo destino, usado en los diagnósticos.
- * @param message_name Nombre legible del tipo de mensaje.
- *
- * @return true si el mensaje quedó preparado para el transporte.
- */
-static bool send_message(
-    comms_handler_t *handler,
-    char *buffer,
-    const Message *message,
-    uint32_t node_id,
-    const char *message_name
-)
+#define TICK_SIZE   10  // 10 ms
+#define TICK_LIMIT  10  // 10 ticks
+
+#define LIFETIME   30u // program lifetime: 30 s
+#define MSG_TICK   1u  // send message every 1 s
+#define PRIORITY    1  // priority level 1
+
+int main(int argc, char *argv[])
 {
     size_t json_length = 0u;
     MessageSerializeResult serialized = message_serialize(

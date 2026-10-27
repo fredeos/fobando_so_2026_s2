@@ -10,7 +10,6 @@
 #include "common/protocol.h"
 #include "common/message_parser.h"
 #include "serial/serial.h"
-#include "./../serial/posix.h"
 
 /* Incluye espacio para el terminador NUL del payload JSON en la API de comms. */
 #define COMMS_MESSAGE_CAPACITY (MESSAGE_MAX_BYTES + 1u)
@@ -56,22 +55,23 @@ typedef struct {
 } comms_message_t;
 
 /*
- * Handler structure for communications via serial and protocol interface
- * 
+ * Handler structure for communications via serial and protocol interface.
+ * The callee should provide the necessary buffers for the 'recv' and
+ * 'sent' messages for correct payload extraction
 */
 typedef struct {
     // << Information >>
     comms_status_t status;   // handler status for concrete debugging
-    unsigned int tick;       // tick size measured in miliseconds
-    unsigned int tick_limit; // number of ticks for connection integrity
+    uint64_t tick;       // tick size measured in miliseconds
+    uint64_t tick_limit; // number of ticks for connection integrity
     bool online;      // device is conected
     bool running;     // thread is running
     bool active;      // thread is active
+    bool finished;    // thread is finished
     uint8_t priority; // minimum priority level for message saving
     const char* dev;  // device file path; ej. /dev/tty****
     int fd;           // file descriptor for device
     int id;           // handler ID
-    int transactions; // handler transactions comleted
     // << Communication >>
     comms_message_t recv;   // received message
     comms_message_t sent;   // sent message
