@@ -62,20 +62,27 @@ static size_t reap_workers(pid_t *pids, size_t count, bool *failed)
  * El cierre normal es cooperativo. Un driver que no responde se termina con
  * un límite acotado y se declara el reporte incompleto, sin fingir un STOP.
  */
-static void finish_workers(EventQueue *queue, pid_t *pids, size_t count, bool *failed)
+static void finish_workers(
+    EventQueue *queue,
+    pid_t *pids,
+    size_t count,
+    bool *failed,
+    bool worker_reads_stdin
+)
 {
     event_queue_request_stop(queue);
     uint64_t start = monotonic_ms();
+    uint64_t graceful_timeout = worker_reads_stdin ? 7000u : 3000u;
     bool terminated = false, killed = false;
     while (reap_workers(pids, count, failed) > 0u) {
         uint64_t elapsed = monotonic_ms() - start;
-        if (elapsed >= 3000u && !terminated) {
+        if (elapsed >= graceful_timeout && !terminated) {
             *failed = true;
             event_queue_mark_incomplete(queue);
             for (size_t i = 0; i < count; ++i) if (pids[i] > 0) kill(pids[i], SIGTERM);
             terminated = true;
         }
-        if (elapsed >= 3500u && !killed) {
+        if (elapsed >= graceful_timeout + 500u && !killed) {
             for (size_t i = 0; i < count; ++i) if (pids[i] > 0) kill(pids[i], SIGKILL);
             killed = true;
         }
@@ -87,8 +94,12 @@ int report_session_run(const char *directory, const ReportWorker *workers, size_
 {
     if (directory == NULL || directory[0] == '\0' || workers == NULL || count == 0u ||
         count > SIZE_MAX / sizeof(pid_t)) return 1;
-    for (size_t i = 0; i < count; ++i)
+    size_t stdin_workers = 0u;
+    for (size_t i = 0; i < count; ++i) {
         if (workers[i].run == NULL || workers[i].stop == NULL) return 1;
+        if (workers[i].worker_reads_stdin) ++stdin_workers;
+    }
+    if (stdin_workers > 1u) return 1;
 
     struct stat directory_info;
     if ((mkdir(directory, 0775) != 0 && errno != EEXIST) ||
@@ -101,9 +112,13 @@ int report_session_run(const char *directory, const ReportWorker *workers, size_
         event_queue_destroy(queue); free(pids); return 1;
     }
 
+    bool worker_reads_stdin = false;
+    for (size_t i = 0u; i < count; ++i)
+        worker_reads_stdin = worker_reads_stdin || workers[i].worker_reads_stdin;
+
     struct termios original;
     bool terminal_changed = false, failed = false;
-    if (isatty(STDIN_FILENO)) {
+    if (isatty(STDIN_FILENO) && !worker_reads_stdin) {
         if (tcgetattr(STDIN_FILENO, &original) != 0) goto setup_fail;
         struct termios immediate = original;
         immediate.c_lflag &= (tcflag_t)~(ICANON | ECHO);
@@ -153,6 +168,10 @@ int report_session_run(const char *directory, const ReportWorker *workers, size_
             failed = true;
             break;
         }
+        if (worker_reads_stdin) {
+            short_pause();
+            continue;
+        }
         struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
         int ready = poll(&input, 1u, 50);
         if (ready < 0) {
@@ -170,7 +189,7 @@ int report_session_run(const char *directory, const ReportWorker *workers, size_
         }
     }
 
-    finish_workers(queue, pids, count, &failed);
+    finish_workers(queue, pids, count, &failed, worker_reads_stdin);
     if (failed) event_queue_mark_incomplete(queue);
     if (event_queue_close(queue) != EVENT_QUEUE_OK) failed = true;
 

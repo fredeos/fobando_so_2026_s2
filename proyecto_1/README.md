@@ -67,7 +67,8 @@ Usa las variables exportadas; sin ellas, usa `/dev/ttyUSB0` y `/dev/ttyACM0`.
 No es necesario ejecutar `stty` ni el script de diagnóstico previo.
 
 El host realiza CONFIG, calibración y despliegue del CSV. Esperar a que aparezca
-la consola `>`. Entonces escribir, **dentro del host**, no en Bash:
+la consola `>`. La sesión genera los reportes al cerrarse en una carpeta nueva
+dentro de `output/`. Entonces escribir, **dentro del host**, no en Bash:
 
 ```text
 start
@@ -80,13 +81,14 @@ Comandos disponibles:
 | `start` / `stop` | Iniciar o pausar ambos nodos |
 | `start 1` / `stop 1` | Controlar solo ESP32 |
 | `start 2` / `stop 2` | Controlar solo Pico |
-| `exit` | Solicitar STOP y cerrar la sesión |
+| `q` | Solicitar STOP, cerrar la sesión y generar `report.html` y `events.csv` |
 
 STOP conserva el estado preparado y START lo reanuda. Antes de volver a abrir
 el host para una sesión nueva, reiniciar las placas: el firmware actual rechaza
-CONFIG si el scheduler ya fue preparado por un START anterior. Si el host queda
-esperando al salir, Ctrl+C termina el proceso; reiniciar las placas antes del
-siguiente intento.
+CONFIG si el scheduler ya fue preparado por un START anterior. Los nodos envían
+al host sus eventos de ejecución y de plazo perdido por el mismo enlace serial;
+el Host los incorpora al reporte sin recalcular los plazos. Reiniciar ambas
+placas antes del siguiente intento.
 
 ## 3. Compilar y cargar el ESP32
 

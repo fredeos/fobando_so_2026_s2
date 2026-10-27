@@ -14,6 +14,8 @@ typedef struct {
     int (*run)(EventQueue *events, void *context);
     int (*stop)(EventQueue *events, void *context);
     void *context;
+    /* El worker recibe comandos por stdin; la sesión deja de leerlo en el padre. */
+    bool worker_reads_stdin;
 } ReportWorker;
 
 /*

@@ -34,6 +34,68 @@ static uint64_t next_tick_us;
 static TaskStore deployed_tasks;
 static SchedulerRuntime scheduler_runtime;
 
+#define NODE_REPORT_QUEUE_CAPACITY 128u
+static Event node_report_queue[NODE_REPORT_QUEUE_CAPACITY];
+static size_t report_head;
+static size_t report_tail;
+static size_t report_count;
+static Event pending_slice;
+static bool pending_slice_valid;
+static uint32_t report_every_ticks = 1u;
+static uint32_t previous_selected_task = UINT32_MAX;
+
+static bool enqueue_node_report(const Event *event)
+{
+    if (report_count == NODE_REPORT_QUEUE_CAPACITY)
+        return false;
+    node_report_queue[report_tail] = *event;
+    report_tail = (report_tail + 1u) % NODE_REPORT_QUEUE_CAPACITY;
+    ++report_count;
+    return true;
+}
+
+static bool dequeue_node_report(Event *event)
+{
+    if (report_count == 0u)
+        return false;
+    *event = node_report_queue[report_head];
+    report_head = (report_head + 1u) % NODE_REPORT_QUEUE_CAPACITY;
+    --report_count;
+    return true;
+}
+
+static bool flush_pending_slice(void)
+{
+    if (!pending_slice_valid)
+        return true;
+    if (!enqueue_node_report(&pending_slice))
+        return false;
+    pending_slice_valid = false;
+    return true;
+}
+
+static void report_task_released(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    Event event = {.type = EVENT_TASK_RELEASED, .source = EVENT_SOURCE_NODE,
+        .node_id = NODE_ID, .task_id = task_id, .job_id = job_id, .tick = tick};
+    (void)enqueue_node_report(&event);
+}
+
+static void report_task_completed(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    Event event = {.type = EVENT_TASK_COMPLETED, .source = EVENT_SOURCE_NODE,
+        .node_id = NODE_ID, .task_id = task_id, .job_id = job_id, .tick = tick};
+    (void)enqueue_node_report(&event);
+}
+
+static void report_deadline_miss(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    (void)flush_pending_slice();
+    Event event = {.type = EVENT_DEADLINE_MISSED, .source = EVENT_SOURCE_NODE,
+        .node_id = NODE_ID, .task_id = task_id, .job_id = job_id, .tick = tick};
+    (void)enqueue_node_report(&event);
+}
+
 /* Aporte de hardware: LEDs del scheduler y botón con pull-down externo.
  * El procesamiento de mensajes y el runtime de comunicación siguen debajo. */
 #define HARDWARE_BUTTON_PIN 18u
@@ -272,6 +334,7 @@ static bool prepare_response(
                     response_length);
             }
             configured_tick_ms = incoming.data.config.tick_ms;
+            report_every_ticks = incoming.data.config.report_every_ticks;
             configured_algorithm = incoming.data.config.algorithm;
             return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
                 response, response_capacity, response_length);
@@ -327,9 +390,13 @@ static bool prepare_response(
                     response, response_capacity, response_length);
             }
             scheduler_runtime.scheduler.on_selection = hardware_show_selection;
+            scheduler_runtime.scheduler.on_task_released = report_task_released;
+            scheduler_runtime.scheduler.on_task_completed = report_task_completed;
+            scheduler_runtime.scheduler.on_deadline_miss = report_deadline_miss;
             if (!was_running) {
                 hardware_last_misses = scheduler_runtime.scheduler.deadline_miss_count;
                 hardware_clear_button();
+                previous_selected_task = UINT32_MAX;
             }
             if (!was_running)
                 next_tick_us = time_us_64() +
@@ -340,6 +407,7 @@ static bool prepare_response(
 
         if (incoming.type == MSG_STOP) {
             scheduler_runtime_stop(&scheduler_runtime);
+            (void)flush_pending_slice();
             hardware_show_task(UINT32_MAX);
             board_gpio_write(HARDWARE_MISS_PIN, GPIO_LOW);
             hardware_clear_button();
@@ -361,10 +429,29 @@ static bool prepare_response(
         return false;
     }
 
+    if (request_length == 4u && memcmp(request, "PING", 4u) == 0) {
+        Event event;
+        if (dequeue_node_report(&event)) {
+            Message report = {.type = MSG_EVENT, .node_id = NODE_ID,
+                .request_id = 0u, .data.event = event};
+            size_t json_length = 0u;
+            if (message_serialize(&report, response, response_capacity,
+                                  &json_length) != MESSAGE_SERIALIZE_OK)
+                return false;
+            *response_length = (uint32_t)json_length;
+            return true;
+        }
+        const char *legacy = "PONG from Pico";
+        size_t legacy_length = strlen(legacy) + 1u;
+        if (legacy_length > response_capacity)
+            return false;
+        memcpy(response, legacy, legacy_length);
+        *response_length = (uint32_t)legacy_length;
+        return true;
+    }
+
     const char *legacy = "Pico didn't understand message";
-    if (request_length == 4u && memcmp(request, "PING", 4u) == 0)
-        legacy = "PONG from Pico";
-    else if (request_length == 5u && memcmp(request, "MARCO", 5u) == 0 &&
+    if (request_length == 5u && memcmp(request, "MARCO", 5u) == 0 &&
              received->relevance > 0u)
         legacy = "POLO from Pico";
 
@@ -390,6 +477,9 @@ static void run_scheduler_if_due(void)
     hardware_button_poll();
     if (!scheduler_runtime.running || configured_tick_ms == 0u)
         return;
+    if (report_count > NODE_REPORT_QUEUE_CAPACITY - MAX_JOBS -
+                       TASK_MAX_PER_NODE - 4u)
+        return;
 
     if (time_us_64() < next_tick_us)
         return;
@@ -400,6 +490,45 @@ static void run_scheduler_if_due(void)
         scheduler_runtime_stop(&scheduler_runtime);
         return;
     }
+
+    Scheduler *scheduler = &scheduler_runtime.scheduler;
+    uint64_t tick = scheduler->current_tick - 1u;
+    uint32_t report_task_id = selected_task_id == UINT32_MAX ? 0u : selected_task_id;
+    if (selected_task_id != previous_selected_task &&
+        previous_selected_task != UINT32_MAX &&
+        selected_task_id != UINT32_MAX) {
+        Event change = {.type = EVENT_TASK_SWITCH, .source = EVENT_SOURCE_NODE,
+            .node_id = NODE_ID, .task_id = selected_task_id,
+            .job_id = scheduler->last_selected_job_id, .tick = tick};
+        (void)enqueue_node_report(&change);
+    }
+    if (pending_slice_valid &&
+        (pending_slice.type != (selected_task_id == UINT32_MAX
+            ? EVENT_IDLE_SLICE : EVENT_EXECUTION_SLICE) ||
+        pending_slice.task_id != report_task_id ||
+         pending_slice.job_id != scheduler_runtime.scheduler.last_selected_job_id ||
+         pending_slice.tick + pending_slice.duration_ticks != tick)) {
+        (void)flush_pending_slice();
+    }
+    if (!pending_slice_valid) {
+        pending_slice = (Event){
+            .type = selected_task_id == UINT32_MAX
+                ? EVENT_IDLE_SLICE : EVENT_EXECUTION_SLICE,
+            .source = EVENT_SOURCE_NODE,
+            .node_id = NODE_ID,
+            .task_id = report_task_id,
+            .job_id = selected_task_id == UINT32_MAX
+                ? 0u : scheduler->last_selected_job_id,
+            .tick = tick,
+            .duration_ticks = 1u
+        };
+        pending_slice_valid = true;
+    } else if (pending_slice.duration_ticks < UINT32_MAX) {
+        ++pending_slice.duration_ticks;
+    }
+    previous_selected_task = selected_task_id;
+    if (pending_slice.duration_ticks >= report_every_ticks)
+        (void)flush_pending_slice();
 
     /* Evita ejecutar ticks atrasados en ráfaga y deja tiempo al polling serial. */
     next_tick_us = time_us_64() + (uint64_t)configured_tick_ms * 1000u;

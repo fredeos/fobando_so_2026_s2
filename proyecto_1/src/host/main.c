@@ -6,9 +6,11 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "host/report_session.h"
+#include "host/event_queue.h"
 
 #include "common/message_parser.h"
 #include "host/config.h"
@@ -32,6 +34,122 @@
 #define FIRST_DEPLOY_REQUEST_ID   3u
 #define FIRST_CONTROL_REQUEST_ID  0x80000000u
 
+typedef struct {
+    HostConfig config;
+    const char *devices[EXPECTED_DEVICES];
+    uint32_t node_ids[EXPECTED_DEVICES];
+    comms_handler_t handlers[EXPECTED_DEVICES];
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
+    char received[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
+    bool initialized[EXPECTED_DEVICES];
+    bool handler_started[EXPECTED_DEVICES];
+    bool running[EXPECTED_DEVICES];
+    size_t initialized_count;
+} SerialReportSession;
+
+static uint64_t latest_node_ticks[EXPECTED_DEVICES];
+static bool node_started_once[EXPECTED_DEVICES];
+static bool node_reports_drained[EXPECTED_DEVICES];
+static bool node_stop_pending[EXPECTED_DEVICES];
+
+static bool drain_node_reports(
+    EventQueue *queue,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    const bool required[EXPECTED_DEVICES]
+);
+
+/**
+ * @brief Publica un evento en la cola compartida de reportes.
+ *
+ * Reintenta mientras la cola esté temporalmente llena y marca la sesión como
+ * incompleta si no puede publicar el evento.
+ *
+ * @param queue Cola de eventos de la sesión.
+ * @param event Evento que se agregará al reporte.
+ *
+ * @return true si el evento se publicó correctamente.
+ */
+static bool publish_report_event(EventQueue *queue, const Event *event)
+{
+    EventQueueResult result;
+    do {
+        result = event_queue_push(queue, event, 200);
+    } while (result == EVENT_QUEUE_TIMEOUT);
+    if (result != EVENT_QUEUE_OK) {
+        fprintf(stderr, "No se pudo publicar el evento en la cola de reportes (%d).\n",
+            (int)result);
+        event_queue_mark_incomplete(queue);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Actualiza el último tick conocido de un nodo a partir de un evento.
+ *
+ * Para eventos de ejecución e inactividad considera también la duración del
+ * intervalo reportado.
+ *
+ * @param event Evento recibido desde el nodo.
+ */
+static void record_node_event_tick(const Event *event)
+{
+    size_t index = event->node_id == 1u ? 0u : event->node_id == 2u ? 1u :
+        EXPECTED_DEVICES;
+    if (index >= EXPECTED_DEVICES)
+        return;
+    uint64_t end = event->tick;
+    if ((event->type == EVENT_EXECUTION_SLICE ||
+         event->type == EVENT_IDLE_SLICE) &&
+        UINT64_MAX - end >= event->duration_ticks)
+        end += event->duration_ticks;
+    if (end > latest_node_ticks[index])
+        latest_node_ticks[index] = end;
+}
+
+/**
+ * @brief Obtiene el tiempo monotónico actual en nanosegundos.
+ *
+ * @return Tiempo en nanosegundos, o cero si falla la lectura del reloj.
+ */
+static uint64_t host_time_ns(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("clock_gettime");
+        return 0u;
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)now.tv_nsec;
+}
+
+/**
+ * @brief Obtiene el tiempo monotónico actual en milisegundos.
+ *
+ * @return Tiempo en milisegundos, o cero si falla la lectura del reloj.
+ */
+static uint64_t monotonic_time_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("clock_gettime");
+        return 0u;
+    }
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+/**
+ * @brief Serializa y prepara el envío de un mensaje a un nodo.
+ *
+ * @param handler Enlace serial del nodo destino.
+ * @param buffer Buffer donde se serializará el mensaje.
+ * @param message Mensaje que se enviará.
+ * @param node_id Identificador del nodo para diagnóstico.
+ * @param message_name Nombre del mensaje para diagnóstico.
+ *
+ * @return true si el mensaje se serializó y quedó listo para enviarse.
+ */
 static bool send_message(
     comms_handler_t *handler,
     char *buffer,
@@ -312,14 +430,16 @@ static bool wait_for_task_deploy(
  * @return true si el nodo respondió ACK; false ante NACK, error o timeout.
  */
 static bool wait_for_control_reply(
+    EventQueue *queue,
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
     MessageType request_type,
-    const char *device
+    const char *device,
+    unsigned int timeout_seconds
 )
 {
-    time_t start = time(NULL);
+    uint64_t start = monotonic_time_ms();
     for (;;) {
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
@@ -363,6 +483,27 @@ static bool wait_for_control_reply(
                     report_reject_reason(reply.data.reply.reason));
                 return false;
             }
+            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
+                (reply.type == MSG_EVENT || reply.type == MSG_TICK_REPORT)) {
+                Event event = reply.type == MSG_EVENT
+                    ? reply.data.event
+                    : (Event){
+                        .type = EVENT_TICK_REPORT,
+                        .source = EVENT_SOURCE_NODE,
+                        .node_id = reply.node_id,
+                        .tick = reply.data.tick_report.tick,
+                        .task_id = reply.data.tick_report.task_id
+                    };
+                event.host_time_ns = host_time_ns();
+                record_node_event_tick(&event);
+                size_t index = node_id == 1u ? 0u : node_id == 2u ? 1u :
+                    EXPECTED_DEVICES;
+                if (index < EXPECTED_DEVICES)
+                    node_reports_drained[index] = false;
+                if (!publish_report_event(queue, &event))
+                    return false;
+                continue;
+            }
 
             if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
                 response[0] == '{') {
@@ -372,7 +513,7 @@ static bool wait_for_control_reply(
             }
         }
 
-        if (time(NULL) - start >= HANDSHAKE_TIMEOUT_SECONDS) {
+        if (monotonic_time_ms() - start >= (uint64_t)timeout_seconds * 1000u) {
             fprintf(stderr, "Timeout esperando respuesta de %s en nodo %u (%s).\n",
                 request_type == MSG_START ? "START" : "STOP", node_id, device);
             return false;
@@ -380,6 +521,96 @@ static bool wait_for_control_reply(
         struct timespec pause = {.tv_nsec = 10000000L};
         nanosleep(&pause, NULL);
     }
+}
+
+/**
+ * @brief Procesa los mensajes de reporte disponibles en los enlaces seriales.
+ *
+ * Convierte MSG_EVENT y MSG_TICK_REPORT en eventos de la sesión y detecta
+ * PONG para confirmar que el nodo terminó de vaciar su cola de reportes.
+ *
+ * @param queue Cola donde se publicarán los eventos recibidos.
+ * @param node_ids Identificadores de los nodos asociados a cada enlace.
+ * @param handlers Enlaces seriales que se inspeccionarán.
+ *
+ * @return true si los mensajes disponibles se procesaron sin errores.
+ */
+static bool pump_node_reports(
+    EventQueue *queue,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES]
+)
+{
+    bool success = true;
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        char response[COMMS_MESSAGE_CAPACITY];
+        size_t response_size = 0u;
+
+        pthread_mutex_lock(&handlers[i].mutex);
+        bool ready = handlers[i].recv.rdy;
+        if (ready) {
+            response_size = handlers[i].recv.size;
+            memcpy(response, handlers[i].recv.content, response_size);
+            response[response_size] = '\0';
+            handlers[i].recv.rdy = false;
+        }
+        pthread_mutex_unlock(&handlers[i].mutex);
+        if (!ready)
+            continue;
+
+        if (response_size > 0u && response[response_size - 1u] == '\0')
+            --response_size;
+
+        Message message;
+        MessageParseResult parsed = message_parse(response, response_size, &message);
+        if (parsed != MESSAGE_PARSE_OK) {
+            if (response_size >= 4u && memcmp(response, "PONG", 4u) == 0) {
+                node_reports_drained[i] = true;
+                if (node_stop_pending[i]) {
+                    Event stopped = {
+                        .type = EVENT_NODE_STOPPED,
+                        .source = EVENT_SOURCE_HOST,
+                        .node_id = node_ids[i],
+                        .tick = latest_node_ticks[i],
+                        .host_time_ns = host_time_ns()
+                    };
+                    if (publish_report_event(queue, &stopped))
+                        node_stop_pending[i] = false;
+                }
+            }
+            if (response_size > 0u && response[0] == '{') {
+                fprintf(stderr, "Mensaje de reporte inválido del nodo %u: %s\n",
+                    node_ids[i], message_parse_result_string(parsed));
+                success = false;
+            }
+            continue;
+        }
+        if (message.node_id != node_ids[i]) {
+            fprintf(stderr, "Mensaje recibido en enlace %u con node_id %u.\n",
+                node_ids[i], message.node_id);
+            success = false;
+            continue;
+        }
+
+        Event event = {0};
+        if (message.type == MSG_EVENT) {
+            event = message.data.event;
+        } else if (message.type == MSG_TICK_REPORT) {
+            event.type = EVENT_TICK_REPORT;
+            event.source = EVENT_SOURCE_NODE;
+            event.node_id = message.node_id;
+            event.tick = message.data.tick_report.tick;
+            event.task_id = message.data.tick_report.task_id;
+        } else {
+            continue;
+        }
+        event.host_time_ns = host_time_ns();
+        record_node_event_tick(&event);
+        node_reports_drained[i] = false;
+        if (!publish_report_event(queue, &event))
+            success = false;
+    }
+    return success;
 }
 
 /**
@@ -399,12 +630,15 @@ static bool wait_for_control_reply(
  * @return true si ambos nodos aceptaron el comando.
  */
 static bool send_control_to_nodes(
+    EventQueue *queue,
     MessageType type,
     uint32_t request_id,
     const uint32_t node_ids[EXPECTED_DEVICES],
     const char *devices[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
+    bool running[EXPECTED_DEVICES],
+    unsigned int timeout_seconds
 )
 {
     const char *name = type == MSG_START ? "START" : "STOP";
@@ -425,11 +659,39 @@ static bool send_control_to_nodes(
     }
 
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (sent_to_node[i] &&
-            !wait_for_control_reply(&handlers[i], node_ids[i], request_id,
-                                    type, devices[i])) {
-            all_accepted = false;
+        if (sent_to_node[i]) {
+            bool accepted = wait_for_control_reply(
+                queue, &handlers[i], node_ids[i], request_id, type, devices[i],
+                timeout_seconds
+            );
+            if (!accepted) {
+                all_accepted = false;
+                continue;
+            }
+            running[i] = type == MSG_START;
+            if (type == MSG_START) {
+                node_started_once[i] = true;
+                Event event = {
+                    .type = EVENT_NODE_STARTED,
+                    .source = EVENT_SOURCE_HOST,
+                    .node_id = node_ids[i],
+                    .tick = latest_node_ticks[i],
+                    .host_time_ns = host_time_ns()
+                };
+                if (!publish_report_event(queue, &event))
+                    all_accepted = false;
+            } else {
+                node_reports_drained[i] = false;
+                node_stop_pending[i] = node_started_once[i];
+            }
         }
+    }
+    if (type == MSG_STOP) {
+        bool required[EXPECTED_DEVICES] = {
+            node_started_once[0], node_started_once[1]
+        };
+        if (!drain_node_reports(queue, node_ids, handlers, required))
+            all_accepted = false;
     }
     return all_accepted;
 }
@@ -448,13 +710,16 @@ static bool send_control_to_nodes(
  * @return true si el nodo seleccionado respondió ACK.
  */
 static bool send_control_to_node(
+    EventQueue *queue,
     MessageType type,
     uint32_t request_id,
     size_t node_index,
     const uint32_t node_ids[EXPECTED_DEVICES],
     const char *devices[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
+    bool running[EXPECTED_DEVICES],
+    unsigned int timeout_seconds
 )
 {
     const char *name = type == MSG_START ? "START" : "STOP";
@@ -469,10 +734,31 @@ static bool send_control_to_node(
         return false;
     }
 
-    return wait_for_control_reply(
-        &handlers[node_index], node_ids[node_index], request_id, type,
-        devices[node_index]
+    bool accepted = wait_for_control_reply(
+        queue, &handlers[node_index], node_ids[node_index], request_id, type,
+        devices[node_index], timeout_seconds
     );
+    if (!accepted)
+        return false;
+
+    running[node_index] = type == MSG_START;
+    if (type == MSG_START) {
+        node_started_once[node_index] = true;
+        Event event = {
+            .type = EVENT_NODE_STARTED,
+            .source = EVENT_SOURCE_HOST,
+            .node_id = node_ids[node_index],
+            .tick = latest_node_ticks[node_index],
+            .host_time_ns = host_time_ns()
+        };
+        return publish_report_event(queue, &event);
+    } else {
+        node_reports_drained[node_index] = false;
+        node_stop_pending[node_index] = node_started_once[node_index];
+        bool required[EXPECTED_DEVICES] = {false, false};
+        required[node_index] = node_started_once[node_index];
+        return drain_node_reports(queue, node_ids, handlers, required);
+    }
 }
 
 /**
@@ -497,8 +783,8 @@ static uint32_t take_control_request_id(uint32_t *next_request_id)
  * @brief Lee comandos interactivos y controla los schedulers remotos.
  *
  * Acepta `start`/`stop` para ambos nodos, `start 1`/`stop 1` para ESP32,
- * `start 2`/`stop 2` para Pico, y `exit` para detener ambos y salir. Las
- * respuestas se procesan independientemente por nodo.
+ * `start 2`/`stop 2` para Pico, y `q` para solicitar cierre. Las respuestas
+ * se procesan independientemente por nodo mientras llegan los reportes.
  *
  * @param node_ids Identificadores de los nodos.
  * @param devices  Rutas o nombres de los dispositivos seriales.
@@ -507,31 +793,71 @@ static uint32_t take_control_request_id(uint32_t *next_request_id)
  * @param sent     Buffers JSON de envío, uno por dispositivo.
  */
 static void run_control_console(
+    EventQueue *queue,
     const uint32_t node_ids[EXPECTED_DEVICES],
     const char *devices[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY]
+    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY],
+    bool running[EXPECTED_DEVICES]
 )
 {
     char line[64];
+    size_t used = 0u;
     uint32_t next_request_id = FIRST_CONTROL_REQUEST_ID;
 
-    puts("Comandos: start [1|2], stop [1|2], exit.");
-    for (;;) {
-        fputs("> ", stdout);
-        fflush(stdout);
-        if (fgets(line, sizeof(line), stdin) == NULL)
+    puts("Comandos: start [1|2], stop [1|2], q.");
+    fputs("> ", stdout);
+    fflush(stdout);
+    while (!event_queue_stop_requested(queue)) {
+        (void)pump_node_reports(queue, node_ids, handlers);
+        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
+        int ready = poll(&input, 1u, 20);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll stdin");
+            event_queue_request_stop(queue);
             break;
-
-        line[strcspn(line, "\r\n")] = '\0';
+        }
+        if (ready == 0)
+            continue;
+        if (input.revents & (POLLERR | POLLNVAL)) {
+            fprintf(stderr, "Error leyendo comandos de control.\n");
+            event_queue_request_stop(queue);
+            break;
+        }
+        if (!(input.revents & (POLLIN | POLLHUP)))
+            continue;
+        char character;
+        ssize_t bytes = read(STDIN_FILENO, &character, 1u);
+        if (bytes == 0) {
+            event_queue_request_stop(queue);
+            break;
+        }
+        if (bytes < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("read stdin");
+            event_queue_request_stop(queue);
+            break;
+        }
+        if (character != '\n' && character != '\r') {
+            if (used + 1u < sizeof(line))
+                line[used++] = character;
+            continue;
+        }
+        line[used] = '\0';
+        used = 0u;
         if (strcmp(line, "start") == 0) {
             uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_nodes(MSG_START, request_id, node_ids, devices,
-                                        handlers, sent);
+            (void)send_control_to_nodes(queue, MSG_START, request_id,
+                node_ids, devices, handlers, sent, running,
+                HANDSHAKE_TIMEOUT_SECONDS);
         } else if (strcmp(line, "stop") == 0) {
             uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_nodes(MSG_STOP, request_id, node_ids, devices,
-                                        handlers, sent);
+            (void)send_control_to_nodes(queue, MSG_STOP, request_id,
+                node_ids, devices, handlers, sent, running,
+                HANDSHAKE_TIMEOUT_SECONDS);
         } else if (strcmp(line, "start 1") == 0 ||
                    strcmp(line, "start 2") == 0 ||
                    strcmp(line, "stop 1") == 0 ||
@@ -542,19 +868,18 @@ static void run_control_console(
             const size_t node_index = line[strlen(line) - 1u] == '1' ? 0u : 1u;
             uint32_t request_id = take_control_request_id(&next_request_id);
             (void)send_control_to_node(
-                starting ? MSG_START : MSG_STOP, request_id, node_index,
-                node_ids, devices, handlers, sent
+                queue, starting ? MSG_START : MSG_STOP, request_id,
+                node_index, node_ids, devices, handlers, sent, running,
+                HANDSHAKE_TIMEOUT_SECONDS
             );
-        } else if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
-            uint32_t request_id = take_control_request_id(&next_request_id);
-            (void)send_control_to_nodes(MSG_STOP, request_id, node_ids, devices,
-                                        handlers, sent);
+        } else if (strcmp(line, "q") == 0) {
+            event_queue_request_stop(queue);
             break;
-        } else if (line[0] == '\0') {
-            continue;
-        } else {
-            puts("Comando inválido. Usa start [1|2], stop [1|2] o exit.");
+        } else if (line[0] != '\0') {
+            puts("Comando inválido. Usa start [1|2], stop [1|2] o q.");
         }
+        fputs("> ", stdout);
+        fflush(stdout);
     }
 }
 
@@ -576,6 +901,7 @@ static void run_control_console(
  * @return true si la carga y el proceso de despliegue terminaron correctamente.
  */
 static bool plan_and_deploy_tasks(
+    EventQueue *queue,
     const HostConfig *config,
     const uint32_t node_ids[EXPECTED_DEVICES],
     const char *devices[EXPECTED_DEVICES],
@@ -637,6 +963,17 @@ static bool plan_and_deploy_tasks(
     for (size_t i = 0u; i < tasks.count; ++i) {
         PlannerDecision *decision = &decisions[i];
         if (!decision->accepted) {
+            Event event = {
+                .type = EVENT_TASK_REJECTED,
+                .source = EVENT_SOURCE_HOST,
+                .node_id = decision->node_id,
+                .task_id = tasks.items[i].id,
+                .detail = decision->reason,
+                .task = tasks.items[i],
+                .host_time_ns = host_time_ns()
+            };
+            if (!publish_report_event(queue, &event))
+                goto cleanup;
             printf("Tarea %" PRIu32 " no admitida por el planificador: %s.\n",
                 tasks.items[i].id, report_reject_reason(decision->reason));
             continue;
@@ -675,6 +1012,17 @@ static bool plan_and_deploy_tasks(
 
         if (accepted) {
             ++deployed_count;
+            Event event = {
+                .type = EVENT_TASK_ACCEPTED,
+                .source = EVENT_SOURCE_HOST,
+                .node_id = decision->node_id,
+                .task_id = decision->task_id,
+                .cost_ticks = decision->cost_ticks,
+                .task = tasks.items[i],
+                .host_time_ns = host_time_ns()
+            };
+            if (!publish_report_event(queue, &event))
+                goto cleanup;
             printf("Tarea %" PRIu32 " almacenada en nodo %" PRIu32
                    " (costo %" PRIu32 " tick(s)).\n",
                 decision->task_id, decision->node_id, decision->cost_ticks);
@@ -687,6 +1035,17 @@ static bool plan_and_deploy_tasks(
                     decision->task_id);
                 goto cleanup;
             }
+            Event event = {
+                .type = EVENT_TASK_REJECTED,
+                .source = EVENT_SOURCE_NODE,
+                .node_id = decision->node_id,
+                .task_id = decision->task_id,
+                .detail = reason,
+                .task = tasks.items[i],
+                .host_time_ns = host_time_ns()
+            };
+            if (!publish_report_event(queue, &event))
+                goto cleanup;
             printf("Nodo %" PRIu32 " rechazó tarea %" PRIu32 ": %s.\n",
                 decision->node_id, decision->task_id,
                 report_reject_reason(reason));
@@ -715,18 +1074,25 @@ cleanup:
  * @param handlers Arreglo de handlers de comunicación.
  * @param count    Cantidad de handlers que deben cerrarse.
  */
-static void stop_handlers(comms_handler_t *handlers, size_t count)
+static void stop_handlers(
+    comms_handler_t *handlers,
+    const bool *handler_started,
+    size_t count
+)
 {
-    /* Solicita el cierre a todos los hilos antes de esperar su terminación. */
-    for (size_t i = 0u; i < count; ++i)
-        comms_stop_handler(&handlers[i]);
+    for (size_t i = 0u; i < count; ++i) {
+        if (handler_started[i])
+            comms_stop_handler(&handlers[i]);
+    }
 
     for (size_t i = 0u; i < count; ++i) {
+        if (!handler_started[i])
+            continue;
         for (;;) {
             pthread_mutex_lock(&handlers[i].mutex);
-            bool running = handlers[i].running;
+            bool finished = handlers[i].finished;
             pthread_mutex_unlock(&handlers[i].mutex);
-            if (!running)
+            if (finished)
                 break;
             struct timespec pause = {.tv_nsec = 10000000L};
             nanosleep(&pause, NULL);
@@ -735,21 +1101,226 @@ static void stop_handlers(comms_handler_t *handlers, size_t count)
 }
 
 /**
- * @brief Ejecuta la secuencia Host–nodos desde la configuración hasta START/STOP.
+ * @brief Espera a que los nodos requeridos confirmen el vaciado de sus reportes.
  *
- * Valida los puertos, inicia los enlaces, configura y calibra ambos nodos,
- * despliega las tareas admitidas y abre la consola de control. Los enlaces se
- * mantienen activos hasta que el usuario sale de la consola o ocurre un error.
+ * Procesa los eventos pendientes mientras espera un PONG por nodo y falla si
+ * no se confirma el drenado dentro del límite de espera.
  *
- * @param argc Cantidad de argumentos de línea de comandos.
- * @param argv Debe incluir el ejecutable, el puerto ESP32 y el puerto Pico.
+ * @param queue Cola donde se publicarán los reportes recibidos.
+ * @param node_ids Identificadores de los nodos.
+ * @param handlers Enlaces seriales que se inspeccionarán.
+ * @param required Indica qué nodos deben confirmar el drenado.
  *
- * @return 0 si la secuencia termina correctamente; valor distinto de cero ante
- *         errores de argumentos, configuración, enlace, calibración o despliegue.
+ * @return true si todos los nodos requeridos confirmaron el vaciado.
+ */
+static bool drain_node_reports(
+    EventQueue *queue,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    const bool required[EXPECTED_DEVICES]
+)
+{
+    uint64_t start = monotonic_time_ms();
+    for (;;) {
+        bool drained = true;
+        for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+            if (required[i] && !node_reports_drained[i])
+                drained = false;
+        }
+        if (drained)
+            return true;
+        (void)pump_node_reports(queue, node_ids, handlers);
+        if (monotonic_time_ms() - start >= 2000u)
+            break;
+        struct timespec pause = {.tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (required[i] && !node_reports_drained[i]) {
+            fprintf(stderr, "No se vació la cola de eventos del nodo %u antes del cierre.\n",
+                node_ids[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Configura los nodos, calibra capacidades y despliega las tareas.
+ *
+ * Al completar el despliegue inicia la consola interactiva de control. La
+ * función se ejecuta en el worker propietario de los enlaces seriales.
+ *
+ * @param queue Cola compartida para publicar los eventos de la sesión.
+ * @param context Contexto de sesión serial recibido por ReportWorker.
+ *
+ * @return Código cero si la configuración y el despliegue terminan bien.
+ */
+static int serial_report_worker_run(EventQueue *queue, void *context)
+{
+    SerialReportSession *session = context;
+    memset(latest_node_ticks, 0, sizeof(latest_node_ticks));
+    memset(node_started_once, 0, sizeof(node_started_once));
+    memset(node_reports_drained, 0, sizeof(node_reports_drained));
+    memset(node_stop_pending, 0, sizeof(node_stop_pending));
+    bool acked[EXPECTED_DEVICES] = {false, false};
+    bool calibrated[EXPECTED_DEVICES] = {false, false};
+    uint32_t ut_per_tick[EXPECTED_DEVICES] = {0u, 0u};
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (comms_init_handler((int)i, &session->handlers[i],
+                               session->devices[i], 0u,
+                               session->config.tick_ms,
+                               session->config.missed_reports_limit)
+            != COMMS_OK) {
+            fprintf(stderr, "No se pudo inicializar el enlace %s.\n",
+                session->devices[i]);
+            return 1;
+        }
+        session->initialized[i] = true;
+        session->initialized_count = i + 1u;
+        session->handlers[i].sent.content = session->sent[i];
+        session->handlers[i].recv.content = session->received[i];
+
+        Message request = {
+            .type = MSG_CONFIG,
+            .node_id = session->node_ids[i],
+            .request_id = 1u,
+            .data.config = {
+                .algorithm = session->config.algorithm == SCHED_EDF
+                    ? MESSAGE_SCHED_EDF : MESSAGE_SCHED_RMS,
+                .tick_ms = session->config.tick_ms,
+                .report_every_ticks = session->config.report_every_ticks
+            }
+        };
+        if (!send_message(&session->handlers[i], session->sent[i], &request,
+                          session->node_ids[i], "CONFIG")) {
+            return 1;
+        }
+        if (comms_setup_handler(&session->handlers[i]) != COMMS_OK) {
+            fprintf(stderr, "No se pudo iniciar el enlace %s.\n",
+                session->devices[i]);
+            return 1;
+        }
+        session->handler_started[i] = true;
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
+        acked[i] = wait_for_ack(&session->handlers[i], session->node_ids[i],
+                                1u, session->devices[i]);
+
+    if (!acked[0] || !acked[1]) {
+        fprintf(stderr, "Intercambio CONFIG incompleto; revise conexiones y firmware.\n");
+        return 1;
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        Message request = {
+            .type = MSG_CALIBRATE_REQUEST,
+            .node_id = session->node_ids[i],
+            .request_id = CALIBRATION_REQUEST_ID,
+            .data.sample_ticks = CALIBRATION_DEFAULT_SAMPLES
+        };
+        if (!send_message(&session->handlers[i], session->sent[i], &request,
+                          session->node_ids[i],
+                          "CALIBRATE_REQUEST")) {
+            return 1;
+        }
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        calibrated[i] = wait_for_calibration(
+            &session->handlers[i], session->node_ids[i],
+            CALIBRATION_REQUEST_ID, session->devices[i], &ut_per_tick[i]
+        );
+    }
+
+    if (!calibrated[0] || !calibrated[1]) {
+        fprintf(stderr, "Calibración incompleta; revise los firmwares y la conexión.\n");
+        return 1;
+    }
+
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        Event event = {
+            .type = EVENT_NODE_CALIBRATED,
+            .source = EVENT_SOURCE_HOST,
+            .node_id = session->node_ids[i],
+            .ut_per_tick = ut_per_tick[i],
+            .host_time_ns = host_time_ns()
+        };
+        if (!publish_report_event(queue, &event))
+            return 1;
+    }
+
+    bool deployed = plan_and_deploy_tasks(
+        queue, &session->config, session->node_ids, session->devices,
+        session->handlers, session->sent, ut_per_tick
+    );
+    if (!deployed) {
+        return 1;
+    }
+
+    puts("CONFIG, calibración y despliegue de tareas completados.");
+    run_control_console(queue, session->node_ids, session->devices,
+                        session->handlers, session->sent, session->running);
+    return 0;
+}
+
+/**
+ * @brief Detiene los nodos activos, drena sus eventos y cierra los enlaces.
+ *
+ * @param queue Cola compartida donde se publican los últimos eventos.
+ * @param context Contexto de sesión serial recibido por ReportWorker.
+ *
+ * @return Código cero si el cierre y el drenado terminaron correctamente.
+ */
+static int serial_report_worker_stop(EventQueue *queue, void *context)
+{
+    SerialReportSession *session = context;
+    bool success = true;
+    uint32_t request_id = FIRST_CONTROL_REQUEST_ID;
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (!session->initialized[i] || !session->handler_started[i] ||
+            !session->running[i])
+            continue;
+        if (!send_control_to_node(
+                queue, MSG_STOP, request_id++, i, session->node_ids,
+                session->devices, session->handlers, session->sent,
+                session->running, 1u)) {
+            Event event = {
+                .type = EVENT_NODE_FAILED,
+                .source = EVENT_SOURCE_HOST,
+                .node_id = session->node_ids[i],
+                .host_time_ns = host_time_ns()
+            };
+            (void)publish_report_event(queue, &event);
+            success = false;
+        }
+    }
+    bool required[EXPECTED_DEVICES] = {
+        node_started_once[0], node_started_once[1]
+    };
+    if (!drain_node_reports(queue, session->node_ids, session->handlers, required))
+        success = false;
+    stop_handlers(session->handlers, session->handler_started,
+                  session->initialized_count);
+    return success ? 0 : 1;
+}
+
+/**
+ * @brief Arranca una sesión serial con reportes CSV/HTML al finalizar.
+ *
+ * Los comandos `start` y `stop` se conservan; `q` detiene los nodos y cierra
+ * la sesión para generar el reporte.
+ *
+ * @param argc Cantidad de argumentos de la línea de comandos.
+ * @param argv Argumentos: puertos seriales ESP32 y Pico, o modo de demo.
+ *
+ * @return Código de salida de la sesión.
  */
 int main(int argc, char *argv[])
 {
-    /* Modo aislado para verificar reportes y cierre sin hardware ni protocolo */
     if (argc >= 2 && strcmp(argv[1], "--report-demo") == 0) {
         if (argc > 3) {
             fprintf(stderr, "Usage: %s --report-demo [output_directory]\n", argv[0]);
@@ -760,7 +1331,8 @@ int main(int argc, char *argv[])
             perror("output");
             return 1;
         }
-        snprintf(directory, sizeof(directory), "output/report_%ld_%ld", (long)time(NULL), (long)getpid());
+        snprintf(directory, sizeof(directory), "output/report_%ld_%ld",
+            (long)time(NULL), (long)getpid());
         return report_demo_run(argc == 3 ? argv[2] : directory);
     }
 
@@ -769,104 +1341,41 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    HostConfig config;
+    SerialReportSession session = {0};
     char error[256];
-    if (!config_load("config/system.conf", &config, error, sizeof(error))) {
+    if (!config_load("config/system.conf", &session.config, error, sizeof(error))) {
         fprintf(stderr, "No se pudo cargar config/system.conf: %s\n", error);
         return 1;
     }
+    session.devices[0] = argv[1];
+    session.devices[1] = argv[2];
+    session.node_ids[0] = 1u;
+    session.node_ids[1] = 2u;
 
-    const char *devices[EXPECTED_DEVICES] = {argv[1], argv[2]};
-    /* Los node_id del JSON son estables e independientes del índice del hilo. */
-    const uint32_t node_ids[EXPECTED_DEVICES] = {1u, 2u};
-    comms_handler_t handlers[EXPECTED_DEVICES] = {0};
-    char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
-    char received[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
-    bool setup_ok[EXPECTED_DEVICES] = {false, false};
-    bool acked[EXPECTED_DEVICES] = {false, false};
-    bool calibrated[EXPECTED_DEVICES] = {false, false};
-    uint32_t ut_per_tick[EXPECTED_DEVICES] = {0u, 0u};
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        if (comms_init_handler((int)i, &handlers[i], devices[i], 0u,
-                               config.tick_ms, config.missed_reports_limit)
-            != COMMS_OK) {
-            fprintf(stderr, "No se pudo inicializar el enlace %s.\n", devices[i]);
-            stop_handlers(handlers, i);
-            return 1;
-        }
-        handlers[i].sent.content = sent[i];
-        handlers[i].recv.content = received[i];
-
-        Message request = {
-            .type = MSG_CONFIG,
-            .node_id = node_ids[i],
-            .request_id = 1u,
-            .data.config = {
-                .algorithm = config.algorithm == SCHED_EDF
-                    ? MESSAGE_SCHED_EDF : MESSAGE_SCHED_RMS,
-                .tick_ms = config.tick_ms,
-                .report_every_ticks = config.report_every_ticks
-            }
-        };
-        if (!send_message(&handlers[i], sent[i], &request, node_ids[i], "CONFIG")) {
-            stop_handlers(handlers, i + 1u);
-            return 1;
-        }
-        setup_ok[i] = comms_setup_handler(&handlers[i]) == COMMS_OK;
-        if (!setup_ok[i]) {
-            fprintf(stderr, "No se pudo iniciar el enlace %s.\n", devices[i]);
-            stop_handlers(handlers, i + 1u);
-            return 1;
-        }
+    if (mkdir("output", 0775) != 0 && errno != EEXIST) {
+        perror("output");
+        return 1;
     }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
-        acked[i] = wait_for_ack(&handlers[i], node_ids[i], 1u, devices[i]);
-
-    if (!acked[0] || !acked[1]) {
-        stop_handlers(handlers, EXPECTED_DEVICES);
-        fprintf(stderr, "Intercambio CONFIG incompleto; revise conexiones y firmware.\n");
+    char directory[128];
+    int written = snprintf(directory, sizeof(directory), "output/report_%ld_%ld",
+        (long)time(NULL), (long)getpid());
+    if (written < 0 || (size_t)written >= sizeof(directory)) {
+        fprintf(stderr, "No se pudo construir la ruta del reporte.\n");
         return 1;
     }
 
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        Message request = {
-            .type = MSG_CALIBRATE_REQUEST,
-            .node_id = node_ids[i],
-            .request_id = CALIBRATION_REQUEST_ID,
-            .data.sample_ticks = CALIBRATION_DEFAULT_SAMPLES
-        };
-        if (!send_message(&handlers[i], sent[i], &request, node_ids[i],
-                          "CALIBRATE_REQUEST")) {
-            stop_handlers(handlers, EXPECTED_DEVICES);
-            return 1;
-        }
-    }
-
-    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        calibrated[i] = wait_for_calibration(
-            &handlers[i], node_ids[i], CALIBRATION_REQUEST_ID,
-            devices[i], &ut_per_tick[i]
-        );
-    }
-
-    if (!calibrated[0] || !calibrated[1]) {
-        stop_handlers(handlers, EXPECTED_DEVICES);
-        fprintf(stderr, "Calibración incompleta; revise los firmwares y la conexión.\n");
-        return 1;
-    }
-
-    bool deployed = plan_and_deploy_tasks(
-        &config, node_ids, devices, handlers, sent, ut_per_tick
-    );
-    if (!deployed) {
-        stop_handlers(handlers, EXPECTED_DEVICES);
-        return 1;
-    }
-
-    puts("CONFIG, calibración y despliegue de tareas completados.");
-    run_control_console(node_ids, devices, handlers, sent);
-    stop_handlers(handlers, EXPECTED_DEVICES);
-    return 0;
+    ReportWorker worker = {
+        .run = serial_report_worker_run,
+        .stop = serial_report_worker_stop,
+        .context = &session,
+        .worker_reads_stdin = true
+    };
+    printf("Generando reporte de sesión en %s; use q para finalizar.\n", directory);
+    int result = report_session_run(directory, &worker, 1u);
+    if (result == 0)
+        printf("Sesión cerrada. Reporte HTML y CSV en %s.\n", directory);
+    else
+        fprintf(stderr, "La sesión terminó con errores; revise el reporte en %s.\n",
+            directory);
+    return result;
 }

@@ -14,6 +14,9 @@ typedef struct Scheduler {
     /* Llamado tras seleccionar el trabajo y antes de sus UT; UINT32_MAX=idle.
      * Debe ser breve y no bloquear, por ejemplo para actualizar los LEDs. */
     void (*on_selection)(uint32_t task_id);
+    void (*on_task_released)(uint32_t task_id, uint32_t job_id, uint32_t tick);
+    void (*on_task_completed)(uint32_t task_id, uint32_t job_id, uint32_t tick);
+    void (*on_deadline_miss)(uint32_t task_id, uint32_t job_id, uint32_t tick);
     SchedulerTask tasks[MAX_TASKS];
     Job jobs[MAX_JOBS];
     uint32_t free_index[MAX_JOBS];
@@ -21,6 +24,7 @@ typedef struct Scheduler {
     uint32_t task_count;
     uint32_t job_count;
     uint32_t current_tick;
+    uint32_t last_selected_job_id;
     uint32_t sn;
     bool deadline_missed;
     uint32_t deadline_miss_count;

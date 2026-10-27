@@ -15,6 +15,7 @@ typedef struct {
     int markers;
     bool fail;
     bool hang;
+    bool read_input;
 } TestWorker;
 
 static int run_worker(EventQueue *queue, void *context)
@@ -24,6 +25,15 @@ static int run_worker(EventQueue *queue, void *context)
     assert(event_queue_push(queue, &event, 1000) == EVENT_QUEUE_OK);
     assert(write(worker->markers, "R", 1u) == 1);
     if (worker->fail) return 1;
+    if (worker->read_input) {
+        char character;
+        do {
+            ssize_t length = read(STDIN_FILENO, &character, 1u);
+            if (length <= 0) return 1;
+        } while (character != '\n');
+        event_queue_request_stop(queue);
+        return 0;
+    }
     while (worker->hang || !event_queue_stop_requested(queue)) {
         struct timespec pause = {.tv_nsec = 1000000L};
         nanosleep(&pause, NULL);
@@ -55,11 +65,12 @@ static void test_session(unsigned mode)
         assert(dup2(input[0], STDIN_FILENO) == STDIN_FILENO);
         close(input[0]);
         TestWorker contexts[] = {
-            {.id = 1u, .markers = markers[1]},
+            {.id = 1u, .markers = markers[1], .read_input = mode == 5u},
             {.id = 2u, .markers = markers[1], .fail = mode == 3u, .hang = mode == 4u}
         };
         ReportWorker workers[] = {
-            {.run = run_worker, .stop = stop_worker, .context = &contexts[0]},
+            {.run = run_worker, .stop = stop_worker, .context = &contexts[0],
+                .worker_reads_stdin = mode == 5u},
             {.run = run_worker, .stop = stop_worker, .context = &contexts[1]}
         };
         int result = report_session_run(directory, workers, 2u);
@@ -78,6 +89,7 @@ static void test_session(unsigned mode)
         else assert(0);
     }
     if (mode == 0u || mode == 4u) assert(write(input[1], "q", 1u) == 1);
+    if (mode == 5u) assert(write(input[1], "q\n", 2u) == 2);
     if (mode == 2u) assert(kill(supervisor, SIGTERM) == 0);
     close(input[1]);
     char marker;
@@ -90,7 +102,8 @@ static void test_session(unsigned mode)
     close(markers[0]);
     int status;
     assert(waitpid(supervisor, &status, 0) == supervisor);
-    assert(WIFEXITED(status) && WEXITSTATUS(status) == (mode >= 3u ? 1 : 0));
+    assert(WIFEXITED(status) &&
+           WEXITSTATUS(status) == (mode == 3u || mode == 4u ? 1 : 0));
 
     char path[256];
     snprintf(path, sizeof(path), "%s/events.csv", directory);
@@ -110,13 +123,13 @@ static void test_session(unsigned mode)
     bool incomplete = false;
     while (fgets(line, sizeof(line), file) != NULL)
         if (strstr(line, "REPORTE INCOMPLETO") != NULL) incomplete = true;
-    assert(fclose(file) == 0 && incomplete == (mode >= 3u));
+    assert(fclose(file) == 0 && incomplete == (mode == 3u || mode == 4u));
     assert(unlink(path) == 0 && rmdir(directory) == 0);
 }
 
 int main(void)
 {
-    for (unsigned mode = 0u; mode < 5u; ++mode) test_session(mode);
+    for (unsigned mode = 0u; mode < 6u; ++mode) test_session(mode);
     puts("OK: graceful report session tests");
     return 0;
 }

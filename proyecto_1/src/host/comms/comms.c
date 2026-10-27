@@ -32,7 +32,7 @@ comms_status_t comms_init_handler(
     handler->online  = false;
     handler->running = false;
     handler->active  = false;
-    handler->finished = false;
+    handler->finished = true;
 
     handler->priority = priority;
 
@@ -64,6 +64,10 @@ comms_status_t comms_setup_handler(
         return COMMS_INVALID_ARG;
 
     // << Start thread >>
+    pthread_mutex_lock(&handler->mutex);
+    handler->active = true;
+    handler->finished = false;
+    pthread_mutex_unlock(&handler->mutex);
     pthread_t handler_thread;
     int code = pthread_create(
         &handler_thread,
@@ -71,7 +75,13 @@ comms_status_t comms_setup_handler(
         comms_handler,
         handler
     );
-    if (code != 0) return COMMS_ERROR;
+    if (code != 0) {
+        pthread_mutex_lock(&handler->mutex);
+        handler->active = false;
+        handler->finished = true;
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_ERROR;
+    }
     pthread_detach(handler_thread);
     // << Return >>
     return COMMS_OK;
@@ -193,7 +203,6 @@ void* comms_handler(void* arg){
     // << Procedure loop >>
     pthread_mutex_lock(&hd->mutex);   // lock
     hd->online  = false;
-    hd->active  = true;
     hd->running = false;
     hd->finished = false;
     pthread_mutex_unlock(&hd->mutex); // unlock
@@ -360,7 +369,10 @@ void* comms_handler(void* arg){
             // (Check errors)
             if (tx_errno == PROTOCOL_SERIAL_EIO) {
                 printf("%s: Device(%d) disconnected by error!\n", hd->dev, hd->id);
-                close(hd->fd);
+                if (hd->fd >= 0) {
+                    close(hd->fd);
+                    hd->fd = -1;
+                }
                 stage = 0;
                 serial_refresh = true;
                 status = COMMS_TX_ERROR;

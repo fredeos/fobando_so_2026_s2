@@ -26,9 +26,13 @@ void init(Scheduler *sc, uint32_t sn, SchedulerType type){
 
     sc->type = type;
     sc->on_selection = NULL;
+    sc->on_task_released = NULL;
+    sc->on_task_completed = NULL;
+    sc->on_deadline_miss = NULL;
     sc->task_count = 0;
     sc->job_count = 0;
     sc->current_tick = 0;
+    sc->last_selected_job_id = UINT32_MAX;
     sc->sn = sn;
     sc->free_count = MAX_JOBS;
 
@@ -172,6 +176,8 @@ bool release_job(Scheduler *sc, uint32_t task_index) {
     job->ut_remaining = task->W;
     job->active = true;
     sc->job_count++;
+    if (sc->on_task_released != NULL)
+        sc->on_task_released(task->id, job->release, sc->current_tick);
 
     return true;
 }
@@ -268,6 +274,9 @@ bool execute_job_tick(Scheduler *sc, int job_index) {
     job->ut_remaining -= uts;
 
     if (job->ut_remaining == 0) {
+        if (sc->on_task_completed != NULL)
+            sc->on_task_completed(job->task->id, job->release,
+                                  sc->current_tick + 1u);
 
         if (job->task->type == 'S') {
 
@@ -339,6 +348,7 @@ bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
 
     // Use UINT32_MAX to indicate that no task has been selected yet.
     *selected_task_id = UINT32_MAX;
+    sc->last_selected_job_id = UINT32_MAX;
 
     // Release periodic jobs that become ready at the current tick.
     check_periodic_releases(sc);
@@ -357,6 +367,7 @@ bool scheduler_run_tick(Scheduler *sc, uint32_t *selected_task_id)
         }
 
         *selected_task_id = job->task->id;
+        sc->last_selected_job_id = job->release;
         if (sc->on_selection != NULL) sc->on_selection(*selected_task_id);
 
         if (!execute_job_tick(sc, job_index)) {
@@ -412,6 +423,8 @@ static void check_deadline_misses(Scheduler *sc)
         sc->deadline_miss_count++;
         sc->last_missed_task_id = job->task->id;
         sc->last_missed_deadline = job->deadline;
+        if (sc->on_deadline_miss != NULL)
+            sc->on_deadline_miss(job->task->id, job->release, sc->current_tick);
 
         // Abort the job and return its slot to the free list.
         free_job(sc, i);

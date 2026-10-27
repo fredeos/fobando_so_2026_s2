@@ -33,8 +33,9 @@ CRC no fueron reemplazados: se añadió una capa de contenido tipado sobre ellos
 
 El flujo implementado configura ambos nodos, mide su capacidad en unidades de
 trabajo por tick (`UT/tick`), admite y despliega tareas, e inicia o pausa el
-scheduler de forma remota. El Host conserva abiertas las conexiones seriales
-después del despliegue y acepta los comandos `start`, `stop` y `exit`.
+scheduler de forma remota. El Host conserva abiertas las conexiones seriales,
+recibe eventos de los nodos y genera reportes CSV/HTML al cerrar la sesión con
+`q`. La consola también acepta `start` y `stop`.
 
 ## 2. Capas de comunicación
 
@@ -188,10 +189,9 @@ falla la serialización. La función no reserva memoria dinámica.
 
 El serializador conoce los tipos declarados en el contrato común —entre ellos
 `CONFIG`, calibración, despliegue de tareas, `START`, eventos, reportes, ACK y
-NACK—, pero que un tipo se pueda serializar no significa que ya esté conectado
-al flujo de ejecución del Host o implementado en el comportamiento del
-firmware. En este flujo están conectados CONFIG/ACK,
-CALIBRATE_REQUEST/CALIBRATE_RESPONSE y DEPLOY_TASK con su ACK/NACK.
+NACK—. El Host registra las decisiones de admisión, calibración e inicio/pausa;
+los nodos transmiten por el enlace serial liberaciones, ejecuciones,
+finalizaciones y plazos perdidos.
 
 ### Parser
 
@@ -445,8 +445,8 @@ El Host permanece en una consola después de desplegar las tareas. `start` y
 `stop` sin argumento envían el comando a ambos nodos; `start 1`, `stop 1`,
 `start 2` y `stop 2` controlan solamente el nodo indicado. Cada nodo responde
 de forma independiente: un NACK o timeout de un dispositivo no deshace ni
-detiene el scheduler del otro. `exit` envía STOP a ambos antes de cerrar los
-enlaces. La ejecución comienza solamente si el nodo tiene tareas guardadas,
+detiene el scheduler del otro. `q` cierra la sesión; el Host envía STOP a los
+nodos que siguen activos y genera el reporte. La ejecución comienza solamente si el nodo tiene tareas guardadas,
 tick configurado y calibración válida. Si no tiene tareas, rechaza START con
 `REJECT_NO_TASKS`. La primera recepción válida de START construye el scheduler
 a partir del `TaskStore`; START posterior reanuda el estado existente.
@@ -467,8 +467,12 @@ desincronizados el `TaskStore` y el scheduler ya construido. Los eventos
 `TRIGGER_SPORADIC` se aceptan únicamente mientras se ejecuta y si el ID coincide
 con la tarea esporádica registrada.
 
-Los ticks periódicos ejecutan el workload local de `unidad_trabajo()`; esta
-versión no transmite todavía eventos de ejecución ni `TICK_REPORT` al Host.
+Los ticks periódicos ejecutan el workload local de `unidad_trabajo()`. El
+scheduler notifica liberaciones, finalizaciones y plazos perdidos a una cola
+local del nodo; los tramos de ejecución/idle se agregan según
+`report_every_ticks`. El nodo envía esos eventos como `MSG_EVENT` al responder
+al polling `PING` habitual del Host. El Host solo los transporta a la cola de
+reportes: no vuelve a calcular ni a inferir los plazos perdidos.
 El transporte serial no proporciona inicio simultáneo sincronizado: si se usa
 un comando sin argumento, cada nodo empieza su primer tick después de recibir
 su START respectivo.
@@ -551,15 +555,15 @@ El Makefile también contiene dependencias de enlace para que:
 | `src/host/config/task_parser.c` | Carga las definiciones de tareas desde el CSV configurado. |
 | `src/host/comms/comms.h` | Define la capacidad de buffers para el payload JSON. |
 | `src/host/comms/comms.c` | Transporta mensajes y sincroniza buffers; permite que JSON de aplicación reemplace texto heartbeat antiguo en RX. |
-| `src/nodes/esp32/main/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP y ticks del nodo 1 sin bloquear el polling serial. |
-| `src/nodes/pico/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP y ticks del nodo 2 sin bloquear el polling serial. |
+| `src/nodes/esp32/main/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP, ticks y transmisión de eventos del nodo 1. |
+| `src/nodes/pico/main.c` | Maneja CONFIG, calibración, despliegue, START/STOP, ticks y transmisión de eventos del nodo 2. |
 | `src/nodes/esp32/src/calibrator.c` | Mide unidades de trabajo por intervalo del ESP32. |
 | `src/nodes/pico/src/calibrator.c` | Mide unidades de trabajo por intervalo del Pico. |
 | `src/nodes/scheduler/task.h` | Define `SchedulerTask` y `Job` para separar el tipo de ejecución del `Task` compartido. |
 | `src/nodes/scheduler/task_conversion.h` | Expone la conversión de `StoredTask` a `SchedulerTask`. |
 | `src/nodes/scheduler/task_conversion.c` | Valida y convierte campos, incluyendo el costo guardado a `C`. |
 | `src/nodes/scheduler/scheduler_runtime.c` | Construye el scheduler desde `TaskStore`, pausa/reanuda y permite ejecutar ticks/eventos esporádicos. |
-| `tests/test_scheduler_runtime.c` | Verifica START inicial, pausa, preservación del estado y reanudación. |
+| `tests/test_scheduler_runtime.c` | Verifica START, pausa/reanudación y callbacks de liberación, finalización y plazo perdido. |
 | `include/common/task.h` | Define el máximo común de 8 tareas por nodo, compartido por almacenamiento y scheduler. |
 | `include/common/task_store.h` | Define `StoredTask` (tarea y costo) y `TaskStore` (tabla fija). |
 | `src/common/task_store.c` | Valida, detecta duplicados/límites y almacena tareas recibidas. |
@@ -702,13 +706,13 @@ Si CONFIG/ACK funciona pero vuelve a ocurrir un timeout de calibración, revisar
 
 - El Host implementa CONFIG/ACK, calibración, admisión, asignación y
   despliegue/almacenamiento de las tareas admitidas.
-- Los nodos usan `tick_ms` y el algoritmo recibido en CONFIG. La frecuencia de
-  reportes todavía no se aplica.
+- Los nodos usan `tick_ms`, el algoritmo y `report_every_ticks` recibidos en
+  CONFIG. Los eventos de runtime y los plazos perdidos viajan como mensajes
+  `EVENT` en respuesta al polling serial del Host.
 - El Host usa las capacidades calibradas para llamar al `Planner`, pero la
   tabla resultante solo vive durante esta sesión del Host.
 - `TaskStore` es RAM volátil; al reiniciar un nodo se vacía.
 - El inicio de ambos nodos no es simultáneo de forma sincronizada.
-- No se generan `EVENT` o `TICK_REPORT` para informar al Host del avance.
 - El Host envía STOP al salir normalmente; si el proceso termina abruptamente
   o se pierde el enlace, el nodo no cuenta con un mecanismo de timeout que lo
   detenga automáticamente.
@@ -721,5 +725,7 @@ cada MCU y ejecutar:
 ```
 
 En la consola del Host, escribir `start` para comenzar, `stop` para pausar,
-`start` de nuevo para reanudar o `exit` para detener ambos nodos y cerrar la
-sesión. La ejecución física de este flujo debe validarse en ambos dispositivos.
+`start` de nuevo para reanudar o `q` para detener ambos nodos y cerrar la
+sesión. Al terminar, revisar `output/report_*/report.html` y
+`output/report_*/events.csv`. La ejecución física debe validarse en ambos
+dispositivos.

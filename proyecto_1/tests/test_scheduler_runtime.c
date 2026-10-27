@@ -5,6 +5,41 @@
 #include "common/task_store.h"
 #include "scheduler_runtime.h"
 
+typedef struct {
+    uint32_t releases;
+    uint32_t completions;
+    uint32_t misses;
+    uint32_t task_id;
+    uint32_t job_id;
+    uint32_t tick;
+} RuntimeEvents;
+
+static RuntimeEvents runtime_events;
+
+static void capture_release(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    ++runtime_events.releases;
+    runtime_events.task_id = task_id;
+    runtime_events.job_id = job_id;
+    runtime_events.tick = tick;
+}
+
+static void capture_completion(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    ++runtime_events.completions;
+    runtime_events.task_id = task_id;
+    runtime_events.job_id = job_id;
+    runtime_events.tick = tick;
+}
+
+static void capture_miss(uint32_t task_id, uint32_t job_id, uint32_t tick)
+{
+    ++runtime_events.misses;
+    runtime_events.task_id = task_id;
+    runtime_events.job_id = job_id;
+    runtime_events.tick = tick;
+}
+
 static void test_start_pause_and_resume(void)
 {
     TaskStore store;
@@ -97,11 +132,63 @@ static void test_start_rejects_empty_store(void)
     assert(!runtime.prepared && !runtime.running);
 }
 
+static void test_runtime_event_callbacks(void)
+{
+    TaskStore store;
+    task_store_init(&store);
+    const Task task = {
+        .id = 33u, .type = TASK_PERIODIC, .work = 6u,
+        .period = 10u, .deadline = 4u, .criticality = 1
+    };
+    assert(task_store_add(&store, &task, 2u) == REJECT_NONE);
+
+    SchedulerRuntime runtime;
+    scheduler_runtime_init(&runtime);
+    RejectReason reason = REJECT_INVALID_STATE;
+    assert(scheduler_runtime_start(&runtime, &store, 4u, RMS, &reason));
+    runtime_events = (RuntimeEvents){0};
+    runtime.scheduler.on_task_released = capture_release;
+    runtime.scheduler.on_task_completed = capture_completion;
+    runtime.scheduler.on_deadline_miss = capture_miss;
+
+    uint32_t selected_task_id = UINT32_MAX;
+    assert(scheduler_runtime_run_tick(&runtime, &selected_task_id));
+    assert(runtime_events.releases == 1u);
+    assert(runtime_events.task_id == task.id && runtime_events.job_id == 0u);
+    assert(runtime_events.tick == 0u);
+    assert(runtime.scheduler.last_selected_job_id == 0u);
+
+    assert(scheduler_runtime_run_tick(&runtime, &selected_task_id));
+    assert(runtime_events.completions == 1u);
+    assert(runtime_events.task_id == task.id && runtime_events.job_id == 0u);
+    assert(runtime_events.tick == 2u);
+    assert(runtime_events.misses == 0u);
+
+    task_store_init(&store);
+    const Task overdue_task = {
+        .id = 34u, .type = TASK_PERIODIC, .work = 5u,
+        .period = 10u, .deadline = 1u, .criticality = 1
+    };
+    assert(task_store_add(&store, &overdue_task, 1u) == REJECT_NONE);
+    scheduler_runtime_init(&runtime);
+    assert(scheduler_runtime_start(&runtime, &store, 1u, RMS, &reason));
+    runtime_events = (RuntimeEvents){0};
+    runtime.scheduler.on_task_released = capture_release;
+    runtime.scheduler.on_task_completed = capture_completion;
+    runtime.scheduler.on_deadline_miss = capture_miss;
+    assert(scheduler_runtime_run_tick(&runtime, &selected_task_id));
+    assert(scheduler_runtime_run_tick(&runtime, &selected_task_id));
+    assert(runtime_events.misses == 1u);
+    assert(runtime_events.task_id == overdue_task.id && runtime_events.job_id == 0u);
+    assert(runtime_events.tick == 1u);
+}
+
 int main(void)
 {
     test_start_pause_and_resume();
     test_sporadic_messages_require_running_matching_task();
     test_start_rejects_empty_store();
+    test_runtime_event_callbacks();
     puts("OK: scheduler runtime tests");
     return 0;
 }
