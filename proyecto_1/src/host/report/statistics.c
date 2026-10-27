@@ -303,7 +303,10 @@ bool statistics_build(const Event *events, size_t count, ReportStatistics *out)
                 break;
             case EVENT_TASK_ACCEPTED: update_load(&statistics, node); break;
             case EVENT_TASK_SWITCH: ++node->switches; break;
-            case EVENT_SERIAL_BAD_FRAME: ++node->bad_frames; break;
+            case EVENT_SERIAL_BAD_FRAME:
+                node->bad_frames += event->detail > 0
+                    ? (uint32_t)event->detail : 1u;
+                break;
             case EVENT_EXECUTION_SLICE:
             case EVENT_IDLE_SLICE: {
                 uint64_t end = event->tick + event->duration_ticks;

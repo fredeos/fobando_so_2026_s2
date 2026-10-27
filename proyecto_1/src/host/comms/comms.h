@@ -87,6 +87,7 @@ typedef struct {
     size_t receive_count;
     bool receive_overflow_pending;
     uint64_t heartbeat_count;
+    uint64_t bad_frame_count;
     // << Thread synchronization >>
     pthread_mutex_t mutex;  // pthread mutex
     pthread_cond_t  cond;   // pthread condition variable
@@ -198,6 +199,8 @@ comms_status_t comms_receive_enqueue(
 );
 
 uint64_t comms_heartbeat_count(comms_handler_t* handler);
+void comms_note_bad_frame(comms_handler_t* handler);
+uint64_t comms_take_bad_frame_count(comms_handler_t* handler);
 bool comms_reports_drained_since(
     comms_handler_t* handler,
     uint64_t heartbeat_baseline

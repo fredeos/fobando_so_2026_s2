@@ -87,7 +87,8 @@ STOP conserva el estado preparado y START lo reanuda. Antes de volver a abrir
 el host para una sesión nueva, reiniciar las placas: el firmware actual rechaza
 CONFIG si el scheduler ya fue preparado por un START anterior. Los nodos envían
 al host sus eventos de ejecución y de plazo perdido por el mismo enlace serial;
-el Host los incorpora al reporte sin recalcular los plazos. Reiniciar ambas
+el Host los incorpora al reporte sin recalcular los plazos. Las tramas completas
+con CRC inválido se descartan y se contabilizan en el reporte. Reiniciar ambas
 placas antes del siguiente intento.
 
 La cola interna que comunica los procesos del Host usa un objeto de memoria

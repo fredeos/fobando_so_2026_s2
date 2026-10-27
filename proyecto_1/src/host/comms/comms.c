@@ -47,6 +47,7 @@ comms_status_t comms_init_handler(
     handler->receive_count = 0u;
     handler->receive_overflow_pending = false;
     handler->heartbeat_count = 0u;
+    handler->bad_frame_count = 0u;
 
     handler->sent.content = NULL;
     handler->sent.size = 0;
@@ -261,6 +262,27 @@ uint64_t comms_heartbeat_count(comms_handler_t* handler)
         return 0u;
     pthread_mutex_lock(&handler->mutex);
     uint64_t count = handler->heartbeat_count;
+    pthread_mutex_unlock(&handler->mutex);
+    return count;
+}
+
+void comms_note_bad_frame(comms_handler_t* handler)
+{
+    if (handler == NULL)
+        return;
+    pthread_mutex_lock(&handler->mutex);
+    if (handler->bad_frame_count < UINT64_MAX)
+        ++handler->bad_frame_count;
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+uint64_t comms_take_bad_frame_count(comms_handler_t* handler)
+{
+    if (handler == NULL)
+        return 0u;
+    pthread_mutex_lock(&handler->mutex);
+    uint64_t count = handler->bad_frame_count;
+    handler->bad_frame_count = 0u;
     pthread_mutex_unlock(&handler->mutex);
     return count;
 }
@@ -532,6 +554,8 @@ void* comms_handler(void* arg){
                                 hd->dev);
                         }
                     }
+                } else {
+                    comms_note_bad_frame(hd);
                 }
                 last_activity_ms = get_time_ms();
                 // [Move to message change]

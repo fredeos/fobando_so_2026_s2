@@ -61,6 +61,8 @@ static void fixture(void)
     add(EVENT_EXECUTION_SLICE, 2u, 1u, 1u, 0u, 2u);
     add(EVENT_IDLE_SLICE, 2u, 0u, 0u, 2u, 1u);
     add(EVENT_NODE_FAILED, 2u, 0u, 0u, 3u, 0u);
+    add(EVENT_SERIAL_BAD_FRAME, 2u, 0u, 0u, 3u, 0u);
+    events[count - 1u].detail = 4;
 
     /* Dos ticks distintos llegan fuera de orden; los empates conservan su orden */
     Event temporary = events[6];
@@ -106,6 +108,7 @@ static void test_statistics(void)
     const NodeStatistics *second = node(&statistics, 2u);
     assert(second->observed_ticks == 3u && second->busy_ticks == 2u);
     assert(second->failures == 1u && second->theoretical_final == 0.0L);
+    assert(second->bad_frames == 4u);
     statistics_free(&statistics);
 
     /* Los tramos superpuestos se detectan y no duplican tiempo ocupado */

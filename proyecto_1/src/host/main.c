@@ -538,6 +538,37 @@ static bool wait_for_control_reply(
     }
 }
 
+static bool publish_bad_frame_reports(
+    EventQueue *queue,
+    const uint32_t node_ids[EXPECTED_DEVICES],
+    comms_handler_t handlers[EXPECTED_DEVICES],
+    const bool enabled[EXPECTED_DEVICES]
+)
+{
+    bool success = true;
+    for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        if (!enabled[i])
+            continue;
+        uint64_t count = comms_take_bad_frame_count(&handlers[i]);
+        while (count > 0u) {
+            uint32_t batch = count > INT32_MAX ? (uint32_t)INT32_MAX :
+                (uint32_t)count;
+            Event event = {
+                .type = EVENT_SERIAL_BAD_FRAME,
+                .source = EVENT_SOURCE_NODE,
+                .node_id = node_ids[i],
+                .tick = latest_node_ticks[i],
+                .host_time_ns = host_time_ns(),
+                .detail = (int32_t)batch
+            };
+            if (!publish_report_event(queue, &event))
+                success = false;
+            count -= batch;
+        }
+    }
+    return success;
+}
+
 /**
  * @brief Procesa los mensajes de reporte disponibles en los enlaces seriales.
  *
@@ -556,7 +587,10 @@ static bool pump_node_reports(
     comms_handler_t handlers[EXPECTED_DEVICES]
 )
 {
-    bool success = true;
+    const bool enabled[EXPECTED_DEVICES] = {true, true};
+    bool success = publish_bad_frame_reports(
+        queue, node_ids, handlers, enabled
+    );
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
         for (;;) {
             char response[COMMS_MESSAGE_CAPACITY];
@@ -1330,6 +1364,10 @@ static int serial_report_worker_stop(EventQueue *queue, void *context)
         success = false;
     stop_handlers(session->handlers, session->handler_started,
                   session->initialized_count);
+    if (!publish_bad_frame_reports(
+            queue, session->node_ids, session->handlers,
+            session->handler_started))
+        success = false;
     return success ? 0 : 1;
 }
 

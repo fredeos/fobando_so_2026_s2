@@ -68,6 +68,21 @@ static void test_heartbeats_do_not_fill_fifo(void)
     destroy_handler(&handler);
 }
 
+static void test_bad_frame_count_is_drained(void)
+{
+    comms_handler_t handler;
+    init_handler(&handler, 0u);
+
+    comms_note_bad_frame(&handler);
+    comms_note_bad_frame(&handler);
+    assert(comms_take_bad_frame_count(&handler) == 2u);
+    assert(comms_take_bad_frame_count(&handler) == 0u);
+    comms_note_bad_frame(&handler);
+    assert(comms_take_bad_frame_count(&handler) == 1u);
+
+    destroy_handler(&handler);
+}
+
 static void test_overflow_is_reported_without_reordering(void)
 {
     comms_handler_t handler;
@@ -118,6 +133,7 @@ int main(void)
 {
     test_fifo_preserves_messages();
     test_heartbeats_do_not_fill_fifo();
+    test_bad_frame_count_is_drained();
     test_overflow_is_reported_without_reordering();
     test_priority_filter_and_forced_receive();
     puts("OK: serial receive FIFO tests");
