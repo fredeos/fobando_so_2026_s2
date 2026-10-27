@@ -6,7 +6,7 @@ CC := gcc
 MODE ?= debug
 
 ESP_IDF := idf.py
-CMAKE := cmake
+CMAKE := $(shell command -v cmake)
 BASH := bash
 
 # ============================================================
@@ -23,8 +23,8 @@ ESP_SRC_DIR    := $(SRC_DIR)/nodes/esp32
 PICO_SRC_DIR   := $(SRC_DIR)/nodes/pico
 
 HOST_BUILD_DIR  := $(BUILD_DIR)/host
-ESP_BUILD_DIR   := $(BUILD_DIR)/esp32
-PICO_BUILD_DIR  := $(BUILD_DIR)/pico
+ESP_BUILD_DIR   := $(ESP_SRC_DIR)/build/esp32
+PICO_BUILD_DIR  := $(PICO_SRC_DIR)/build/pico
 
 
 # ============================================================
@@ -32,8 +32,15 @@ PICO_BUILD_DIR  := $(BUILD_DIR)/pico
 # ============================================================
 
 DEV ?= USB0
-IDF_ACTIVATE := $(HOME)/esp/esp-idf/export.sh
-export PICO_SDK_PATH := $(HOME)/pico-sdk
+ESP_PORT ?= /dev/tty$(DEV)
+PICO_PORT ?= /dev/ttyACM0
+IDF_ACTIVATE ?= $(HOME)/esp/esp-idf/export.sh
+ESP_ALGORITHM ?= RMS
+ESP_TICK_MS ?= 1000
+ESP_LOCAL_TEST ?= OFF
+PICO_LOCAL_TEST ?= OFF
+PICO_SDK_PATH ?= $(HOME)/pico-sdk
+export PICO_SDK_PATH
 
 # ============================================================
 # EXECUTABLE TARGETS
@@ -67,6 +74,7 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
           -Iinclude \
+          -Isrc/host \
           -Ithird_party/coreJSON \
           -Isrc/nodes/scheduler
 
@@ -175,7 +183,7 @@ TEST_OBJS := \
     $(REPORT_TEST_OBJ) \
     $(REPORT_SESSION_TEST_OBJ) \
     $(SCHEDULER_RUNTIME_TEST_OBJ)
-	
+
 
 # ============================================================
 # AUTOMATIC DEPENDENCIES
@@ -437,8 +445,44 @@ test-edf: $(EDF_TEST)
 # RUN HOST
 # ============================================================
 
-run: $(TARGET)
-	./$(TARGET)
+# Se pueden usar puertos estables /dev/serial/by-id/ o /dev/ttyUSB* y ttyACM*.
+.PHONY: help ports check-ports pico-build
+run: $(TARGET) check-ports
+	"$(TARGET)" "$(ESP_PORT)" "$(PICO_PORT)"
+
+check-ports:
+	@for port in "$(ESP_PORT)" "$(PICO_PORT)"; do \
+	    if [ ! -c "$$port" ]; then \
+	        echo "No existe el puerto serial: $$port" >&2; \
+	        echo "Use make ports y luego make run ESP_PORT=/ruta/esp PICO_PORT=/ruta/pico" >&2; \
+	        exit 1; \
+	    fi; \
+	    if [ ! -r "$$port" ] || [ ! -w "$$port" ]; then \
+	        echo "Sin permisos de lectura/escritura: $$port (revise el grupo dialout)." >&2; \
+	        exit 1; \
+	    fi; \
+	done
+
+ports:
+	@for port in /dev/serial/by-id/* /dev/ttyUSB* /dev/ttyACM*; do \
+	    if [ -e "$$port" ]; then ls -l "$$port"; fi; \
+	done
+
+help:
+	@printf '%s\n' \
+	    'Ejecutar desde proyecto_1. Guia completa: README.md' \
+	    'make                         Compilar el host' \
+	    'make ports                   Listar puertos conectados' \
+	    'make run ESP_PORT=/ruta/esp PICO_PORT=/ruta/pico' \
+	    '                             Compilar y ejecutar el host con ambos nodos' \
+	    'make esp-build               Compilar firmware ESP32 (requiere ESP-IDF)' \
+	    'make esp-flash ESP_PORT=/ruta/esp' \
+	    '                             Cargar el firmware compilado al ESP32' \
+	    'make pico-build PICO_SDK_PATH=/ruta/pico-sdk CMAKE=/usr/bin/cmake' \
+	    '                             Generar src/nodes/pico/build/pico/pico.uf2' \
+	    'Pico: copiar pico.uf2 a RPI-RP2 tras conectar con BOOTSEL presionado.' \
+	    'Consola del host: start, stop, start 1, start 2, stop 1, stop 2, exit.' \
+	    'Predeterminados: ESP_PORT=/dev/ttyUSB0 (DEV=USB0), PICO_PORT=/dev/ttyACM0.'
 
 # ============================================================
 # RUN PLANNER DEMO
@@ -481,37 +525,49 @@ mcu-config:
 # ESP: make rules
 # ============================================================
 
+# Usa un entorno ESP-IDF activo o IDF_ACTIVATE=/ruta/al/export.sh.
+.PHONY: esp-build esp-flash esp-monitor test-esp-local
 esp-build:
-	@mkdir -p $(dir ${ESP_BUILD_DIR})
-	@echo "Building ESP32 project files..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) build'
-	@echo "[DONE]"
-	@echo ""
+	@mkdir -p $(ESP_BUILD_DIR)
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -DESP_LOCAL_TEST=$(ESP_LOCAL_TEST) -DLOCAL_ALGORITHM=$(ESP_ALGORITHM) -DLOCAL_TICK_MS=$(ESP_TICK_MS) build'
 
 esp-flash:
-	@echo "Flashing ESP32..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p /dev/tty$(DEV) flash'
-	@echo "[DONE]"
-	@echo ""
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p "$(ESP_PORT)" flash'
+
+esp-monitor:
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC_DIR) -B $(ESP_BUILD_DIR) -p "$(ESP_PORT)" monitor'
+
+# La misma regresión de cinco tareas se ejecuta sobre el fixture del ESP32.
+test-esp-local: $(OUT_DIR)/test_esp_local
+	./$(OUT_DIR)/test_esp_local
+
+$(OUT_DIR)/test_esp_local: tests/test_pico_local.c \
+    src/nodes/esp32/main/local_test.h src/nodes/scheduler/scheduler.c \
+    src/nodes/scheduler/scheduler.h src/nodes/scheduler/task.h \
+    src/nodes/scheduler/rms.c src/nodes/scheduler/edf.c src/common/ut.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc/nodes/esp32/main tests/test_pico_local.c \
+	    src/nodes/scheduler/scheduler.c src/nodes/scheduler/rms.c \
+	    src/nodes/scheduler/edf.c src/common/ut.c -o $@ $(LDLIBS)
 
 # ============================================================
 # Pico: make rules
 # ============================================================
 
 pico-build:
-	@mkdir -p $(dir ${PICO_BUILD_DIR})
+	@mkdir -p $(PICO_BUILD_DIR)
 	@echo "Building Pi Pico project files..."
-	cmake -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR) -G "Unix Makefiles" -DPICO_BOARD=pico
+	$(CMAKE) -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR) -G "Unix Makefiles" -DPICO_BOARD=pico -DPICO_LOCAL_TEST=$(PICO_LOCAL_TEST)
 	@echo "Generating Pi Pico binaries..."
-	cmake --build $(PICO_BUILD_DIR)
+	$(CMAKE) --build $(PICO_BUILD_DIR)
 	@echo "[DONE]"
 
 picow-build:
 	@mkdir -p $(dir ${PICO_BUILD_DIR})
 	@echo "Building Pi Pico project files..."
-	cmake -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR)_w -G "Unix Makefiles" -DPICO_BOARD=pico_w
+	$(CMAKE) -S $(PICO_SRC_DIR) -B $(PICO_BUILD_DIR)_w -G "Unix Makefiles" -DPICO_BOARD=pico_w
 	@echo "Generating Pi Pico binaries..."
-	cmake --build $(PICO_BUILD_DIR)_w
+	$(CMAKE) --build $(PICO_BUILD_DIR)_w
 	@echo "[DONE]"
 
 # ============================================================
@@ -526,3 +582,17 @@ clean:
 # ============================================================
 
 -include $(DEPS)
+
+# Prueba del fixture local de Pico en Linux, sin SDK ni hardware.
+.PHONY: test-pico-local
+test-pico-local: $(OUT_DIR)/test_pico_local
+	./$(OUT_DIR)/test_pico_local
+
+$(OUT_DIR)/test_pico_local: tests/test_pico_local.c \
+    src/nodes/pico/local_test.h src/nodes/scheduler/scheduler.c \
+    src/nodes/scheduler/scheduler.h src/nodes/scheduler/task.h \
+    src/nodes/scheduler/rms.c src/nodes/scheduler/edf.c src/common/ut.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc/nodes/pico tests/test_pico_local.c \
+	    src/nodes/scheduler/scheduler.c src/nodes/scheduler/rms.c \
+	    src/nodes/scheduler/edf.c src/common/ut.c -o $@ $(LDLIBS)

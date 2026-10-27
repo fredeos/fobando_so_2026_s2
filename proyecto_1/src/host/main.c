@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "host/report_session.h"
 
 #include "common/message_parser.h"
 #include "host/config.h"
@@ -745,6 +749,21 @@ static void stop_handlers(comms_handler_t *handlers, size_t count)
  */
 int main(int argc, char *argv[])
 {
+    /* Modo aislado para verificar reportes y cierre sin hardware ni protocolo */
+    if (argc >= 2 && strcmp(argv[1], "--report-demo") == 0) {
+        if (argc > 3) {
+            fprintf(stderr, "Usage: %s --report-demo [output_directory]\n", argv[0]);
+            return 1;
+        }
+        char directory[128];
+        if (argc == 2 && mkdir("output", 0775) != 0 && errno != EEXIST) {
+            perror("output");
+            return 1;
+        }
+        snprintf(directory, sizeof(directory), "output/report_%ld_%ld", (long)time(NULL), (long)getpid());
+        return report_demo_run(argc == 3 ? argv[2] : directory);
+    }
+
     if (argc != 1 + EXPECTED_DEVICES) {
         fprintf(stderr, "Usage: %s <ESP32 serial port> <Pico serial port>\n", argv[0]);
         return 1;

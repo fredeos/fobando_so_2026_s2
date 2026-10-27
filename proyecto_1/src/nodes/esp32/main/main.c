@@ -3,6 +3,10 @@
 #include <inttypes.h>
 
 #include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_timer.h"
 
 #include "common/protocol.h"
@@ -15,10 +19,10 @@
 #include "serial/serial.h"
 #include "gpio/gpio.h"
 
-#define LED0 26
-#define LED1 25
-#define LED2 33
-#define LED3 32
+#define LED0 18
+#define LED1 19
+#define LED2 21
+#define LED3 22
 
 #define UART_PORT   UART_NUM_0
 
@@ -32,6 +36,132 @@ static uint64_t next_tick_us;
 /* Tabla temporal: los despliegues aceptados desaparecen al reiniciar el MCU. */
 static TaskStore deployed_tasks;
 static SchedulerRuntime scheduler_runtime;
+
+/* Aporte de hardware: LEDs del scheduler y botón con pull-down externo.
+ * El procesamiento de mensajes y el runtime de comunicación siguen debajo. */
+#define HARDWARE_BUTTON_PIN 27u
+#define HARDWARE_MISS_PIN 15u
+static const uint32_t hardware_task_pins[] = {LED0, LED1, LED2, LED3};
+static uint32_t hardware_last_misses;
+static bool hardware_button_stable_high;
+static volatile uint64_t hardware_button_edge_us;
+static volatile uint32_t hardware_button_events;
+
+static void hardware_show_task(uint32_t id)
+{
+    uint32_t code = id == UINT32_MAX ? 0u : id;
+    for (unsigned bit = 0; bit < 4; ++bit)
+        board_gpio_write(hardware_task_pins[bit],
+                         code & (1u << bit) ? GPIO_HIGH : GPIO_LOW);
+}
+
+/* El scheduler llama este observador después de revisar plazos y antes de UT. */
+static void hardware_show_selection(uint32_t task_id)
+{
+    hardware_show_task(task_id);
+    uint32_t misses = scheduler_runtime.scheduler.deadline_miss_count;
+    board_gpio_write(HARDWARE_MISS_PIN,
+                     misses != hardware_last_misses ? GPIO_HIGH : GPIO_LOW);
+    hardware_last_misses = misses;
+}
+
+static portMUX_TYPE hardware_button_lock = portMUX_INITIALIZER_UNLOCKED;
+static gptimer_handle_t hardware_debounce_timer;
+static TaskHandle_t hardware_main_task;
+
+static void hardware_clear_button(void)
+{
+    portENTER_CRITICAL(&hardware_button_lock);
+    hardware_button_events = 0;
+    portEXIT_CRITICAL(&hardware_button_lock);
+}
+
+/* La IRQ GPIO solo registra el último flanco. */
+static void hardware_button_irq(void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL_ISR(&hardware_button_lock);
+    hardware_button_edge_us = (uint64_t)esp_timer_get_time();
+    portEXIT_CRITICAL_ISR(&hardware_button_lock);
+}
+
+/* Alarma auxiliar: filtra pulsación y liberación durante 30 ms estables.
+ * No ejecuta trabajos, no imprime ni cambia la calendarización. */
+static bool hardware_debounce_irq(gptimer_handle_t timer,
+    const gptimer_alarm_event_data_t *event, void *arg)
+{
+    (void)timer; (void)event; (void)arg;
+    gpio_level_t level = GPIO_LOW;
+    portENTER_CRITICAL_ISR(&hardware_button_lock);
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    if (board_gpio_read(HARDWARE_BUTTON_PIN, &level) == 0 &&
+        now - hardware_button_edge_us >= 30000u &&
+        (level == GPIO_HIGH) != hardware_button_stable_high) {
+        hardware_button_stable_high = level == GPIO_HIGH;
+        if (hardware_button_stable_high && hardware_button_events < UINT32_MAX)
+            ++hardware_button_events;
+    }
+    portEXIT_CRITICAL_ISR(&hardware_button_lock);
+    /* Despertar el bucle desde la alarma ya existente permite dormir entre
+     * polls. FreeRTOS no selecciona los trabajos de RMS/EDF. */
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(hardware_main_task, &woken);
+    return woken == pdTRUE;
+}
+
+static bool hardware_init(void)
+{
+    hardware_main_task = xTaskGetCurrentTaskHandle();
+    if (board_gpio_init(HARDWARE_MISS_PIN, GPIO_OUTPUT) != 0 ||
+        board_gpio_write(HARDWARE_MISS_PIN, GPIO_LOW) != 0 ||
+        board_gpio_init(HARDWARE_BUTTON_PIN, GPIO_INPUT) != 0)
+        return false;
+    hardware_button_edge_us = (uint64_t)esp_timer_get_time();
+    if (gpio_set_intr_type(HARDWARE_BUTTON_PIN, GPIO_INTR_ANYEDGE) != ESP_OK ||
+        gpio_install_isr_service(0) != ESP_OK ||
+        gpio_isr_handler_add(HARDWARE_BUTTON_PIN, hardware_button_irq, NULL) != ESP_OK)
+        return false;
+    gptimer_config_t config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000u
+    };
+    gptimer_event_callbacks_t callbacks = {.on_alarm = hardware_debounce_irq};
+    gptimer_alarm_config_t alarm = {
+        .alarm_count = 1000u, .flags.auto_reload_on_alarm = true
+    };
+    return gptimer_new_timer(&config, &hardware_debounce_timer) == ESP_OK &&
+        gptimer_register_event_callbacks(hardware_debounce_timer, &callbacks, NULL) == ESP_OK &&
+        gptimer_set_alarm_action(hardware_debounce_timer, &alarm) == ESP_OK &&
+        gptimer_enable(hardware_debounce_timer) == ESP_OK &&
+        gptimer_start(hardware_debounce_timer) == ESP_OK;
+}
+
+static uint32_t hardware_take_button_events(void)
+{
+    portENTER_CRITICAL(&hardware_button_lock);
+    uint32_t events = hardware_button_events;
+    hardware_button_events = 0;
+    portEXIT_CRITICAL(&hardware_button_lock);
+    return events;
+}
+
+static void hardware_button_poll(void)
+{
+    uint32_t events = hardware_take_button_events();
+    if (!scheduler_runtime.running || !scheduler_runtime.prepared)
+        return;
+    Scheduler *scheduler = &scheduler_runtime.scheduler;
+    uint32_t index = scheduler->sporadic_task_index;
+    if (index == UINT32_MAX || index >= scheduler->task_count)
+        return;
+    while (events-- > 0u) {
+        RejectReason reason;
+        (void)scheduler_runtime_trigger_sporadic(&scheduler_runtime,
+            scheduler->tasks[index].id, &reason);
+    }
+}
+
 
 /**
  * @brief Serializa una respuesta correlacionada con una solicitud recibida.
@@ -222,6 +352,11 @@ static bool prepare_response(
                 return serialize_reply(&incoming, MSG_NACK, reason, 0u,
                     response, response_capacity, response_length);
             }
+            scheduler_runtime.scheduler.on_selection = hardware_show_selection;
+            if (!was_running) {
+                hardware_last_misses = scheduler_runtime.scheduler.deadline_miss_count;
+                hardware_clear_button();
+            }
             if (!was_running)
                 next_tick_us = (uint64_t)esp_timer_get_time() +
                     (uint64_t)configured_tick_ms * 1000u;
@@ -231,6 +366,9 @@ static bool prepare_response(
 
         if (incoming.type == MSG_STOP) {
             scheduler_runtime_stop(&scheduler_runtime);
+            hardware_show_task(UINT32_MAX);
+            board_gpio_write(HARDWARE_MISS_PIN, GPIO_LOW);
+            hardware_clear_button();
             return serialize_reply(&incoming, MSG_ACK, REJECT_NONE, 0u,
                 response, response_capacity, response_length);
         }
@@ -274,6 +412,7 @@ static bool prepare_response(
  */
 static void run_scheduler_if_due(void)
 {
+    hardware_button_poll();
     if (!scheduler_runtime.running || configured_tick_ms == 0u)
         return;
 
@@ -283,7 +422,7 @@ static void run_scheduler_if_due(void)
 
     uint32_t selected_task_id;
     if (!scheduler_runtime_run_tick(&scheduler_runtime, &selected_task_id)) {
-        board_gpio_write(LED0, GPIO_HIGH);
+        hardware_show_task(15u);
         scheduler_runtime_stop(&scheduler_runtime);
         return;
     }
@@ -347,19 +486,21 @@ void app_main(void){
     board_gpio_write(LED1, GPIO_LOW);
     board_gpio_write(LED2, GPIO_LOW);
     board_gpio_write(LED3, GPIO_LOW);
+    if (!hardware_init()) setup_fail = true;
     // << Setup basic messages >>
     char response[MESSAGE_LEN];
     // << Procedure loop >>
     int state = 0;
 
-    if (setup_fail) board_gpio_write(LED0, GPIO_HIGH);
-    else board_gpio_write(LED1, GPIO_HIGH);
+    if (setup_fail) hardware_show_task(15u);
     while (1) {
-        if (setup_fail) continue;
+        if (setup_fail) {
+            /* Los LEDs ya indican el fallo; no ocupar CPU girando aquí. */
+            vTaskSuspend(NULL);
+            continue;
+        }
         // [RX state]
         if (state == 0){
-            board_gpio_write(LED2, GPIO_HIGH);
-            board_gpio_write(LED3, GPIO_LOW);
             // [Poll RX state machine]
             protocol_errno_t rx_errno = protocol_rx_poll(
                 &uart,
@@ -402,8 +543,6 @@ void app_main(void){
         }
         // [TX state]
         if (state == 1){
-            board_gpio_write(LED2, GPIO_LOW);
-            board_gpio_write(LED3, GPIO_HIGH);
             // [Poll TX state machine]
             protocol_errno_t tx_errno = protocol_tx_poll(
                 &uart,
@@ -417,5 +556,8 @@ void app_main(void){
             }
         }
         run_scheduler_if_due();
+        /* La alarma auxiliar de 1 ms despierta este bucle. Esta espera deja
+         * correr IDLE0 sin usar delay como temporización del scheduler. */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
 }

@@ -16,10 +16,8 @@ int board_gpio_init(uint32_t _pin, gpio_direction_t _mode){
                 ? GPIO_MODE_OUTPUT
                 : GPIO_MODE_INPUT,
 
-        .pull_up_en =
-            (_mode == GPIO_INPUT)
-                ? GPIO_PULLUP_ENABLE
-                : GPIO_PULLUP_DISABLE,
+        /* GPIO27 usa la resistencia pull-down externa del circuito. */
+        .pull_up_en = GPIO_PULLUP_DISABLE,
 
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
 
