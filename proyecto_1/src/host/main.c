@@ -40,7 +40,6 @@ typedef struct {
     uint32_t node_ids[EXPECTED_DEVICES];
     comms_handler_t handlers[EXPECTED_DEVICES];
     char sent[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
-    char received[EXPECTED_DEVICES][COMMS_MESSAGE_CAPACITY];
     bool initialized[EXPECTED_DEVICES];
     bool handler_started[EXPECTED_DEVICES];
     bool running[EXPECTED_DEVICES];
@@ -48,6 +47,7 @@ typedef struct {
 } SerialReportSession;
 
 static uint64_t latest_node_ticks[EXPECTED_DEVICES];
+static uint64_t node_stop_heartbeat_baseline[EXPECTED_DEVICES];
 static bool node_started_once[EXPECTED_DEVICES];
 static bool node_reports_drained[EXPECTED_DEVICES];
 static bool node_stop_pending[EXPECTED_DEVICES];
@@ -180,6 +180,45 @@ static bool send_message(
 }
 
 /**
+ * @brief Extrae el siguiente mensaje recibido por el handler serial.
+ *
+ * Diferencia una cola vacía de un error de recepción, como el desbordamiento
+ * de la cola, para que el llamador no confunda pérdidas con ausencia temporal
+ * de mensajes.
+ *
+ * @param handler Enlace serial que contiene el mensaje.
+ * @param buffer Buffer para copiar el payload.
+ * @param capacity Capacidad del buffer.
+ * @param message_size Recibe la cantidad de bytes copiados.
+ * @param ready Indica si había un mensaje disponible.
+ *
+ * @return true si la consulta terminó correctamente; false ante un error.
+ */
+static bool take_received_message(
+    comms_handler_t *handler,
+    char *buffer,
+    size_t capacity,
+    size_t *message_size,
+    bool *ready
+)
+{
+    comms_status_t status = comms_receive_next(
+        handler, buffer, capacity, message_size
+    );
+    if (status == COMMS_BUSY) {
+        *ready = false;
+        return true;
+    }
+    if (status != COMMS_OK) {
+        fprintf(stderr, "Error extrayendo mensaje serial de %s (estado %d).\n",
+            handler->dev, (int)status);
+        return false;
+    }
+    *ready = true;
+    return true;
+}
+
+/**
  * @brief Espera el ACK de CONFIG correspondiente a una solicitud.
  *
  * Consume las respuestas recibidas por el hilo de comunicación y verifica
@@ -204,16 +243,10 @@ static bool wait_for_ack(
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
-
-        pthread_mutex_lock(&handler->mutex);
-        ready = handler->recv.rdy;
-        if (ready) {
-            response_size = handler->recv.size;
-            memcpy(response, handler->recv.content, response_size);
-            response[response_size] = '\0';
-            handler->recv.rdy = false;
+        if (!take_received_message(handler, response, sizeof(response),
+                                   &response_size, &ready)) {
+            return false;
         }
-        pthread_mutex_unlock(&handler->mutex);
 
         if (ready) {
             if (response_size > 0u && response[response_size - 1u] == '\0')
@@ -281,16 +314,10 @@ static bool wait_for_calibration(
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
-
-        pthread_mutex_lock(&handler->mutex);
-        ready = handler->recv.rdy;
-        if (ready) {
-            response_size = handler->recv.size;
-            memcpy(response, handler->recv.content, response_size);
-            response[response_size] = '\0';
-            handler->recv.rdy = false;
+        if (!take_received_message(handler, response, sizeof(response),
+                                   &response_size, &ready)) {
+            return false;
         }
-        pthread_mutex_unlock(&handler->mutex);
 
         if (ready) {
             if (response_size > 0u && response[response_size - 1u] == '\0')
@@ -365,16 +392,9 @@ static bool wait_for_task_deploy(
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
-
-        pthread_mutex_lock(&handler->mutex);
-        ready = handler->recv.rdy;
-        if (ready) {
-            response_size = handler->recv.size;
-            memcpy(response, handler->recv.content, response_size);
-            response[response_size] = '\0';
-            handler->recv.rdy = false;
-        }
-        pthread_mutex_unlock(&handler->mutex);
+        if (!take_received_message(handler, response, sizeof(response),
+                                   &response_size, &ready))
+            return false;
 
         if (ready) {
             if (response_size > 0u && response[response_size - 1u] == '\0')
@@ -444,16 +464,11 @@ static bool wait_for_control_reply(
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready;
-
-        pthread_mutex_lock(&handler->mutex);
-        ready = handler->recv.rdy;
-        if (ready) {
-            response_size = handler->recv.size;
-            memcpy(response, handler->recv.content, response_size);
-            response[response_size] = '\0';
-            handler->recv.rdy = false;
+        if (!take_received_message(handler, response, sizeof(response),
+                                   &response_size, &ready)) {
+            event_queue_mark_incomplete(queue);
+            return false;
         }
-        pthread_mutex_unlock(&handler->mutex);
 
         if (ready) {
             if (response_size > 0u && response[response_size - 1u] == '\0')
@@ -543,72 +558,78 @@ static bool pump_node_reports(
 {
     bool success = true;
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        char response[COMMS_MESSAGE_CAPACITY];
-        size_t response_size = 0u;
-
-        pthread_mutex_lock(&handlers[i].mutex);
-        bool ready = handlers[i].recv.rdy;
-        if (ready) {
-            response_size = handlers[i].recv.size;
-            memcpy(response, handlers[i].recv.content, response_size);
-            response[response_size] = '\0';
-            handlers[i].recv.rdy = false;
-        }
-        pthread_mutex_unlock(&handlers[i].mutex);
-        if (!ready)
-            continue;
-
-        if (response_size > 0u && response[response_size - 1u] == '\0')
-            --response_size;
-
-        Message message;
-        MessageParseResult parsed = message_parse(response, response_size, &message);
-        if (parsed != MESSAGE_PARSE_OK) {
-            if (response_size >= 4u && memcmp(response, "PONG", 4u) == 0) {
-                node_reports_drained[i] = true;
-                if (node_stop_pending[i]) {
-                    Event stopped = {
-                        .type = EVENT_NODE_STOPPED,
-                        .source = EVENT_SOURCE_HOST,
-                        .node_id = node_ids[i],
-                        .tick = latest_node_ticks[i],
-                        .host_time_ns = host_time_ns()
-                    };
-                    if (publish_report_event(queue, &stopped))
-                        node_stop_pending[i] = false;
-                }
+        for (;;) {
+            char response[COMMS_MESSAGE_CAPACITY];
+            size_t response_size = 0u;
+            bool ready = false;
+            if (!take_received_message(&handlers[i], response, sizeof(response),
+                                      &response_size, &ready)) {
+                success = false;
+                event_queue_mark_incomplete(queue);
+                break;
             }
-            if (response_size > 0u && response[0] == '{') {
-                fprintf(stderr, "Mensaje de reporte inválido del nodo %u: %s\n",
-                    node_ids[i], message_parse_result_string(parsed));
+            if (!ready)
+                break;
+
+            if (response_size > 0u && response[response_size - 1u] == '\0')
+                --response_size;
+
+            Message message;
+            MessageParseResult parsed =
+                message_parse(response, response_size, &message);
+            if (parsed != MESSAGE_PARSE_OK) {
+                if (response_size > 0u && response[0] == '{') {
+                    fprintf(stderr,
+                        "Mensaje de reporte inválido del nodo %u: %s\n",
+                        node_ids[i], message_parse_result_string(parsed));
+                    success = false;
+                }
+                continue;
+            }
+            if (message.node_id != node_ids[i]) {
+                fprintf(stderr,
+                    "Mensaje recibido en enlace %u con node_id %u.\n",
+                    node_ids[i], message.node_id);
+                success = false;
+                continue;
+            }
+
+            Event event = {0};
+            if (message.type == MSG_EVENT) {
+                event = message.data.event;
+            } else if (message.type == MSG_TICK_REPORT) {
+                event.type = EVENT_TICK_REPORT;
+                event.source = EVENT_SOURCE_NODE;
+                event.node_id = message.node_id;
+                event.tick = message.data.tick_report.tick;
+                event.task_id = message.data.tick_report.task_id;
+            } else {
+                continue;
+            }
+            event.host_time_ns = host_time_ns();
+            record_node_event_tick(&event);
+            node_reports_drained[i] = false;
+            if (!publish_report_event(queue, &event))
+                success = false;
+        }
+
+        if (node_stop_pending[i] &&
+            comms_reports_drained_since(
+                &handlers[i], node_stop_heartbeat_baseline[i])) {
+            Event stopped = {
+                .type = EVENT_NODE_STOPPED,
+                .source = EVENT_SOURCE_HOST,
+                .node_id = node_ids[i],
+                .tick = latest_node_ticks[i],
+                .host_time_ns = host_time_ns()
+            };
+            if (publish_report_event(queue, &stopped)) {
+                node_reports_drained[i] = true;
+                node_stop_pending[i] = false;
+            } else {
                 success = false;
             }
-            continue;
         }
-        if (message.node_id != node_ids[i]) {
-            fprintf(stderr, "Mensaje recibido en enlace %u con node_id %u.\n",
-                node_ids[i], message.node_id);
-            success = false;
-            continue;
-        }
-
-        Event event = {0};
-        if (message.type == MSG_EVENT) {
-            event = message.data.event;
-        } else if (message.type == MSG_TICK_REPORT) {
-            event.type = EVENT_TICK_REPORT;
-            event.source = EVENT_SOURCE_NODE;
-            event.node_id = message.node_id;
-            event.tick = message.data.tick_report.tick;
-            event.task_id = message.data.tick_report.task_id;
-        } else {
-            continue;
-        }
-        event.host_time_ns = host_time_ns();
-        record_node_event_tick(&event);
-        node_reports_drained[i] = false;
-        if (!publish_report_event(queue, &event))
-            success = false;
     }
     return success;
 }
@@ -683,6 +704,8 @@ static bool send_control_to_nodes(
             } else {
                 node_reports_drained[i] = false;
                 node_stop_pending[i] = node_started_once[i];
+                node_stop_heartbeat_baseline[i] =
+                    comms_heartbeat_count(&handlers[i]);
             }
         }
     }
@@ -755,6 +778,8 @@ static bool send_control_to_node(
     } else {
         node_reports_drained[node_index] = false;
         node_stop_pending[node_index] = node_started_once[node_index];
+        node_stop_heartbeat_baseline[node_index] =
+            comms_heartbeat_count(&handlers[node_index]);
         bool required[EXPECTED_DEVICES] = {false, false};
         required[node_index] = node_started_once[node_index];
         return drain_node_reports(queue, node_ids, handlers, required);
@@ -1161,6 +1186,8 @@ static int serial_report_worker_run(EventQueue *queue, void *context)
 {
     SerialReportSession *session = context;
     memset(latest_node_ticks, 0, sizeof(latest_node_ticks));
+    memset(node_stop_heartbeat_baseline, 0,
+           sizeof(node_stop_heartbeat_baseline));
     memset(node_started_once, 0, sizeof(node_started_once));
     memset(node_reports_drained, 0, sizeof(node_reports_drained));
     memset(node_stop_pending, 0, sizeof(node_stop_pending));
@@ -1181,7 +1208,6 @@ static int serial_report_worker_run(EventQueue *queue, void *context)
         session->initialized[i] = true;
         session->initialized_count = i + 1u;
         session->handlers[i].sent.content = session->sent[i];
-        session->handlers[i].recv.content = session->received[i];
 
         Message request = {
             .type = MSG_CONFIG,

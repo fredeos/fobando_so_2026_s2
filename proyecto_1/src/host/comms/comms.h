@@ -13,6 +13,13 @@
 
 /* Incluye espacio para el terminador NUL del payload JSON en la API de comms. */
 #define COMMS_MESSAGE_CAPACITY (MESSAGE_MAX_BYTES + 1u)
+#define COMMS_RECEIVE_QUEUE_CAPACITY 128u
+
+typedef struct {
+    uint32_t size;
+    uint8_t priority;
+    char content[COMMS_MESSAGE_CAPACITY];
+} comms_received_message_t;
 
 /*
  * Communications status codes
@@ -56,8 +63,8 @@ typedef struct {
 
 /*
  * Handler structure for communications via serial and protocol interface.
- * The callee should provide the necessary buffers for the 'recv' and
- * 'sent' messages for correct payload extraction
+ * The caller provides a buffer for outgoing messages; received payloads are
+ * retained in the handler's FIFO and retrieved through comms_receive_next.
 */
 typedef struct {
     // << Information >>
@@ -75,6 +82,12 @@ typedef struct {
     // << Communication >>
     comms_message_t recv;   // received message
     comms_message_t sent;   // sent message
+    comms_received_message_t receive_queue[COMMS_RECEIVE_QUEUE_CAPACITY];
+    size_t receive_head;
+    size_t receive_tail;
+    size_t receive_count;
+    bool receive_overflow_pending;
+    uint64_t heartbeat_count;
     // << Thread synchronization >>
     pthread_mutex_t mutex;  // pthread mutex
     pthread_cond_t  cond;   // pthread condition variable
@@ -163,6 +176,33 @@ comms_status_t comms_request_receive(
 */
 comms_status_t comms_acquire_receive(
     comms_handler_t* handler
+);
+
+/*
+ * Retrieve the oldest application message received from the serial device.
+ * PONG heartbeats are counted separately and do not occupy FIFO slots.
+ * Returns COMMS_BUSY when the receive queue is empty and COMMS_RX_ERROR once
+ * after an overflow, so callers can mark the communication as incomplete.
+ */
+comms_status_t comms_receive_next(
+    comms_handler_t* handler,
+    char* buffer,
+    size_t capacity,
+    size_t* message_size
+);
+
+/* Store one completed protocol payload in the handler receive FIFO. */
+comms_status_t comms_receive_enqueue(
+    comms_handler_t* handler,
+    const char* message,
+    size_t message_size,
+    uint8_t priority
+);
+
+uint64_t comms_heartbeat_count(comms_handler_t* handler);
+bool comms_reports_drained_since(
+    comms_handler_t* handler,
+    uint64_t heartbeat_baseline
 );
 
 // ----------------------------------------------------------------------------------

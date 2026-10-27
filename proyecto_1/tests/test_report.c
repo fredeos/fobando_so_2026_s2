@@ -40,6 +40,8 @@ static void fixture(void)
     add(EVENT_EXECUTION_SLICE, 1u, 1u, 1u, 1u, 2u);
     add(EVENT_TASK_REJECTED, 1u, 3u, 0u, 2u, 0u);
     events[count - 1u].detail = REJECT_INSUFFICIENT_CAPACITY;
+    add(EVENT_TASK_REJECTED, 0u, 15u, 0u, 0u, 0u);
+    events[count - 1u].detail = REJECT_SPORADIC_LIMIT;
     add(EVENT_TASK_COMPLETED, 1u, 1u, 1u, 3u, 0u);
     add(EVENT_IDLE_SLICE, 1u, 0u, 0u, 3u, 1u);
     accept(1u, 2u, 4u, 1u, 5u, 3u);
@@ -98,6 +100,8 @@ static void test_statistics(void)
     assert(one->response_count == 1u && one->response_sum == 3.0L);
     assert(one->latency_count == 2u && one->latency_sum == 2.0L);
     assert(task(&statistics, 1u, 3u)->rejected == 1u);
+    assert(task(&statistics, 0u, 15u)->rejected == 1u);
+    assert(statistics.node_count == 2u);
     assert(task(&statistics, 2u, 1u)->node_failures == 1u);
     const NodeStatistics *second = node(&statistics, 2u);
     assert(second->observed_ticks == 3u && second->busy_ticks == 2u);
@@ -135,6 +139,22 @@ static void test_statistics(void)
     assert(node(&statistics, 1u)->missing_cost);
     statistics_free(&statistics);
     free(many);
+}
+
+static void test_unassigned_rejection_is_not_a_node(void)
+{
+    Event rejected = {
+        .type = EVENT_TASK_REJECTED,
+        .node_id = 0u,
+        .task_id = 15u,
+        .detail = REJECT_SPORADIC_LIMIT
+    };
+    ReportStatistics statistics = {0};
+    assert(statistics_build(&rejected, 1u, &statistics));
+    assert(statistics.node_count == 0u);
+    assert(statistics.task_count == 1u);
+    assert(task(&statistics, 0u, 15u)->rejected == 1u);
+    statistics_free(&statistics);
 }
 
 static char *load(const char *directory, const char *name)
@@ -178,9 +198,11 @@ static void test_report(bool invalid, bool empty)
     char *html = load(directory, "report.html");
     char *csv = load(directory, "events.csv");
     assert(strstr(html, "Gantt por nodo") != NULL);
+    assert(strstr(html, "<h3>Nodo 0</h3>") == NULL);
     assert(strstr(html, "Estadísticas por tarea") != NULL);
     assert((strstr(html, "REPORTE INCOMPLETO") != NULL) == invalid);
     if (!empty) {
+        assert(strstr(html, "Sin asignar") != NULL);
         assert(strstr(html, "Plazo absoluto") != NULL);
         assert(strstr(html, "FALLA_NODO") != NULL);
         assert(strstr(html, "Capacidad insuficiente") != NULL);
@@ -202,6 +224,7 @@ int main(void)
 {
     fixture();
     test_statistics();
+    test_unassigned_rejection_is_not_a_node();
     test_report(false, false);
     test_report(true, false);
     test_report(false, true);

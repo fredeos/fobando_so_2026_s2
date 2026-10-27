@@ -44,6 +44,11 @@ comms_status_t comms_init_handler(
     handler->recv.priority = 0;
     handler->recv.set = false;
     handler->recv.rdy = false;
+    handler->receive_head = 0u;
+    handler->receive_tail = 0u;
+    handler->receive_count = 0u;
+    handler->receive_overflow_pending = false;
+    handler->heartbeat_count = 0u;
 
     handler->sent.content = NULL;
     handler->sent.size = 0;
@@ -143,12 +148,15 @@ comms_status_t comms_acquire_send(
 comms_status_t comms_request_receive(
     comms_handler_t* handler
 ){
-    if (handler->recv.set)
+    if (handler == NULL)
+        return COMMS_INVALID_ARG;
+    pthread_mutex_lock(&handler->mutex);
+    if (handler->recv.set) {
+        pthread_mutex_unlock(&handler->mutex);
         return COMMS_BUSY;
-    
-    pthread_mutex_lock(&handler->mutex);   // lock
+    }
     handler->recv.set = true;
-    pthread_mutex_unlock(&handler->mutex);   // unlock
+    pthread_mutex_unlock(&handler->mutex);
 
     return COMMS_OK;
 }
@@ -156,11 +164,121 @@ comms_status_t comms_request_receive(
 comms_status_t comms_acquire_receive(
     comms_handler_t* handler
 ){
+    if (handler == NULL)
+        return COMMS_INVALID_ARG;
     pthread_mutex_lock(&handler->mutex);   // lock
-    handler->recv.rdy = false;
+    handler->recv.rdy = handler->receive_count > 0u;
     pthread_mutex_unlock(&handler->mutex);   // unlock
 
     return COMMS_OK;
+}
+
+comms_status_t comms_receive_next(
+    comms_handler_t* handler,
+    char* buffer,
+    size_t capacity,
+    size_t* message_size
+)
+{
+    if (handler == NULL || buffer == NULL || message_size == NULL)
+        return COMMS_INVALID_ARG;
+
+    pthread_mutex_lock(&handler->mutex);
+    if (handler->receive_overflow_pending) {
+        handler->receive_overflow_pending = false;
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_RX_ERROR;
+    }
+    if (handler->receive_count == 0u) {
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_BUSY;
+    }
+
+    const comms_received_message_t* message =
+        &handler->receive_queue[handler->receive_head];
+    if (capacity <= message->size) {
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_INVALID_ARG;
+    }
+
+    memcpy(buffer, message->content, message->size);
+    buffer[message->size] = '\0';
+    *message_size = message->size;
+    handler->receive_head =
+        (handler->receive_head + 1u) % COMMS_RECEIVE_QUEUE_CAPACITY;
+    --handler->receive_count;
+    handler->recv.rdy = handler->receive_count > 0u;
+    pthread_mutex_unlock(&handler->mutex);
+    return COMMS_OK;
+}
+
+comms_status_t comms_receive_enqueue(
+    comms_handler_t* handler,
+    const char* message,
+    size_t message_size,
+    uint8_t priority
+)
+{
+    if (handler == NULL || message == NULL ||
+        message_size == 0u || message_size >= COMMS_MESSAGE_CAPACITY)
+        return COMMS_INVALID_ARG;
+
+    pthread_mutex_lock(&handler->mutex);
+    bool force_receive = handler->recv.set && !handler->recv.rdy;
+    if (!force_receive && priority < handler->priority) {
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_BUSY;
+    }
+    if (message_size >= 4u && memcmp(message, "PONG", 4u) == 0) {
+        ++handler->heartbeat_count;
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_OK;
+    }
+
+    if (handler->receive_count == COMMS_RECEIVE_QUEUE_CAPACITY) {
+        handler->receive_overflow_pending = true;
+        pthread_mutex_unlock(&handler->mutex);
+        return COMMS_RX_ERROR;
+    }
+
+    comms_received_message_t* slot =
+        &handler->receive_queue[handler->receive_tail];
+    memcpy(slot->content, message, message_size);
+    slot->content[message_size] = '\0';
+    slot->size = (uint32_t)message_size;
+    slot->priority = priority;
+    handler->receive_tail =
+        (handler->receive_tail + 1u) % COMMS_RECEIVE_QUEUE_CAPACITY;
+    ++handler->receive_count;
+    handler->recv.rdy = true;
+    if (force_receive)
+        handler->recv.set = false;
+    pthread_mutex_unlock(&handler->mutex);
+    return COMMS_OK;
+}
+
+uint64_t comms_heartbeat_count(comms_handler_t* handler)
+{
+    if (handler == NULL)
+        return 0u;
+    pthread_mutex_lock(&handler->mutex);
+    uint64_t count = handler->heartbeat_count;
+    pthread_mutex_unlock(&handler->mutex);
+    return count;
+}
+
+bool comms_reports_drained_since(
+    comms_handler_t* handler,
+    uint64_t heartbeat_baseline
+)
+{
+    if (handler == NULL)
+        return false;
+    pthread_mutex_lock(&handler->mutex);
+    bool drained = handler->receive_count == 0u &&
+        handler->heartbeat_count != heartbeat_baseline;
+    pthread_mutex_unlock(&handler->mutex);
+    return drained;
 }
 
 // ===============================================================================================
@@ -288,9 +406,6 @@ void* comms_handler(void* arg){
         // (Update status)
         hd->status = status;
         // (Extract requests)
-        bool recv_set = hd->recv.set;
-        bool recv_rdy = hd->recv.rdy;
-
         bool sent_set = hd->sent.set;
         bool sent_rdy = hd->sent.rdy;
         pthread_mutex_unlock(&hd->mutex); // unlock
@@ -427,40 +542,15 @@ void* comms_handler(void* arg){
                         sizeof(rx.buffer)
                     );
                     if (rx_frame_errno == PROTOCOL_OK){
-                        pthread_mutex_lock(&hd->mutex);   // lock
-                        // (Save contents)
-                        bool msg_save = false;
-                        if (recv_set && !recv_rdy){ // force message save
-                            // + Save frame contents
-                            msg_save = true;
-                            // + Reset flags
-                            hd->recv.rdy = true;
-                            hd->recv.set = false;
-                        } else if (rx_frame.relevance >= hd->priority &&
-                                   (!hd->recv.rdy ||
-                                    (hd->recv.content != NULL &&
-                                     rx_frame.length > 0u &&
-                                     rx_frame.payload[0] == '{' &&
-                                     (hd->recv.size == 0u ||
-                                      hd->recv.content[0] != '{')))){ // prefer app JSON over heartbeat text
-                            // + Save frame contents
-                            msg_save = true;
-                            // + Reset flags
-                            hd->recv.rdy = true;
+                        comms_status_t queued = comms_receive_enqueue(
+                            hd, (const char*)rx_frame.payload, rx_frame.length,
+                            rx_frame.relevance
+                        );
+                        if (queued == COMMS_RX_ERROR) {
+                            fprintf(stderr,
+                                "%s: receive queue full; incoming message dropped.\n",
+                                hd->dev);
                         }
-                        // (Copy contents)
-                        if (msg_save){
-                            // + Copy frame contents
-                            hd->recv.size = rx_frame.length;
-                            hd->recv.priority = rx_frame.relevance;
-                            memcpy(
-                                hd->recv.content,
-                                rx_frame.payload,
-                                rx_frame.length
-                            );
-                            hd->recv.content[rx_frame.length] = '\0';
-                        }
-                        pthread_mutex_unlock(&hd->mutex); // unlock
                     }
                 }
                 // [Count transactions]

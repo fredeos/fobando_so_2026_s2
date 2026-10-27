@@ -60,6 +60,7 @@ TASK_CONVERSION_TEST := $(OUT_DIR)/test_task_conversion
 EVENT_QUEUE_TEST := $(OUT_DIR)/test_event_queue
 REPORT_TEST := $(OUT_DIR)/test_report
 REPORT_SESSION_TEST := $(OUT_DIR)/test_report_session
+COMMS_RECEIVE_TEST := $(OUT_DIR)/test_comms_receive
 SCHEDULER_TEST := $(OUT_DIR)/test_scheduler
 RMS_TEST := $(OUT_DIR)/test_rms
 EDF_TEST := $(OUT_DIR)/test_edf
@@ -147,6 +148,7 @@ TASK_CONVERSION_OBJ := $(BUILD_DIR)/nodes/scheduler/task_conversion.o
 EVENT_QUEUE_TEST_OBJ := $(BUILD_DIR)/tests/test_event_queue.o
 REPORT_TEST_OBJ := $(BUILD_DIR)/tests/test_report.o
 REPORT_SESSION_TEST_OBJ := $(BUILD_DIR)/tests/test_report_session.o
+COMMS_RECEIVE_TEST_OBJ := $(BUILD_DIR)/tests/test_comms_receive.o
 
 EVENT_QUEUE_OBJ := $(BUILD_DIR)/host/ipc/event_queue.o
 REPORT_OBJS := $(BUILD_DIR)/host/report/report.o \
@@ -182,6 +184,7 @@ TEST_OBJS := \
     $(EVENT_QUEUE_TEST_OBJ) \
     $(REPORT_TEST_OBJ) \
     $(REPORT_SESSION_TEST_OBJ) \
+    $(COMMS_RECEIVE_TEST_OBJ) \
     $(SCHEDULER_RUNTIME_TEST_OBJ)
 
 
@@ -385,6 +388,15 @@ $(REPORT_SESSION_TEST): $(REPORT_SESSION_TEST_OBJ) $(EVENT_QUEUE_OBJ) \
 	@mkdir -p $(dir $@)
 	$(CC) $^ -o $@ $(LDLIBS)
 
+$(COMMS_RECEIVE_TEST): $(COMMS_RECEIVE_TEST_OBJ) \
+                       $(BUILD_DIR)/host/comms/comms.o \
+                       $(BUILD_DIR)/host/serial/serial.o \
+                       $(BUILD_DIR)/host/timing/timing.o \
+                       $(BUILD_DIR)/common/protocol.o \
+                       $(BUILD_DIR)/common/conversion.o
+	@mkdir -p $(dir $@)
+	$(CC) $^ -o $@ $(LDLIBS)
+
 test: $(FOUNDATION_TEST) \
       $(PLANNER_TEST) \
       $(CONFIG_TEST) \
@@ -400,7 +412,8 @@ test: $(FOUNDATION_TEST) \
       $(SCHEDULER_RUNTIME_TEST) \
       $(EVENT_QUEUE_TEST) \
       $(REPORT_TEST) \
-      $(REPORT_SESSION_TEST)
+      $(REPORT_SESSION_TEST) \
+      $(COMMS_RECEIVE_TEST)
 	./$(FOUNDATION_TEST)
 	./$(PLANNER_TEST)
 	./$(CONFIG_TEST)
@@ -414,6 +427,7 @@ test: $(FOUNDATION_TEST) \
 	./$(EVENT_QUEUE_TEST)
 	./$(REPORT_TEST)
 	./$(REPORT_SESSION_TEST)
+	./$(COMMS_RECEIVE_TEST)
 	./$(SCHEDULER_TEST)
 	./$(RMS_TEST)
 	./$(EDF_TEST)

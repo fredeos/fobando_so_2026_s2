@@ -239,19 +239,23 @@ bool statistics_build(const Event *events, size_t count, ReportStatistics *out)
         if (events[i].type < EVENT_TASK_ACCEPTED || events[i].type > EVENT_TASK_SWITCH ||
             UINT64_MAX - events[i].tick < events[i].duration_ticks) goto fail;
         ordered[i] = &events[i];
-        NodeStatistics *node = get_node(&statistics, events[i].node_id);
-        if (node == NULL) goto fail;
-        if (events[i].type == EVENT_NODE_STARTED) node->explicit_start = true;
+        if (events[i].node_id != 0u) {
+            NodeStatistics *node = get_node(&statistics, events[i].node_id);
+            if (node == NULL) goto fail;
+            if (events[i].type == EVENT_NODE_STARTED) node->explicit_start = true;
+        }
     }
     if (count > 0u) qsort(ordered, count, sizeof(*ordered), compare_events);
 
     for (size_t i = 0; i < count; ++i) {
         const Event *event = ordered[i];
-        NodeStatistics *node = get_node(&statistics, event->node_id);
-        if (node == NULL) goto fail;
-        advance(node, event->tick);
+        NodeStatistics *node = event->node_id == 0u
+            ? NULL : get_node(&statistics, event->node_id);
+        if (event->node_id != 0u && node == NULL) goto fail;
+        if (node != NULL)
+            advance(node, event->tick);
 
-        if (runtime_event(event->type)) {
+        if (node != NULL && runtime_event(event->type)) {
             if (!node->seen_runtime) {
                 node->seen_runtime = true;
                 node->first_tick = event->tick;
@@ -269,10 +273,14 @@ bool statistics_build(const Event *events, size_t count, ReportStatistics *out)
         if (task_event(event->type)) {
             TaskStatistics *task = get_task(&statistics, event);
             if (task == NULL || !update_task(task, event, &jobs)) goto fail;
-            if (event->type != EVENT_TASK_ACCEPTED && event->type != EVENT_TASK_REJECTED &&
+            if (node != NULL && event->type != EVENT_TASK_ACCEPTED &&
+                event->type != EVENT_TASK_REJECTED &&
                 (!task->active || !task->definition_known || !task->cost_known))
                 node->missing_cost = true;
         }
+
+        if (node == NULL)
+            continue;
 
         switch (event->type) {
             case EVENT_NODE_STARTED: node->running = true; break;

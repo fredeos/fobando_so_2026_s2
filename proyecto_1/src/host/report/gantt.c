@@ -24,6 +24,8 @@ bool gantt_write(FILE *file, const Event *events, size_t count,
     };
     for (size_t n = 0; n < statistics->node_count; ++n) {
         const NodeStatistics *node = &statistics->nodes[n];
+        if (node->node_id == 0u)
+            continue;
         uint64_t first = UINT64_MAX, last = 0u;
         size_t rows = 1u;
         for (size_t t = 0; t < statistics->task_count; ++t)

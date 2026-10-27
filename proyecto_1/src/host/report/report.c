@@ -105,7 +105,12 @@ static void write_tasks(FILE *file, const ReportStatistics *statistics)
           "</tr></thead><tbody>", file);
     for (size_t i = 0; i < statistics->task_count; ++i) {
         const TaskStatistics *task = &statistics->tasks[i];
-        fprintf(file, "<tr><td>%" PRIu32 "</td><td>%" PRIu32 "</td>", task->node_id, task->task_id);
+        if (task->node_id == 0u)
+            fprintf(file, "<tr><td>Sin asignar</td><td>%" PRIu32 "</td>",
+                    task->task_id);
+        else
+            fprintf(file, "<tr><td>%" PRIu32 "</td><td>%" PRIu32 "</td>",
+                    task->node_id, task->task_id);
         if (task->definition_known) {
             fprintf(file, "<td>%c</td><td>", (char)task->task.type);
             if (task->cost_known) fprintf(file, "%" PRIu32, task->cost_ticks);
@@ -139,9 +144,12 @@ static void write_history(FILE *file, const ReportLog *log)
     for (size_t i = 0; i < log->count; ++i) {
         const Event *event = &log->events[i];
         if (event->type != EVENT_TASK_ACCEPTED && event->type != EVENT_TASK_REJECTED) continue;
-        fprintf(file, "<tr><td>%" PRIu64 "</td><td>%" PRIu32 "</td><td>%" PRIu32
-                "</td><td>%s</td><td>%s (%" PRId32 ")</td><td>%" PRIu32 "</td></tr>",
-                event->tick, event->node_id, event->task_id,
+        fprintf(file, "<tr><td>%" PRIu64 "</td><td>", event->tick);
+        if (event->node_id == 0u) fputs("Sin asignar", file);
+        else fprintf(file, "%" PRIu32, event->node_id);
+        fprintf(file, "</td><td>%" PRIu32 "</td><td>%s</td><td>%s (%" PRId32
+                ")</td><td>%" PRIu32 "</td></tr>",
+                event->task_id,
                 event->type == EVENT_TASK_ACCEPTED ? "Aceptada" : "Rechazada",
                 event->type == EVENT_TASK_ACCEPTED ? "Admisión confirmada" : report_reject_reason(event->detail),
                 event->detail, event->cost_ticks);
@@ -151,9 +159,12 @@ static void write_history(FILE *file, const ReportLog *log)
           "<th>Nodo</th><th>Tarea</th><th>Job</th><th>Duración</th><th>Detalle</th></tr></thead><tbody>", file);
     for (size_t i = 0; i < log->count; ++i) {
         const Event *event = &log->events[i];
-        fprintf(file, "<tr><td>%zu</td><td>%" PRIu64 "</td><td>%s</td><td>%" PRIu32
-                "</td><td>%" PRIu32 "</td><td>%" PRIu32 "</td><td>%" PRIu32 "</td><td>%" PRId32 "</td></tr>",
-                i, event->tick, report_event_name(event->type), event->node_id,
+        fprintf(file, "<tr><td>%zu</td><td>%" PRIu64 "</td><td>%s</td><td>",
+                i, event->tick, report_event_name(event->type));
+        if (event->node_id == 0u) fputs("Sin asignar", file);
+        else fprintf(file, "%" PRIu32, event->node_id);
+        fprintf(file, "</td><td>%" PRIu32 "</td><td>%" PRIu32 "</td><td>%" PRIu32
+                "</td><td>%" PRId32 "</td></tr>",
                 event->task_id, event->job_id, event->duration_ticks, event->detail);
     }
     fputs("</tbody></table></div>", file);
