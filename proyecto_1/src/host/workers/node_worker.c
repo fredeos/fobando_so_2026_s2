@@ -19,16 +19,10 @@ int node_worker_run(EventQueue *queue, void *opaque)
 {
     /* El mismo callback sirve para ambos procesos; el índice selecciona el nodo. */
     NodeWorkerContext *context = opaque;
-    SerialReportSession *session = &context->serial;
+    NodeSerialContext *session = &context->serial;
     size_t index = context->index;
     bool enabled[EXPECTED_DEVICES] = {false, false};
     enabled[index] = true;
-    memset(latest_node_ticks, 0, sizeof(latest_node_ticks));
-    memset(node_stop_heartbeat_baseline, 0,
-           sizeof(node_stop_heartbeat_baseline));
-    memset(node_started_once, 0, sizeof(node_started_once));
-    memset(node_reports_drained, 0, sizeof(node_reports_drained));
-    memset(node_stop_pending, 0, sizeof(node_stop_pending));
 
     /* 1. Abrir el puerto serial que pertenece a este proceso. */
     comms_handler_t *handler = &session->handlers[index];
@@ -39,7 +33,6 @@ int node_worker_run(EventQueue *queue, void *opaque)
         return 1;
     }
     session->initialized[index] = true;
-    session->initialized_count = 1u;
     handler->sent.content = session->sent[index];
 
     /* 2. Enviar la configuración del Host y esperar confirmación del firmware. */
@@ -99,8 +92,8 @@ int node_worker_run(EventQueue *queue, void *opaque)
     /* 5. Atender reportes seriales y órdenes IPC hasta cerrar la sesión. */
     while (!event_queue_stop_requested(queue)) {
         /* Los reportes del dispositivo van a la cola compartida del reporter. */
-        if (!pump_node_reports(queue, session->node_ids, session->handlers,
-                               enabled))
+        if (!pump_node_reports(queue, session, session->node_ids,
+                               session->handlers, enabled))
             return 1;
         /* poll evita bloquear la lectura de reportes esperando una orden. */
         struct pollfd command_event = {
@@ -133,7 +126,7 @@ int node_worker_run(EventQueue *queue, void *opaque)
                 send_message(handler, session->sent[index], request,
                              request->node_id, "DEPLOY_TASK")) {
                 reply.ok = wait_for_task_deploy(
-                    queue, handler, request->node_id, request->request_id,
+                    queue, session, handler, request->node_id, request->request_id,
                     session->devices[index], &reply.accepted, &reply.reason
                 );
             }
@@ -151,30 +144,30 @@ int node_worker_run(EventQueue *queue, void *opaque)
                 uint64_t heartbeat_baseline =
                     comms_heartbeat_count(handler);
                 reply.ok = wait_for_control_reply(
-                    queue, handler, request->node_id, request->request_id,
+                    queue, session, handler, request->node_id, request->request_id,
                     type, session->devices[index], HANDSHAKE_TIMEOUT_SECONDS
                 );
                 if (reply.ok) {
                     session->running[index] = type == MSG_START;
                     if (type == MSG_START) {
-                        node_started_once[index] = true;
+                        session->started_once[index] = true;
                         Event started = {
                             .type = EVENT_NODE_STARTED,
                             .source = EVENT_SOURCE_HOST,
                             .node_id = request->node_id,
-                            .tick = latest_node_ticks[index],
+                            .tick = session->latest_ticks[index],
                             .host_time_ns = host_time_ns()
                         };
                         reply.ok = publish_report_event(queue, &started);
                     } else {
                         /* STOP también debe esperar los reportes finales del nodo. */
-                        node_reports_drained[index] = false;
+                        session->reports_drained[index] = false;
                         uint64_t start = monotonic_time_ms();
                         while (!comms_reports_drained_since(
                                    handler, heartbeat_baseline) &&
                                monotonic_time_ms() - start < 2000u) {
                             if (!pump_node_reports(
-                                    queue, session->node_ids,
+                                    queue, session, session->node_ids,
                                     session->handlers, enabled)) {
                                 reply.ok = false;
                                 break;
@@ -193,7 +186,7 @@ int node_worker_run(EventQueue *queue, void *opaque)
                                 .type = EVENT_NODE_STOPPED,
                                 .source = EVENT_SOURCE_HOST,
                                 .node_id = request->node_id,
-                                .tick = latest_node_ticks[index],
+                                .tick = session->latest_ticks[index],
                                 .host_time_ns = host_time_ns()
                             };
                             reply.ok = publish_report_event(queue, &stopped);
@@ -220,7 +213,7 @@ int node_worker_stop(EventQueue *queue, void *opaque)
 {
     /* La sesión llama este callback después de node_worker_run, incluso si falló. */
     NodeWorkerContext *context = opaque;
-    SerialReportSession *session = &context->serial;
+    NodeSerialContext *session = &context->serial;
     size_t index = context->index;
     if (!session->handler_started[index])
         return session->initialized[index] ? 1 : 0;
@@ -238,7 +231,7 @@ int node_worker_stop(EventQueue *queue, void *opaque)
         };
         if (!send_message(handler, session->sent[index], &stop,
                           stop.node_id, "STOP") ||
-            !wait_for_control_reply(queue, handler, stop.node_id, request_id,
+            !wait_for_control_reply(queue, session, handler, stop.node_id, request_id,
                                     MSG_STOP, session->devices[index], 1u)) {
             success = false;
         } else {
@@ -248,7 +241,7 @@ int node_worker_stop(EventQueue *queue, void *opaque)
             uint64_t start = monotonic_time_ms();
             while (!comms_reports_drained_since(handler, heartbeat_baseline) &&
                    monotonic_time_ms() - start < 2000u) {
-                if (!pump_node_reports(queue, session->node_ids,
+                if (!pump_node_reports(queue, session, session->node_ids,
                                        session->handlers, enabled)) {
                     success = false;
                     break;
@@ -265,7 +258,7 @@ int node_worker_stop(EventQueue *queue, void *opaque)
                     .type = EVENT_NODE_STOPPED,
                     .source = EVENT_SOURCE_HOST,
                     .node_id = session->node_ids[index],
-                    .tick = latest_node_ticks[index],
+                    .tick = session->latest_ticks[index],
                     .host_time_ns = host_time_ns()
                 };
                 if (!publish_report_event(queue, &stopped))
@@ -278,7 +271,7 @@ int node_worker_stop(EventQueue *queue, void *opaque)
     started[index] = session->handler_started[index];
     stop_handlers(session->handlers, started, EXPECTED_DEVICES);
     if (!publish_bad_frame_reports(
-            queue, session->node_ids, session->handlers, started))
+            queue, session, session->node_ids, session->handlers, started))
         success = false;
     return success ? 0 : 1;
 }

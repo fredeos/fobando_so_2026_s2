@@ -67,12 +67,6 @@ bool publish_report_event(EventQueue *queue, const Event *event)
     return false;
 }
 
-uint64_t latest_node_ticks[EXPECTED_DEVICES];
-uint64_t node_stop_heartbeat_baseline[EXPECTED_DEVICES];
-bool node_started_once[EXPECTED_DEVICES];
-bool node_reports_drained[EXPECTED_DEVICES];
-bool node_stop_pending[EXPECTED_DEVICES];
-
 /**
  * @brief Actualiza el último tick conocido de un nodo a partir de un evento.
  *
@@ -82,7 +76,7 @@ bool node_stop_pending[EXPECTED_DEVICES];
  * @param event Evento recibido desde el nodo.
  */
 /* Guarda el tick final observado para etiquetar correctamente el cierre. */
-static void record_node_event_tick(const Event *event)
+static void record_node_event_tick(NodeSerialContext *serial, const Event *event)
 {
     size_t index = event->node_id == 1u ? 0u : event->node_id == 2u ? 1u :
         EXPECTED_DEVICES;
@@ -93,8 +87,8 @@ static void record_node_event_tick(const Event *event)
          event->type == EVENT_IDLE_SLICE) &&
         UINT64_MAX - end >= event->duration_ticks)
         end += event->duration_ticks;
-    if (end > latest_node_ticks[index])
-        latest_node_ticks[index] = end;
+    if (end > serial->latest_ticks[index])
+        serial->latest_ticks[index] = end;
 }
 
 /**
@@ -372,6 +366,7 @@ bool wait_for_calibration(
  */
 bool wait_for_task_deploy(
     EventQueue *queue,
+    NodeSerialContext *serial,
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
@@ -423,11 +418,11 @@ bool wait_for_task_deploy(
                         .task_id = reply.data.tick_report.task_id
                     };
                 event.host_time_ns = host_time_ns();
-                record_node_event_tick(&event);
+                record_node_event_tick(serial, &event);
                 size_t index = node_id == 1u ? 0u : node_id == 2u ? 1u :
                     EXPECTED_DEVICES;
                 if (index < EXPECTED_DEVICES)
-                    node_reports_drained[index] = false;
+                    serial->reports_drained[index] = false;
                 if (!publish_report_event(queue, &event))
                     return false;
                 continue;
@@ -468,6 +463,7 @@ bool wait_for_task_deploy(
  */
 bool wait_for_control_reply(
     EventQueue *queue,
+    NodeSerialContext *serial,
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
@@ -528,11 +524,11 @@ bool wait_for_control_reply(
                         .task_id = reply.data.tick_report.task_id
                     };
                 event.host_time_ns = host_time_ns();
-                record_node_event_tick(&event);
+                record_node_event_tick(serial, &event);
                 size_t index = node_id == 1u ? 0u : node_id == 2u ? 1u :
                     EXPECTED_DEVICES;
                 if (index < EXPECTED_DEVICES)
-                    node_reports_drained[index] = false;
+                    serial->reports_drained[index] = false;
                 if (!publish_report_event(queue, &event))
                     return false;
                 continue;
@@ -562,6 +558,7 @@ bool wait_for_control_reply(
  */
 bool publish_bad_frame_reports(
     EventQueue *queue,
+    NodeSerialContext *serial,
     const uint32_t node_ids[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
     const bool enabled[EXPECTED_DEVICES]
@@ -580,7 +577,7 @@ bool publish_bad_frame_reports(
                 .type = EVENT_SERIAL_BAD_FRAME,
                 .source = EVENT_SOURCE_NODE,
                 .node_id = node_ids[i],
-                .tick = latest_node_ticks[i],
+                .tick = serial->latest_ticks[i],
                 .host_time_ns = host_time_ns(),
                 .detail = (int32_t)batch
             };
@@ -606,6 +603,7 @@ bool publish_bad_frame_reports(
  */
 bool pump_node_reports(
     EventQueue *queue,
+    NodeSerialContext *serial,
     const uint32_t node_ids[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
     const bool enabled[EXPECTED_DEVICES]
@@ -613,9 +611,12 @@ bool pump_node_reports(
 {
     /* Vaciar los mensajes disponibles sin bloquear al worker por una respuesta. */
     bool success = publish_bad_frame_reports(
-        queue, node_ids, handlers, enabled
+        queue, serial, node_ids, handlers, enabled
     );
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+        /* Cada proceso worker solo inicializa y atiende el handler habilitado. */
+        if (!enabled[i])
+            continue;
         for (;;) {
             char response[COMMS_MESSAGE_CAPACITY];
             size_t response_size = 0u;
@@ -665,25 +666,25 @@ bool pump_node_reports(
                 continue;
             }
             event.host_time_ns = host_time_ns();
-            record_node_event_tick(&event);
-            node_reports_drained[i] = false;
+            record_node_event_tick(serial, &event);
+            serial->reports_drained[i] = false;
             if (!publish_report_event(queue, &event))
                 success = false;
         }
 
-        if (node_stop_pending[i] &&
+        if (serial->stop_pending[i] &&
             comms_reports_drained_since(
-                &handlers[i], node_stop_heartbeat_baseline[i])) {
+                &handlers[i], serial->stop_heartbeat_baseline[i])) {
             Event stopped = {
                 .type = EVENT_NODE_STOPPED,
                 .source = EVENT_SOURCE_HOST,
                 .node_id = node_ids[i],
-                .tick = latest_node_ticks[i],
+                .tick = serial->latest_ticks[i],
                 .host_time_ns = host_time_ns()
             };
             if (publish_report_event(queue, &stopped)) {
-                node_reports_drained[i] = true;
-                node_stop_pending[i] = false;
+                serial->reports_drained[i] = true;
+                serial->stop_pending[i] = false;
             } else {
                 success = false;
             }
@@ -1372,11 +1373,10 @@ int main(int argc, char *argv[])
         context.workers[i].index = i;
         context.workers[i].command_read_fd = command_pipes[i][0];
         context.workers[i].reply_write_fd = reply_pipes[i][1];
+        /* Cada copia de contexto contiene solo los datos seriales de su worker. */
         context.workers[i].serial.config = context.config;
-        for (size_t node = 0u; node < EXPECTED_DEVICES; ++node) {
-            context.workers[i].serial.devices[node] = context.devices[node];
-            context.workers[i].serial.node_ids[node] = context.node_ids[node];
-        }
+        context.workers[i].serial.devices[i] = context.devices[i];
+        context.workers[i].serial.node_ids[i] = context.node_ids[i];
     }
 
     if (mkdir("output", 0775) != 0 && errno != EEXIST) {

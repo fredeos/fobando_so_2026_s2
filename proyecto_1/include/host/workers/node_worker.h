@@ -8,15 +8,16 @@
 #include "comms/comms.h"
 #include "host/config.h"
 #include "host/event_queue.h"
-#include "host/planner.h"
 
 #define EXPECTED_DEVICES 2
 #define HANDSHAKE_TIMEOUT_SECONDS 5
 #define CALIBRATION_REQUEST_ID 2u
 #define FIRST_CONTROL_REQUEST_ID 0x80000000u
 
+/* Recursos seriales que cada proceso worker conserva en su propia copia. */
 typedef struct {
     HostConfig config;
+    /* Solo el índice propio está poblado; se conserva el índice para helpers por arreglo. */
     const char *devices[EXPECTED_DEVICES];
     uint32_t node_ids[EXPECTED_DEVICES];
     comms_handler_t handlers[EXPECTED_DEVICES];
@@ -24,10 +25,12 @@ typedef struct {
     bool initialized[EXPECTED_DEVICES];
     bool handler_started[EXPECTED_DEVICES];
     bool running[EXPECTED_DEVICES];
-    Planner planner;
-    uint32_t next_deploy_request_id;
-    size_t initialized_count;
-} SerialReportSession;
+    uint64_t latest_ticks[EXPECTED_DEVICES];
+    uint64_t stop_heartbeat_baseline[EXPECTED_DEVICES];
+    bool started_once[EXPECTED_DEVICES];
+    bool reports_drained[EXPECTED_DEVICES];
+    bool stop_pending[EXPECTED_DEVICES];
+} NodeSerialContext;
 
 typedef enum {
     NODE_COMMAND_DEPLOY = 1,
@@ -48,18 +51,11 @@ typedef struct {
 } NodeReply;
 
 typedef struct {
-    SerialReportSession serial;
+    NodeSerialContext serial;
     size_t index;
     int command_read_fd;
     int reply_write_fd;
 } NodeWorkerContext;
-
-/* El fork de cada nodo crea su propia copia de estos datos de ejecución. */
-extern uint64_t latest_node_ticks[EXPECTED_DEVICES];
-extern uint64_t node_stop_heartbeat_baseline[EXPECTED_DEVICES];
-extern bool node_started_once[EXPECTED_DEVICES];
-extern bool node_reports_drained[EXPECTED_DEVICES];
-extern bool node_stop_pending[EXPECTED_DEVICES];
 
 /* Funciones compartidas con el coordinador para transporte y reportes. */
 bool publish_report_event(EventQueue *queue, const Event *event);
@@ -73,19 +69,22 @@ bool wait_for_ack(comms_handler_t *handler, uint32_t node_id,
 bool wait_for_calibration(comms_handler_t *handler, uint32_t node_id,
                           uint32_t request_id, const char *device,
                           uint32_t *ut_per_tick);
-bool wait_for_task_deploy(EventQueue *queue, comms_handler_t *handler,
+bool wait_for_task_deploy(EventQueue *queue, NodeSerialContext *serial,
+                          comms_handler_t *handler,
                           uint32_t node_id, uint32_t request_id,
                           const char *device, bool *accepted,
                           RejectReason *reason);
-bool wait_for_control_reply(EventQueue *queue, comms_handler_t *handler,
+bool wait_for_control_reply(EventQueue *queue, NodeSerialContext *serial,
+                            comms_handler_t *handler,
                             uint32_t node_id, uint32_t request_id,
                             MessageType expected_type, const char *device,
                             unsigned int timeout_seconds);
 bool publish_bad_frame_reports(
-    EventQueue *queue, const uint32_t node_ids[EXPECTED_DEVICES],
+    EventQueue *queue, NodeSerialContext *serial,
+    const uint32_t node_ids[EXPECTED_DEVICES],
     comms_handler_t handlers[EXPECTED_DEVICES],
     const bool enabled[EXPECTED_DEVICES]);
-bool pump_node_reports(EventQueue *queue,
+bool pump_node_reports(EventQueue *queue, NodeSerialContext *serial,
                        const uint32_t node_ids[EXPECTED_DEVICES],
                        comms_handler_t handlers[EXPECTED_DEVICES],
                        const bool enabled[EXPECTED_DEVICES]);
