@@ -125,6 +125,14 @@ objeto compartido.
 ## 3. Compilar y cargar el ESP32
 
 Se requiere una instalación funcional de ESP-IDF. La prueba actual usó v5.4.2.
+
+El firmware con comunicación y reportes necesita una pila de 8192 bytes para
+la tarea `main`, definida en `src/nodes/esp32/sdkconfig.defaults`. Si ya existe
+un `sdkconfig` anterior, configurar `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` en
+`idf.py menuconfig` (Component config > ESP System Settings > Main task stack
+size) y volver a compilar/cargar el ESP. El valor anterior de 3584 bytes puede
+provocar un desbordamiento de pila al responder CONFIG.
+
 Activar la instalación propia, por ejemplo:
 
 ```bash
