@@ -110,13 +110,23 @@ static JobHistory *get_job(JobTable *table, const Event *event)
     return job;
 }
 
-/* Mantener el orden de recepción para eventos del mismo nodo y tick */
+/* Usar el tiempo del Host para ordenar reinicios y decisiones de failover. */
 static int compare_events(const void *left, const void *right)
 {
     const Event *a = *(const Event *const *)left;
     const Event *b = *(const Event *const *)right;
-    if (a->node_id != b->node_id) return a->node_id < b->node_id ? -1 : 1;
-    if (a->tick != b->tick) return a->tick < b->tick ? -1 : 1;
+    /* En datos mixtos, ordenar primero los eventos legacy sin timestamp. */
+    if ((a->host_time_ns == 0u) != (b->host_time_ns == 0u))
+        return a->host_time_ns == 0u ? -1 : 1;
+    if (a->host_time_ns != 0u && a->host_time_ns != b->host_time_ns)
+        return a->host_time_ns < b->host_time_ns ? -1 : 1;
+    /* Fixtures y reportes antiguos pueden no tener marca temporal del Host. */
+    if (a->host_time_ns == 0u) {
+        if (a->node_id != b->node_id)
+            return a->node_id < b->node_id ? -1 : 1;
+        if (a->tick != b->tick)
+            return a->tick < b->tick ? -1 : 1;
+    }
     return a == b ? 0 : (a < b ? -1 : 1);
 }
 
@@ -138,6 +148,7 @@ static bool runtime_event(EventType type)
 static void update_load(ReportStatistics *statistics, NodeStatistics *node)
 {
     node->load = 0.0L;
+    node->missing_cost = false;
     for (size_t i = 0; i < statistics->task_count; ++i) {
         TaskStatistics *task = &statistics->tasks[i];
         if (task->node_id != node->node_id || !task->active) continue;
@@ -155,6 +166,9 @@ static void update_load(ReportStatistics *statistics, NodeStatistics *node)
 /* Avanzar la integral de carga únicamente mientras el nodo está activo */
 static void advance(NodeStatistics *node, uint64_t tick)
 {
+    /* Eventos del Host como ACCEPTED pueden tener tick cero tras reconexión. */
+    if (tick <= node->clock)
+        return;
     if (node->running) {
         uint64_t duration = tick - node->clock;
         node->observed_ticks += duration;
@@ -275,7 +289,7 @@ bool statistics_build(const Event *events, size_t count, ReportStatistics *out)
             if (task == NULL || !update_task(task, event, &jobs)) goto fail;
             if (node != NULL && event->type != EVENT_TASK_ACCEPTED &&
                 event->type != EVENT_TASK_REJECTED &&
-                (!task->active || !task->definition_known || !task->cost_known))
+                (!task->definition_known || !task->cost_known))
                 node->missing_cost = true;
         }
 

@@ -65,23 +65,31 @@ static void write_nodes(FILE *file, const ReportStatistics *statistics)
         fprintf(file, "<tr><td>%" PRIu32 "</td><td>%" PRIu64 "</td><td>%" PRIu64
                 "</td><td>%" PRIu64 "</td>", node->node_id, node->observed_ticks,
                 node->busy_ticks, node->idle_ticks);
-        if (node->missing_cost) fputs("<td>N/D</td><td>N/D</td><td>N/D</td>", file);
+        if (node->missing_cost) {
+            /* La carga no se puede reconstruir; los picos/finales sí reflejan
+             * las asignaciones conocidas y el faltante queda señalado abajo. */
+            if (node->observed_ticks == 0u) fputs("<td>0.00%</td>", file);
+            else fprintf(file, "<td>%.2Lf%%</td>", node->theoretical_mean * 100.0L);
+            fprintf(file, "<td>%.2Lf%%</td><td>%.2Lf%%</td>",
+                    node->theoretical_peak * 100.0L,
+                    node->theoretical_final * 100.0L);
+        }
         else {
-            if (node->observed_ticks == 0u) fputs("<td>N/D</td>", file);
+            if (node->observed_ticks == 0u) fputs("<td>0.00%</td>", file);
             else fprintf(file, "<td>%.2Lf%%</td>", node->theoretical_mean * 100.0L);
             fprintf(file, "<td>%.2Lf%%</td><td>%.2Lf%%</td>",
                     node->theoretical_peak * 100.0L, node->theoretical_final * 100.0L);
         }
-        if (node->observed_ticks == 0u || node->overlapping_slices > 0u ||
-            node->out_of_window_slices > 0u || node->busy_ticks > node->observed_ticks ||
-            node->idle_ticks != node->observed_ticks - node->busy_ticks)
-            fputs("<td>N/D</td>", file);
-        else fprintf(file, "<td>%.2Lf%%</td>",
-                      (long double)node->busy_ticks / node->observed_ticks * 100.0L);
+        uint64_t measured_ticks = node->busy_ticks + node->idle_ticks;
+        fprintf(file, "<td>%.2Lf%%</td>", measured_ticks == 0u ? 0.0L :
+                (long double)node->busy_ticks / measured_ticks * 100.0L);
         fprintf(file, "<td>%" PRIu64 "</td><td>%" PRIu64 "</td><td>%" PRIu64 "</td><td>",
                 node->switches, node->failures, node->bad_frames);
         if (node->implicit_start) fputs("Inicio inferido. ", file);
         if (node->missing_cost) fputs("Falta definición/costo. ", file);
+        if (node->observed_ticks == 0u) fputs("Sin ticks activos observados. ", file);
+        if (node->busy_ticks + node->idle_ticks == 0u)
+            fputs("Sin tramos de ejecución/inactividad registrados. ", file);
         if (node->overlapping_slices > 0u) fputs("Hay tramos superpuestos. ", file);
         if (node->out_of_window_slices > 0u) fputs("Hay tramos fuera del tiempo activo. ", file);
         if (node->busy_ticks > node->observed_ticks) fputs("Ejecución fuera del tiempo activo. ", file);
@@ -91,8 +99,9 @@ static void write_nodes(FILE *file, const ReportStatistics *statistics)
     }
     fputs("</tbody></table></div><p>Teórica: suma C/T de las asignaciones confirmadas. "
           "La media integra esa carga durante los ticks activos; el pico y la carga final "
-          "conservan los cambios de asignación. Medida: unión de ticks ejecutados / ticks activos. "
-          "Sin intervalos de ejecución no se puede reconstruir el trabajo a partir de reportes de tick.</p>", file);
+          "conservan los cambios de asignación. Medida: ticks ocupados / tramos ocupados e idle "
+          "registrados. Cuando no hay tramos, se muestra 0.00% y la columna Calidad lo indica; "
+          "esa cifra representa ausencia de ejecución registrada, no una medición completa.</p>", file);
 }
 
 static void write_tasks(FILE *file, const ReportStatistics *statistics)
