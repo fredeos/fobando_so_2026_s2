@@ -10,6 +10,26 @@
 #include "common/message_parser.h"
 #include "timing/timing.h"
 
+#define RECONFIGURE_ATTEMPTS 3u
+#define RECONFIGURE_READY_TIMEOUT_MS 10000u
+
+/* Espera a que el handler haya reconectado y pueda aceptar otro mensaje. */
+static bool wait_until_send_ready(comms_handler_t *handler)
+{
+    uint64_t deadline = monotonic_time_ms() + RECONFIGURE_READY_TIMEOUT_MS;
+    while (monotonic_time_ms() < deadline) {
+        pthread_mutex_lock(&handler->mutex);
+        bool online = handler->online;
+        bool send_free = !handler->sent.set;
+        pthread_mutex_unlock(&handler->mutex);
+        if (online && send_free)
+            return true;
+        struct timespec pause = {.tv_nsec = 100000000L};
+        nanosleep(&pause, NULL);
+    }
+    return false;
+}
+
 /* Notifica al coordinador los cambios de enlace después de la conexión inicial. */
 static bool publish_link_transition(NodeWorkerContext *context,
                                     comms_handler_t *handler,
@@ -28,7 +48,11 @@ static bool publish_link_transition(NodeWorkerContext *context,
     if (online == context->last_link_online)
         return true;
 
-    NodeLinkStatus status = {.node_id = node_id, .online = online};
+    NodeLinkStatus status = {
+        .node_id = node_id,
+        .tick = context->serial.latest_ticks[context->index],
+        .online = online
+    };
     const unsigned char *bytes = (const unsigned char *)&status;
     size_t written = 0u;
     while (written < sizeof(status)) {
@@ -108,6 +132,7 @@ int node_worker_run(EventQueue *queue, void *opaque)
                               CALIBRATION_REQUEST_ID,
                               session->devices[index], &ut_per_tick))
         return 1;
+    session->ut_per_tick[index] = ut_per_tick;
 
     /* 4. Registrar la calibración y contestar al coordinador por el pipe. */
     Event calibrated = {
@@ -156,7 +181,92 @@ int node_worker_run(EventQueue *queue, void *opaque)
                                       sizeof(command), false, 1000))
             return 1;
         NodeReply reply = {.reason = REJECT_INVALID_STATE};
-        if (command.type == NODE_COMMAND_DEPLOY) {
+        if (command.type == NODE_COMMAND_RECONFIGURE) {
+            /* Reaplicar CONFIG/calibración; los cortes breves se recuperan aquí. */
+            Message request = {
+                .type = MSG_CONFIG,
+                .node_id = session->node_ids[index],
+                .request_id = 1u,
+                .data.config = {
+                    .algorithm = session->config.algorithm == SCHED_EDF
+                        ? MESSAGE_SCHED_EDF : MESSAGE_SCHED_RMS,
+                    .tick_ms = session->config.tick_ms,
+                    .report_every_ticks = session->config.report_every_ticks
+                }
+            };
+            bool config_accepted = false;
+            RejectReason config_reason = REJECT_NONE;
+            bool config_reply_received = false;
+            for (unsigned int attempt = 1u;
+                 attempt <= RECONFIGURE_ATTEMPTS && !config_reply_received;
+                 ++attempt) {
+                if (!wait_until_send_ready(handler))
+                    continue;
+                if (!send_message(handler, session->sent[index], &request,
+                                  request.node_id, "CONFIG"))
+                    continue;
+                config_reply_received = wait_for_config_reply(
+                    queue, session, handler, request.node_id,
+                    request.request_id, session->devices[index],
+                    &config_accepted, &config_reason);
+                if (!config_reply_received && attempt < RECONFIGURE_ATTEMPTS) {
+                    fprintf(stderr,
+                        "Reintentando CONFIG para nodo %u (%u/%u).\n",
+                        request.node_id, attempt + 1u,
+                        RECONFIGURE_ATTEMPTS);
+                }
+            }
+
+            if (config_reply_received && config_accepted) {
+                /* Un CONFIG nuevo implica que el MCU reinició sus ticks. */
+                session->tick_offset[index] =
+                    session->latest_ticks[index] == UINT64_MAX
+                    ? UINT64_MAX : session->latest_ticks[index] + 1u;
+                Message calibration = {
+                    .type = MSG_CALIBRATE_REQUEST,
+                    .node_id = request.node_id,
+                    .request_id = CALIBRATION_REQUEST_ID,
+                    .data.sample_ticks = CALIBRATION_DEFAULT_SAMPLES
+                };
+                for (unsigned int attempt = 1u;
+                     attempt <= RECONFIGURE_ATTEMPTS && !reply.ok;
+                     ++attempt) {
+                    uint32_t capacity = 0u;
+                    if (wait_until_send_ready(handler) &&
+                        send_message(handler, session->sent[index],
+                                     &calibration, request.node_id,
+                                     "CALIBRATE_REQUEST") &&
+                        wait_for_calibration(handler, request.node_id,
+                            calibration.request_id, session->devices[index],
+                            &capacity)) {
+                        session->ut_per_tick[index] = capacity;
+                        reply.ok = true;
+                        reply.ut_per_tick = capacity;
+                    } else if (attempt < RECONFIGURE_ATTEMPTS) {
+                        fprintf(stderr,
+                            "Reintentando calibración para nodo %u (%u/%u).\n",
+                            request.node_id, attempt + 1u,
+                            RECONFIGURE_ATTEMPTS);
+                    }
+                }
+            } else if (config_reply_received &&
+                       config_reason == REJECT_INVALID_STATE &&
+                       session->ut_per_tick[index] > 0u) {
+                /* El firmware conservó su configuración y calibración. */
+                reply.ok = true;
+                reply.ut_per_tick = session->ut_per_tick[index];
+            }
+            if (reply.ok) {
+                Event calibrated = {
+                    .type = EVENT_NODE_CALIBRATED,
+                    .source = EVENT_SOURCE_HOST,
+                    .node_id = request.node_id,
+                    .ut_per_tick = reply.ut_per_tick,
+                    .host_time_ns = host_time_ns()
+                };
+                reply.ok = publish_report_event(queue, &calibrated);
+            }
+        } else if (command.type == NODE_COMMAND_DEPLOY) {
             /* El coordinador ya eligió el nodo; aquí solo se reenvía al firmware. */
             Message *request = &command.message;
             if (request->type == MSG_DEPLOY_TASK &&

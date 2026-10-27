@@ -48,8 +48,10 @@ typedef struct {
     int pipe_fds[EXPECTED_DEVICES * 6u];
     NodeWorkerContext workers[EXPECTED_DEVICES];
     bool node_online[EXPECTED_DEVICES];
+    bool node_should_run[EXPECTED_DEVICES];
     bool failover_active[EXPECTED_DEVICES];
     FailoverResult failovers[EXPECTED_DEVICES];
+    uint32_t next_control_request_id;
     Planner planner;
     uint32_t next_deploy_request_id;
 } HostCoordinatorContext;
@@ -81,12 +83,14 @@ bool publish_report_event(EventQueue *queue, const Event *event)
  * @param event Evento recibido desde el nodo.
  */
 /* Guarda el tick final observado para etiquetar correctamente el cierre. */
-static void record_node_event_tick(NodeSerialContext *serial, const Event *event)
+static void record_node_event_tick(NodeSerialContext *serial, Event *event)
 {
     size_t index = event->node_id == 1u ? 0u : event->node_id == 2u ? 1u :
         EXPECTED_DEVICES;
     if (index >= EXPECTED_DEVICES)
         return;
+    if (UINT64_MAX - event->tick >= serial->tick_offset[index])
+        event->tick += serial->tick_offset[index];
     uint64_t end = event->tick;
     if ((event->type == EVENT_EXECUTION_SLICE ||
          event->type == EVENT_IDLE_SLICE) &&
@@ -270,6 +274,77 @@ bool wait_for_ack(
 
         if (time(NULL) - start >= HANDSHAKE_TIMEOUT_SECONDS) {
             fprintf(stderr, "Timeout esperando ACK de nodo %u en %s.\n",
+                node_id, device);
+            return false;
+        }
+        struct timespec pause = {.tv_nsec = 10000000L};
+        nanosleep(&pause, NULL);
+    }
+}
+
+/* Espera ACK/NACK de CONFIG y conserva los reportes que lleguen entre ambos. */
+bool wait_for_config_reply(
+    EventQueue *queue,
+    NodeSerialContext *serial,
+    comms_handler_t *handler,
+    uint32_t node_id,
+    uint32_t request_id,
+    const char *device,
+    bool *accepted,
+    RejectReason *reason
+)
+{
+    uint64_t started = monotonic_time_ms();
+    for (;;) {
+        char response[COMMS_MESSAGE_CAPACITY];
+        size_t response_size = 0u;
+        bool ready = false;
+        if (!take_received_message(handler, response, sizeof(response),
+                                  &response_size, &ready))
+            return false;
+        if (ready) {
+            if (response_size > 0u && response[response_size - 1u] == '\0')
+                --response_size;
+            Message reply;
+            MessageParseResult parsed = message_parse(
+                response, response_size, &reply
+            );
+            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
+                reply.request_id == request_id &&
+                (reply.type == MSG_ACK || reply.type == MSG_NACK) &&
+                reply.data.reply.type == MSG_CONFIG) {
+                *accepted = reply.type == MSG_ACK;
+                *reason = *accepted ? REJECT_NONE : reply.data.reply.reason;
+                comms_acquire_send(handler);
+                if (*accepted)
+                    printf("CONFIG confirmado por nodo %u (%s).\n", node_id,
+                        device);
+                return true;
+            }
+            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
+                (reply.type == MSG_EVENT || reply.type == MSG_TICK_REPORT)) {
+                Event event = reply.type == MSG_EVENT
+                    ? reply.data.event
+                    : (Event){
+                        .type = EVENT_TICK_REPORT,
+                        .source = EVENT_SOURCE_NODE,
+                        .node_id = reply.node_id,
+                        .tick = reply.data.tick_report.tick,
+                        .task_id = reply.data.tick_report.task_id
+                    };
+                record_node_event_tick(serial, &event);
+                event.host_time_ns = host_time_ns();
+                if (!publish_report_event(queue, &event))
+                    return false;
+            } else if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
+                       response[0] == '{') {
+                fprintf(stderr, "Respuesta CONFIG inválida de nodo %u (%s): %s\n",
+                    node_id, device, message_parse_result_string(parsed));
+            }
+        }
+        if (monotonic_time_ms() - started >=
+            (uint64_t)HANDSHAKE_TIMEOUT_SECONDS * 1000u) {
+            fprintf(stderr, "Timeout esperando respuesta CONFIG de nodo %u (%s).\n",
                 node_id, device);
             return false;
         }
@@ -790,10 +865,13 @@ static bool request_node_worker(
     if (context == NULL || command == NULL || reply == NULL ||
         node_index >= EXPECTED_DEVICES)
         return false;
+    int reply_timeout_ms = command->type == NODE_COMMAND_RECONFIGURE
+        ? 70000 : 12000;
     if (!transfer_process_message(context->command_write_fd[node_index],
                                   (void *)command, sizeof(*command), true, 6000) ||
         !transfer_process_message(context->reply_read_fd[node_index],
-                                  reply, sizeof(*reply), false, 12000)) {
+                                  reply, sizeof(*reply), false,
+                                  reply_timeout_ms)) {
         fprintf(stderr, "No hubo respuesta del proceso del nodo %u.\n",
             context->node_ids[node_index]);
         event_queue_mark_incomplete(queue);
@@ -1170,13 +1248,15 @@ static bool coordinator_control_node(
             type == MSG_START ? "START" : "STOP", context->node_ids[index]);
         return false;
     }
+    context->node_should_run[index] = type == MSG_START;
     return true;
 }
 
 /* Replanifica las tareas del nodo caído y despliega las que quepan en el otro. */
 static bool coordinator_failover_node(EventQueue *queue,
                                       HostCoordinatorContext *context,
-                                      size_t failed_index)
+                                      size_t failed_index,
+                                      uint64_t failed_tick)
 {
     FailoverResult *result = &context->failovers[failed_index];
     if (!failover_handle_node_failure(&context->planner,
@@ -1187,6 +1267,7 @@ static bool coordinator_failover_node(EventQueue *queue,
         .type = EVENT_NODE_FAILED,
         .source = EVENT_SOURCE_HOST,
         .node_id = context->node_ids[failed_index],
+        .tick = failed_tick,
         .host_time_ns = host_time_ns()
     };
     if (!publish_report_event(queue, &failed))
@@ -1247,11 +1328,13 @@ static bool coordinator_failover_node(EventQueue *queue,
 static bool coordinator_restore_unmigrated_tasks(
     EventQueue *queue,
     HostCoordinatorContext *context,
-    size_t node_index
+    size_t node_index,
+    bool *restored_any
 )
 {
     FailoverResult *result = &context->failovers[node_index];
     bool success = true;
+    *restored_any = false;
     for (size_t i = 0u; i < result->count; ++i) {
         FailoverEntry *entry = &result->entries[i];
         if (entry->decision.accepted)
@@ -1295,6 +1378,8 @@ static bool coordinator_restore_unmigrated_tasks(
         if (!publish_report_event(queue, &event))
             success = false;
         if (accepted)
+            *restored_any = true;
+        if (accepted)
             printf("Failover: tarea %u restaurada en nodo %u.\n",
                 entry->task.id, restored.node_id);
     }
@@ -1318,7 +1403,7 @@ static bool coordinator_handle_link_status(EventQueue *queue,
     if (!status->online && was_online && !context->failover_active[index]) {
         context->failover_active[index] = true;
         printf("Nodo %u desconectado; iniciando failover.\n", status->node_id);
-        if (!coordinator_failover_node(queue, context, index)) {
+        if (!coordinator_failover_node(queue, context, index, status->tick)) {
             event_queue_mark_incomplete(queue);
             return false;
         }
@@ -1330,9 +1415,37 @@ static bool coordinator_handle_link_status(EventQueue *queue,
         }
         printf("Nodo %u reconectado; disponible para nuevas tareas.\n",
             status->node_id);
-        if (!coordinator_restore_unmigrated_tasks(queue, context, index)) {
+        NodeCommand reconfigure = {.type = NODE_COMMAND_RECONFIGURE};
+        NodeReply calibration;
+        if (!request_node_worker(queue, context, index, &reconfigure,
+                                 &calibration) || !calibration.ok ||
+            calibration.ut_per_tick == 0u) {
+            fprintf(stderr, "No se pudo reconfigurar el nodo %u al reconectar.\n",
+                status->node_id);
             event_queue_mark_incomplete(queue);
             return false;
+        }
+        context->planner.nodes[index].ut_per_tick = calibration.ut_per_tick;
+
+        bool restored_any = false;
+        if (!coordinator_restore_unmigrated_tasks(
+                queue, context, index, &restored_any)) {
+            event_queue_mark_incomplete(queue);
+            return false;
+        }
+        if (restored_any && context->node_should_run[index]) {
+            /* STOP normaliza firmware que siguió activo; START vuelve a correrlo. */
+            if (!coordinator_control_node(
+                    queue, context, MSG_STOP, index,
+                    take_control_request_id(&context->next_control_request_id)) ||
+                !coordinator_control_node(
+                    queue, context, MSG_START, index,
+                    take_control_request_id(&context->next_control_request_id))) {
+                event_queue_mark_incomplete(queue);
+                return false;
+            }
+            printf("Scheduler del nodo %u reanudado tras la reconexión.\n",
+                status->node_id);
         }
     }
     return true;
@@ -1372,7 +1485,7 @@ static int host_coordinator_run(EventQueue *queue, void *opaque)
             queue, context, context->config.tasks_file, capacities))
         return 1;
 
-    uint32_t next_control_request_id = FIRST_CONTROL_REQUEST_ID;
+    context->next_control_request_id = FIRST_CONTROL_REQUEST_ID;
     /* Este buffer arma una línea de consola sin bloquear el procesamiento de la sesión. */
     char line[320];
     size_t used = 0u;
@@ -1469,7 +1582,7 @@ static int host_coordinator_run(EventQueue *queue, void *opaque)
             bool success = true;
             for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
                 if (!coordinator_control_node(queue, context, type, i,
-                        take_control_request_id(&next_control_request_id)))
+                        take_control_request_id(&context->next_control_request_id)))
                     success = false;
             if (!success)
                 event_queue_mark_incomplete(queue);
@@ -1482,7 +1595,7 @@ static int host_coordinator_run(EventQueue *queue, void *opaque)
             size_t index = line[strlen(line) - 1u] == '1' ? 0u : 1u;
             if (!coordinator_control_node(
                     queue, context, starting ? MSG_START : MSG_STOP, index,
-                    take_control_request_id(&next_control_request_id)))
+                    take_control_request_id(&context->next_control_request_id)))
                 event_queue_mark_incomplete(queue);
         } else if (line[0] != '\0') {
             puts("Comando inválido. Usa add, start [1|2], stop [1|2] o q.");

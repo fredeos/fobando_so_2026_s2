@@ -25,7 +25,9 @@ typedef struct {
     bool initialized[EXPECTED_DEVICES];
     bool handler_started[EXPECTED_DEVICES];
     bool running[EXPECTED_DEVICES];
+    uint32_t ut_per_tick[EXPECTED_DEVICES];
     uint64_t latest_ticks[EXPECTED_DEVICES];
+    uint64_t tick_offset[EXPECTED_DEVICES];
     uint64_t stop_heartbeat_baseline[EXPECTED_DEVICES];
     bool started_once[EXPECTED_DEVICES];
     bool reports_drained[EXPECTED_DEVICES];
@@ -35,7 +37,8 @@ typedef struct {
 typedef enum {
     NODE_COMMAND_DEPLOY = 1,
     NODE_COMMAND_START,
-    NODE_COMMAND_STOP
+    NODE_COMMAND_STOP,
+    NODE_COMMAND_RECONFIGURE
 } NodeCommandType;
 
 typedef struct {
@@ -62,6 +65,7 @@ typedef struct {
 
 typedef struct {
     uint32_t node_id;
+    uint64_t tick;
     bool online;
 } NodeLinkStatus;
 
@@ -74,6 +78,10 @@ bool send_message(comms_handler_t *handler, char *buffer,
                   const char *message_name);
 bool wait_for_ack(comms_handler_t *handler, uint32_t node_id,
                   uint32_t request_id, const char *device);
+bool wait_for_config_reply(EventQueue *queue, NodeSerialContext *serial,
+                           comms_handler_t *handler, uint32_t node_id,
+                           uint32_t request_id, const char *device,
+                           bool *accepted, RejectReason *reason);
 bool wait_for_calibration(comms_handler_t *handler, uint32_t node_id,
                           uint32_t request_id, const char *device,
                           uint32_t *ut_per_tick);
