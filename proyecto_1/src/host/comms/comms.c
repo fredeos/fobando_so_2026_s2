@@ -240,7 +240,10 @@ void* comms_handler(void* arg){
         bool timeout = (full_ticks && !minimum && !serial_refresh);
         if (timeout) {
             printf("%s: Device(%d) disconnected by timeout!\n", hd->dev, hd->id);
-            close(hd->fd);
+            if (hd->fd >= 0) {
+                close(hd->fd);
+                hd->fd = -1;
+            }
             stage = 0;
             serial_refresh = true;
             status = COMMS_TX_ERROR;
@@ -266,9 +269,10 @@ void* comms_handler(void* arg){
             hd->finished = true;
             pthread_mutex_unlock(&hd->mutex); // unlock
             // + Close file descriptor
-            if (!serial_refresh){
+            if (!serial_refresh && hd->fd >= 0){
                 printf("Closing file descriptor for device(%d)\n", hd->id);
                 close(hd->fd);
+                hd->fd = -1;
             }
             break;
         }
@@ -397,7 +401,10 @@ void* comms_handler(void* arg){
                 stage = 0;
                 serial_refresh = true;
                 status = COMMS_RX_ERROR;
-                close(hd->fd);
+                if (hd->fd >= 0) {
+                    close(hd->fd);
+                    hd->fd = -1;
+                }
             } else status = COMMS_RX_BUSY;
             // (Check completion)
             if (rx.complete){
@@ -455,9 +462,10 @@ void* comms_handler(void* arg){
     hd->running = false;
     hd->online = false;
     pthread_mutex_unlock(&hd->mutex);
-    if (!setup_fail) {
+    if (hd->fd >= 0) {
         printf("Closing file descriptor for %s device(%d)\n", hd->dev, hd->id);
         close(hd->fd);
+        hd->fd = -1;
     }
     // << Return >>
     return NULL;

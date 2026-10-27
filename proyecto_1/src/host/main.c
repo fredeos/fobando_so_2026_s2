@@ -23,7 +23,18 @@
 #define MSG_TICK   1u  // send message every 1 s
 #define PRIORITY    1  // priority level 1
 
-int main(int argc, char *argv[])
+#define HANDSHAKE_TIMEOUT_SECONDS 5
+#define CALIBRATION_REQUEST_ID    2u
+#define FIRST_DEPLOY_REQUEST_ID   3u
+#define FIRST_CONTROL_REQUEST_ID  0x80000000u
+
+static bool send_message(
+    comms_handler_t *handler,
+    char *buffer,
+    const Message *message,
+    uint32_t node_id,
+    const char *message_name
+)
 {
     size_t json_length = 0u;
     MessageSerializeResult serialized = message_serialize(
@@ -581,7 +592,7 @@ static bool plan_and_deploy_tasks(
             config->tasks_file, error);
         goto cleanup;
     }
-    if (tasks.count > UINT32_MAX - FIRST_DEPLOY_REQUEST_ID + 1u) {
+    if (tasks.count > FIRST_CONTROL_REQUEST_ID - FIRST_DEPLOY_REQUEST_ID) {
         fprintf(stderr, "El archivo contiene demasiadas tareas para request_id.\n");
         goto cleanup;
     }
