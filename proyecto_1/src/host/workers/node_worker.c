@@ -5,9 +5,44 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
 #include "host/workers/node_worker.h"
 #include "common/message_parser.h"
 #include "timing/timing.h"
+
+/* Notifica al coordinador los cambios de enlace después de la conexión inicial. */
+static bool publish_link_transition(NodeWorkerContext *context,
+                                    comms_handler_t *handler,
+                                    uint32_t node_id)
+{
+    pthread_mutex_lock(&handler->mutex);
+    bool online = handler->online;
+    pthread_mutex_unlock(&handler->mutex);
+
+    if (!context->link_status_known) {
+        if (!online)
+            return true;
+        context->link_status_known = true;
+        context->last_link_online = false;
+    }
+    if (online == context->last_link_online)
+        return true;
+
+    NodeLinkStatus status = {.node_id = node_id, .online = online};
+    const unsigned char *bytes = (const unsigned char *)&status;
+    size_t written = 0u;
+    while (written < sizeof(status)) {
+        ssize_t count = write(context->link_status_write_fd, bytes + written,
+                              sizeof(status) - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return false;
+        written += (size_t)count;
+    }
+    context->last_link_online = online;
+    return true;
+}
 
 /**
  * @brief Configura un nodo y luego atiende órdenes del coordinador.
@@ -94,6 +129,9 @@ int node_worker_run(EventQueue *queue, void *opaque)
         /* Los reportes del dispositivo van a la cola compartida del reporter. */
         if (!pump_node_reports(queue, session, session->node_ids,
                                session->handlers, enabled))
+            return 1;
+        if (!publish_link_transition(context, handler,
+                                     session->node_ids[index]))
             return 1;
         /* poll evita bloquear la lectura de reportes esperando una orden. */
         struct pollfd command_event = {

@@ -16,6 +16,7 @@
 #include "common/message_parser.h"
 #include "host/config.h"
 #include "host/manual_tasks.h"
+#include "host/failover.h"
 #include "host/statistics.h"
 #include "host/task_parser.h"
 #include "comms/comms.h"
@@ -43,8 +44,12 @@ typedef struct {
     uint32_t node_ids[EXPECTED_DEVICES];
     int command_write_fd[EXPECTED_DEVICES];
     int reply_read_fd[EXPECTED_DEVICES];
-    int pipe_fds[EXPECTED_DEVICES * 4u];
+    int link_status_read_fd[EXPECTED_DEVICES];
+    int pipe_fds[EXPECTED_DEVICES * 6u];
     NodeWorkerContext workers[EXPECTED_DEVICES];
+    bool node_online[EXPECTED_DEVICES];
+    bool failover_active[EXPECTED_DEVICES];
+    FailoverResult failovers[EXPECTED_DEVICES];
     Planner planner;
     uint32_t next_deploy_request_id;
 } HostCoordinatorContext;
@@ -850,17 +855,19 @@ static int prepare_child_pipe_descriptors(
     if (context == NULL || (!reporter && worker_index >= EXPECTED_DEVICES))
         return 1;
 
-    int retained[2] = {-1, -1};
+    int retained[3] = {-1, -1, -1};
     /* Mantener abiertos únicamente los extremos que el proceso usará. */
     if (!reporter) {
         retained[0] = context->workers[worker_index].command_read_fd;
         retained[1] = context->workers[worker_index].reply_write_fd;
+        retained[2] = context->workers[worker_index].link_status_write_fd;
     }
 
     bool success = true;
-    for (size_t i = 0u; i < EXPECTED_DEVICES * 4u; ++i) {
+    for (size_t i = 0u; i < EXPECTED_DEVICES * 6u; ++i) {
         int fd = context->pipe_fds[i];
-        if (fd < 0 || fd == retained[0] || fd == retained[1])
+        if (fd < 0 || fd == retained[0] || fd == retained[1] ||
+            fd == retained[2])
             continue;
         if (close(fd) != 0) {
             perror("close inherited node pipe");
@@ -887,17 +894,13 @@ static int close_parent_pipe_descriptors(void *opaque)
 
     bool success = true;
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
-        size_t command_read = i * 4u;
-        size_t reply_write = command_read + 3u;
-        if (context->pipe_fds[command_read] >= 0) {
-            if (close(context->pipe_fds[command_read]) != 0)
+        size_t base = i * 6u;
+        const size_t child_only[] = {base, base + 3u, base + 5u};
+        for (size_t j = 0u; j < sizeof(child_only) / sizeof(child_only[0]); ++j) {
+            int fd = context->pipe_fds[child_only[j]];
+            if (fd >= 0 && close(fd) != 0)
                 success = false;
-            context->pipe_fds[command_read] = -1;
-        }
-        if (context->pipe_fds[reply_write] >= 0) {
-            if (close(context->pipe_fds[reply_write]) != 0)
-                success = false;
-            context->pipe_fds[reply_write] = -1;
+            context->pipe_fds[child_only[j]] = -1;
         }
     }
     return success ? 0 : 1;
@@ -1170,6 +1173,171 @@ static bool coordinator_control_node(
     return true;
 }
 
+/* Replanifica las tareas del nodo caído y despliega las que quepan en el otro. */
+static bool coordinator_failover_node(EventQueue *queue,
+                                      HostCoordinatorContext *context,
+                                      size_t failed_index)
+{
+    FailoverResult *result = &context->failovers[failed_index];
+    if (!failover_handle_node_failure(&context->planner,
+                                      context->node_ids[failed_index], result))
+        return false;
+
+    Event failed = {
+        .type = EVENT_NODE_FAILED,
+        .source = EVENT_SOURCE_HOST,
+        .node_id = context->node_ids[failed_index],
+        .host_time_ns = host_time_ns()
+    };
+    if (!publish_report_event(queue, &failed))
+        return false;
+
+    bool success = true;
+    for (size_t i = 0u; i < result->count; ++i) {
+        FailoverEntry *entry = &result->entries[i];
+        if (!entry->decision.accepted) {
+            Event rejected = {
+                .type = EVENT_TASK_REJECTED,
+                .source = EVENT_SOURCE_HOST,
+                .task_id = entry->task.id,
+                .detail = entry->decision.reason,
+                .task = entry->task,
+                .host_time_ns = host_time_ns()
+            };
+            if (!publish_report_event(queue, &rejected))
+                success = false;
+            fprintf(stderr, "Failover: tarea %u sin capacidad disponible (%s).\n",
+                entry->task.id,
+                report_reject_reason(entry->decision.reason));
+            continue;
+        }
+
+        NodeReply reply;
+        if (!coordinator_deploy_task(queue, context, &entry->decision,
+                                     &entry->task, &reply) || !reply.ok) {
+            success = false;
+            continue;
+        }
+        if (!reply.accepted) {
+            if (!planner_remove_task(&context->planner,
+                                     entry->decision.node_id,
+                                     entry->task.id))
+                success = false;
+        }
+        Event moved = {
+            .type = reply.accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
+            .source = reply.accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
+            .node_id = entry->decision.node_id,
+            .task_id = entry->task.id,
+            .cost_ticks = reply.accepted ? entry->decision.cost_ticks : 0u,
+            .detail = reply.accepted ? REJECT_NONE : reply.reason,
+            .task = entry->task,
+            .host_time_ns = host_time_ns()
+        };
+        if (!publish_report_event(queue, &moved))
+            success = false;
+        printf("Failover: tarea %u %s en nodo %u.\n", entry->task.id,
+            reply.accepted ? "reasignada" : "rechazada por el nodo",
+            entry->decision.node_id);
+    }
+    return success;
+}
+
+/* Recupera en el nodo reconectado las tareas que no cupieron en el sobreviviente. */
+static bool coordinator_restore_unmigrated_tasks(
+    EventQueue *queue,
+    HostCoordinatorContext *context,
+    size_t node_index
+)
+{
+    FailoverResult *result = &context->failovers[node_index];
+    bool success = true;
+    for (size_t i = 0u; i < result->count; ++i) {
+        FailoverEntry *entry = &result->entries[i];
+        if (entry->decision.accepted)
+            continue; /* Ya quedó asignada al nodo sobreviviente. */
+
+        PlannerDecision restored = planner_assign_task(
+            &context->planner, &entry->task
+        );
+        if (!restored.accepted) {
+            fprintf(stderr,
+                "No se pudo restaurar la tarea %u en el nodo %u (%s).\n",
+                entry->task.id, context->node_ids[node_index],
+                report_reject_reason(restored.reason));
+            success = false;
+            continue;
+        }
+
+        NodeReply reply;
+        bool replied = coordinator_deploy_task(
+            queue, context, &restored, &entry->task, &reply
+        );
+        bool accepted = replied && reply.ok &&
+            (reply.accepted || reply.reason == REJECT_DUPLICATE_TASK);
+        if (!accepted) {
+            (void)planner_remove_task(&context->planner,
+                                      restored.node_id, entry->task.id);
+            success = false;
+        }
+
+        Event event = {
+            .type = accepted ? EVENT_TASK_ACCEPTED : EVENT_TASK_REJECTED,
+            .source = accepted ? EVENT_SOURCE_HOST : EVENT_SOURCE_NODE,
+            .node_id = restored.node_id,
+            .task_id = entry->task.id,
+            .cost_ticks = accepted ? restored.cost_ticks : 0u,
+            .detail = accepted ? REJECT_NONE :
+                (replied ? reply.reason : REJECT_INVALID_STATE),
+            .task = entry->task,
+            .host_time_ns = host_time_ns()
+        };
+        if (!publish_report_event(queue, &event))
+            success = false;
+        if (accepted)
+            printf("Failover: tarea %u restaurada en nodo %u.\n",
+                entry->task.id, restored.node_id);
+    }
+    return success;
+}
+
+/* Aplica al planificador las transiciones reportadas por cada worker serial. */
+static bool coordinator_handle_link_status(EventQueue *queue,
+                                          HostCoordinatorContext *context,
+                                          const NodeLinkStatus *status)
+{
+    size_t index = 0u;
+    while (index < EXPECTED_DEVICES &&
+           context->node_ids[index] != status->node_id)
+        ++index;
+    if (index == EXPECTED_DEVICES)
+        return false;
+
+    bool was_online = context->node_online[index];
+    context->node_online[index] = status->online;
+    if (!status->online && was_online && !context->failover_active[index]) {
+        context->failover_active[index] = true;
+        printf("Nodo %u desconectado; iniciando failover.\n", status->node_id);
+        if (!coordinator_failover_node(queue, context, index)) {
+            event_queue_mark_incomplete(queue);
+            return false;
+        }
+    } else if (status->online && context->failover_active[index]) {
+        context->failover_active[index] = false;
+        for (size_t i = 0u; i < context->planner.node_count; ++i) {
+            if (context->planner.nodes[i].id == status->node_id)
+                context->planner.nodes[i].status = NODE_READY;
+        }
+        printf("Nodo %u reconectado; disponible para nuevas tareas.\n",
+            status->node_id);
+        if (!coordinator_restore_unmigrated_tasks(queue, context, index)) {
+            event_queue_mark_incomplete(queue);
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * @brief Coordina los dos workers, el despliegue y la consola de usuario.
  *
@@ -1216,8 +1384,13 @@ static int host_coordinator_run(EventQueue *queue, void *opaque)
     /* El coordinador lee la consola; los puertos seriales solo los tocan workers. */
     /* La consola vive en el padre; los workers siguen atendiendo serial en paralelo. */
     while (!event_queue_stop_requested(queue)) {
-        struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
-        int ready = poll(&input, 1u, 100);
+        struct pollfd input[1u + EXPECTED_DEVICES];
+        input[0] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+        for (size_t i = 0u; i < EXPECTED_DEVICES; ++i)
+            input[i + 1u] = (struct pollfd){
+                .fd = context->link_status_read_fd[i], .events = POLLIN
+            };
+        int ready = poll(input, 1u + EXPECTED_DEVICES, 100);
         if (ready < 0) {
             if (errno == EINTR)
                 return 0;
@@ -1227,7 +1400,32 @@ static int host_coordinator_run(EventQueue *queue, void *opaque)
         }
         if (ready == 0)
             continue;
-        if (input.revents & (POLLERR | POLLNVAL)) {
+        for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
+            if (input[i + 1u].revents & (POLLERR | POLLNVAL | POLLHUP)) {
+                fprintf(stderr, "Se cerró el canal de estado del nodo %u.\n",
+                    context->node_ids[i]);
+                event_queue_mark_incomplete(queue);
+                return 1;
+            }
+            if (!(input[i + 1u].revents & POLLIN))
+                continue;
+            NodeLinkStatus status;
+            ssize_t bytes;
+            do {
+                bytes = read(context->link_status_read_fd[i], &status,
+                             sizeof(status));
+            } while (bytes < 0 && errno == EINTR);
+            if (bytes != (ssize_t)sizeof(status) ||
+                !coordinator_handle_link_status(queue, context, &status)) {
+                fprintf(stderr, "No se pudo procesar el estado del nodo %zu.\n",
+                    i + 1u);
+                event_queue_mark_incomplete(queue);
+                return 1;
+            }
+        }
+        if (!(input[0].revents & POLLIN))
+            continue;
+        if (input[0].revents & (POLLERR | POLLNVAL)) {
             fprintf(stderr, "Error leyendo comandos de control.\n");
             return 1;
         }
@@ -1345,34 +1543,44 @@ int main(int argc, char *argv[])
     /* Crear un canal de órdenes y otro de respuestas por cada worker. */
     int command_pipes[EXPECTED_DEVICES][2];
     int reply_pipes[EXPECTED_DEVICES][2];
+    int link_status_pipes[EXPECTED_DEVICES][2];
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
         command_pipes[i][0] = -1;
         command_pipes[i][1] = -1;
         reply_pipes[i][0] = -1;
         reply_pipes[i][1] = -1;
+        link_status_pipes[i][0] = -1;
+        link_status_pipes[i][1] = -1;
     }
     for (size_t i = 0u; i < EXPECTED_DEVICES; ++i) {
         /* Los hijos heredarán todos los extremos; su callback cierra los ajenos. */
-        if (pipe(command_pipes[i]) != 0 || pipe(reply_pipes[i]) != 0) {
+        if (pipe(command_pipes[i]) != 0 || pipe(reply_pipes[i]) != 0 ||
+            pipe(link_status_pipes[i]) != 0) {
             perror("pipe node worker");
             for (size_t j = 0u; j < EXPECTED_DEVICES; ++j) {
                 if (command_pipes[j][0] >= 0) close(command_pipes[j][0]);
                 if (command_pipes[j][1] >= 0) close(command_pipes[j][1]);
                 if (reply_pipes[j][0] >= 0) close(reply_pipes[j][0]);
                 if (reply_pipes[j][1] >= 0) close(reply_pipes[j][1]);
+                if (link_status_pipes[j][0] >= 0) close(link_status_pipes[j][0]);
+                if (link_status_pipes[j][1] >= 0) close(link_status_pipes[j][1]);
             }
             return 1;
         }
         /* El padre conserva write/read; el worker conserva read/write. */
         context.command_write_fd[i] = command_pipes[i][1];
         context.reply_read_fd[i] = reply_pipes[i][0];
-        context.pipe_fds[i * 4u] = command_pipes[i][0];
-        context.pipe_fds[i * 4u + 1u] = command_pipes[i][1];
-        context.pipe_fds[i * 4u + 2u] = reply_pipes[i][0];
-        context.pipe_fds[i * 4u + 3u] = reply_pipes[i][1];
+        context.pipe_fds[i * 6u] = command_pipes[i][0];
+        context.pipe_fds[i * 6u + 1u] = command_pipes[i][1];
+        context.pipe_fds[i * 6u + 2u] = reply_pipes[i][0];
+        context.pipe_fds[i * 6u + 3u] = reply_pipes[i][1];
+        context.pipe_fds[i * 6u + 4u] = link_status_pipes[i][0];
+        context.pipe_fds[i * 6u + 5u] = link_status_pipes[i][1];
+        context.link_status_read_fd[i] = link_status_pipes[i][0];
         context.workers[i].index = i;
         context.workers[i].command_read_fd = command_pipes[i][0];
         context.workers[i].reply_write_fd = reply_pipes[i][1];
+        context.workers[i].link_status_write_fd = link_status_pipes[i][1];
         /* Cada copia de contexto contiene solo los datos seriales de su worker. */
         context.workers[i].serial.config = context.config;
         context.workers[i].serial.devices[i] = context.devices[i];
@@ -1417,6 +1625,8 @@ int main(int argc, char *argv[])
         close(command_pipes[i][1]);
         close(reply_pipes[i][0]);
         close(reply_pipes[i][1]);
+        close(link_status_pipes[i][0]);
+        close(link_status_pipes[i][1]);
     }
     if (result == 0)
         printf("Sesión cerrada. Reporte HTML y CSV en %s.\n", directory);

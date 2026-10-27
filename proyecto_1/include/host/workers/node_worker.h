@@ -55,7 +55,15 @@ typedef struct {
     size_t index;
     int command_read_fd;
     int reply_write_fd;
+    int link_status_write_fd;
+    bool link_status_known;
+    bool last_link_online;
 } NodeWorkerContext;
+
+typedef struct {
+    uint32_t node_id;
+    bool online;
+} NodeLinkStatus;
 
 /* Funciones compartidas con el coordinador para transporte y reportes. */
 bool publish_report_event(EventQueue *queue, const Event *event);
