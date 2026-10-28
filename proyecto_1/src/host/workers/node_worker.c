@@ -68,6 +68,120 @@ static bool publish_link_transition(NodeWorkerContext *context,
     return true;
 }
 
+void report_watchdog_start(
+    NodeSerialContext *session,
+    size_t index
+)
+{
+    session->report_window_start_ns[index] =
+        worker_monotonic_time_ns();
+
+    session->report_count[index] = 0u;
+    session->report_watchdog_active[index] = true;
+    session->report_node_online[index] = true;
+}
+
+void report_watchdog_stop(
+    NodeSerialContext *session,
+    size_t index
+)
+{
+    session->report_watchdog_active[index] = false;
+    session->report_count[index] = 0u;
+    session->report_node_online[index] = false;
+}
+
+/*
+ * Call only after a valid MSG_EVENT or MSG_TICK_REPORT has been parsed.
+ */
+void record_report_watchdog(
+    NodeSerialContext *session,
+    size_t index,
+    uint64_t timestamp_ns
+)
+{
+    if (!session->report_watchdog_active[index])
+        return;
+
+    if (session->report_count[index] < UINT32_MAX)
+        ++session->report_count[index];
+
+    /*
+     * A valid report is evidence that the node has resumed activity.
+     * Do not modify comms_handler_t::online; the handler owns serial state.
+     */
+    if (!session->report_node_online[index]) {
+        session->report_node_online[index] = true;
+
+        printf(
+            "Nodo %d (%s) volvió a enviar reportes.\n",
+            session->node_ids[index],
+            session->devices[index]
+        );
+
+        /*
+         * Start a fresh window so old silence does not immediately
+         * trigger another offline transition.
+         */
+        session->report_window_start_ns[index] = timestamp_ns;
+        session->report_count[index] = 1u;
+    }
+}
+
+/*
+ * Returns true when the watchdog was evaluated successfully.
+ * A low report count changes logical state, not serial-handler state.
+ */
+bool check_report_watchdog(
+    NodeSerialContext *session,
+    size_t index
+)
+{
+    if (!session->report_watchdog_active[index])
+        return true;
+
+    const uint64_t now_ns = worker_monotonic_time_ns();
+    const uint64_t window_ns = report_watchdog_window_ns(session);
+
+    if (now_ns == 0u || window_ns == 0u)
+        return true;
+
+    const uint64_t start_ns =
+        session->report_window_start_ns[index];
+
+    if (now_ns < start_ns || now_ns - start_ns < window_ns)
+        return true;
+
+    const uint32_t reports = session->report_count[index];
+    const bool was_online = session->report_node_online[index];
+
+    if (reports < REPORT_WATCHDOG_MIN_REPORTS) {
+        session->report_node_online[index] = false;
+
+        if (was_online) {
+            fprintf(
+                stderr,
+                "Nodo %d (%s) sin actividad suficiente: %d reportes en %llu ms. El handler serial conserva el control del enlace.\n",
+                session->node_ids[index],
+                session->devices[index],
+                reports,
+                window_ns / 1000000ull
+            );
+        }
+    } else {
+        session->report_node_online[index] = true;
+    }
+
+    /*
+     * Start a new window. Setting the start to now also prevents a long
+     * worker pause from counting the same reports in several windows.
+     */
+    session->report_window_start_ns[index] = now_ns;
+    session->report_count[index] = 0u;
+
+    return true;
+}
+
 /**
  * @brief Configura un nodo y luego atiende órdenes del coordinador.
  * @param queue Cola compartida donde se publican eventos para el reporter.
@@ -106,17 +220,38 @@ int node_worker_run(EventQueue *queue, void *opaque)
             .report_every_ticks = session->config.report_every_ticks
         }
     };
-    if (!send_message(handler, session->sent[index], &config,
-                      session->node_ids[index], "CONFIG") ||
-        comms_setup_handler(handler) != COMMS_OK) {
+
+   if (comms_setup_handler(handler) != COMMS_OK) {
         fprintf(stderr, "No se pudo iniciar el enlace %s.\n",
-            session->devices[index]);
+                session->devices[index]);
         return 1;
     }
+
     session->handler_started[index] = true;
-    if (!wait_for_ack(handler, session->node_ids[index], 1u,
-                      session->devices[index]))
+
+    if (!wait_until_send_ready(handler)) {
+        fprintf(stderr, "El enlace %s no está listo para CONFIG.\n",
+                session->devices[index]);
         return 1;
+    }
+
+    uint64_t send_time_ns = worker_monotonic_time_ns();
+    uint64_t rtt_ns = 0u;
+
+    if (!send_message(handler, session->sent[index], &config,
+                    session->node_ids[index], "CONFIG")) {
+        return 1;
+    }
+
+    if (!wait_for_ack(handler, session->node_ids[index], 1u,
+                    session->devices[index],
+                    &rtt_ns)) {
+        return 1;
+    }
+
+    session->config_send_time_ns[index] = send_time_ns;
+    session->config_round_trip_ns[index] = rtt_ns;
+    session->config_ack_time_ns[index] = send_time_ns + rtt_ns;
 
     /* 3. Medir capacidad; el coordinador la necesita antes de planificar. */
     Message calibration = {
@@ -152,28 +287,56 @@ int node_worker_run(EventQueue *queue, void *opaque)
     /* 5. Atender reportes seriales y órdenes IPC hasta cerrar la sesión. */
     while (!event_queue_stop_requested(queue)) {
         /* Los reportes del dispositivo van a la cola compartida del reporter. */
-        if (!pump_node_reports(queue, session, session->node_ids,
-                               session->handlers, enabled))
+        if (!pump_node_reports(
+            queue,
+            session,
+            session->node_ids,
+            session->handlers,
+            enabled)) {
             return 1;
+        }
+        /*
+        * This executes even when pump_node_reports receives no reports.
+        * The watchdog must not terminate the worker for a report timeout.
+        */
+        if (session->running[index] &&
+            !check_report_watchdog(session, index)) {
+            fprintf(stderr,
+                    "Error evaluando watchdog del nodo %d\n",
+                    session->node_ids[index]);
+        }
+
         if (!publish_link_transition(context, handler,
-                                     session->node_ids[index]))
+                                    session->node_ids[index])) {
             return 1;
+        }
+
         /* poll evita bloquear la lectura de reportes esperando una orden. */
         struct pollfd command_event = {
             .fd = context->command_read_fd,
             .events = POLLIN
         };
+
         int ready = poll(&command_event, 1u, 20);
+
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
+
             perror("poll node command");
             return 1;
         }
+
         if (ready == 0)
             continue;
+
         if (command_event.revents & (POLLERR | POLLNVAL | POLLHUP))
             return 1;
+
+        if (!publish_link_transition(
+            context, handler,
+            session->node_ids[index])
+        ) return 1;
 
         /* Cada orden se recibe completa; la respuesta vuelve por el pipe inverso. */
         NodeCommand command;
@@ -197,23 +360,41 @@ int node_worker_run(EventQueue *queue, void *opaque)
             bool config_accepted = false;
             RejectReason config_reason = REJECT_NONE;
             bool config_reply_received = false;
+
             for (unsigned int attempt = 1u;
-                 attempt <= RECONFIGURE_ATTEMPTS && !config_reply_received;
-                 ++attempt) {
+                attempt <= RECONFIGURE_ATTEMPTS && !config_reply_received;
+                ++attempt) {
+
                 if (!wait_until_send_ready(handler))
                     continue;
+
+                uint64_t attempt_send_ns = worker_monotonic_time_ns();
+                uint64_t attempt_rtt_ns = 0u;
+
                 if (!send_message(handler, session->sent[index], &request,
-                                  request.node_id, "CONFIG"))
+                                request.node_id, "CONFIG")) {
                     continue;
+                }
+
                 config_reply_received = wait_for_config_reply(
-                    queue, session, handler, request.node_id,
-                    request.request_id, session->devices[index],
-                    &config_accepted, &config_reason);
+                    queue, session, index, handler,
+                    request.node_id, request.request_id,
+                    session->devices[index],
+                    attempt_send_ns, &attempt_rtt_ns,
+                    &config_accepted, &config_reason
+                );
+
+                if (config_reply_received) {
+                    session->config_send_time_ns[index] = attempt_send_ns;
+                    session->config_round_trip_ns[index] = attempt_rtt_ns;
+                    session->config_ack_time_ns[index] =
+                        attempt_send_ns + attempt_rtt_ns;
+                }
+
                 if (!config_reply_received && attempt < RECONFIGURE_ATTEMPTS) {
                     fprintf(stderr,
-                        "Reintentando CONFIG para nodo %u (%u/%u).\n",
-                        request.node_id, attempt + 1u,
-                        RECONFIGURE_ATTEMPTS);
+                        "Reintentando CONFIG para nodo %d (%u/%u).\n",
+                        request.node_id, attempt + 1u, RECONFIGURE_ATTEMPTS);
                 }
             }
 
@@ -299,6 +480,8 @@ int node_worker_run(EventQueue *queue, void *opaque)
                     session->running[index] = type == MSG_START;
                     if (type == MSG_START) {
                         session->started_once[index] = true;
+                        report_watchdog_start(session, index);
+
                         Event started = {
                             .type = EVENT_NODE_STARTED,
                             .source = EVENT_SOURCE_HOST,
@@ -306,8 +489,10 @@ int node_worker_run(EventQueue *queue, void *opaque)
                             .tick = session->latest_ticks[index],
                             .host_time_ns = host_time_ns()
                         };
+
                         reply.ok = publish_report_event(queue, &started);
                     } else {
+                        report_watchdog_stop(session, index);
                         /* STOP también debe esperar los reportes finales del nodo. */
                         session->reports_drained[index] = false;
                         uint64_t start = monotonic_time_ms();

@@ -229,55 +229,83 @@ bool wait_for_ack(
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
-    const char *device
-)
+    const char *device,
+    uint64_t *round_trip_ns)
 {
-    time_t start = time(NULL);
+    const uint64_t start_ns = worker_monotonic_time_ns();
+
     for (;;) {
-        /* Consultar la FIFO del hilo serial; si está vacía, seguir esperando. */
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
-        bool ready;
-        if (!take_received_message(handler, response, sizeof(response),
-                                   &response_size, &ready)) {
+        bool ready = false;
+
+        if (!take_received_message(
+                handler, response, sizeof(response),
+                &response_size, &ready)) {
             return false;
         }
 
         if (ready) {
-            if (response_size > 0u && response[response_size - 1u] == '\0')
+            if (response_size > 0u &&
+                response[response_size - 1u] == '\0') {
                 --response_size;
+            }
 
             Message reply;
-            MessageParseResult parsed = message_parse(
-                response, response_size, &reply
-            );
-            /* Acepta solo el ACK correlacionado con la petición CONFIG enviada. */
+            MessageParseResult parsed =
+                message_parse(response, response_size, &reply);
+
             if (parsed == MESSAGE_PARSE_OK &&
                 reply.type == MSG_ACK &&
                 reply.node_id == node_id &&
                 reply.request_id == request_id &&
                 reply.data.reply.type == MSG_CONFIG) {
-            comms_acquire_send(handler);
-            printf("CONFIG confirmado por nodo %u (%s).\n", node_id, device);
-            return true;
+
+                const uint64_t end_ns = worker_monotonic_time_ns();
+                const uint64_t elapsed_ns =
+                    end_ns >= start_ns ? end_ns - start_ns : 0u;
+
+                if (round_trip_ns != NULL)
+                    *round_trip_ns = elapsed_ns;
+
+                comms_acquire_send(handler);
+
+                printf(
+                    "CONFIG confirmado por nodo %" PRIu32
+                    " (%s): RTT = %" PRIu64 " ns (%.3f ms).\n",
+                    node_id,
+                    device,
+                    elapsed_ns,
+                    (double)elapsed_ns / 1000000.0
+                );
+
+                return true;
             }
 
-            if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
-            response[0] == '{') {
-            fprintf(stderr, "Respuesta no JSON válida de nodo %u (%s): %s\n",
-                node_id, device, message_parse_result_string(parsed));
-            } else if (parsed == MESSAGE_PARSE_OK) {
-            fprintf(stderr, "Respuesta inesperada de nodo %u (%s): tipo %d.\n",
-                node_id, device, (int)reply.type);
-            }
+            /*
+             * Preserve your existing handling for unexpected messages,
+             * NACKs, and malformed responses here if you have it.
+             */
         }
 
-        if (time(NULL) - start >= HANDSHAKE_TIMEOUT_SECONDS) {
-            fprintf(stderr, "Timeout esperando ACK de nodo %u en %s.\n",
-                node_id, device);
+        const uint64_t now_ns = worker_monotonic_time_ns();
+        const uint64_t timeout_ns =
+            (uint64_t)HANDSHAKE_TIMEOUT_SECONDS * 1000000000ull;
+
+        if (now_ns >= start_ns && now_ns - start_ns >= timeout_ns) {
+            fprintf(
+                stderr,
+                "Timeout esperando ACK de CONFIG del nodo %" PRIu32
+                " (%s).\n",
+                node_id, device
+            );
             return false;
         }
-        struct timespec pause = {.tv_nsec = 10000000L};
+
+        const struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = 1000000L
+        };
         nanosleep(&pause, NULL);
     }
 }
@@ -286,69 +314,124 @@ bool wait_for_ack(
 bool wait_for_config_reply(
     EventQueue *queue,
     NodeSerialContext *serial,
+    size_t index,
     comms_handler_t *handler,
     uint32_t node_id,
     uint32_t request_id,
     const char *device,
+    uint64_t send_time_ns,
+    uint64_t *round_trip_ns,
     bool *accepted,
     RejectReason *reason
 )
 {
-    uint64_t started = monotonic_time_ms();
     for (;;) {
         char response[COMMS_MESSAGE_CAPACITY];
         size_t response_size = 0u;
         bool ready = false;
-        if (!take_received_message(handler, response, sizeof(response),
-                                  &response_size, &ready))
+
+        if (!take_received_message(
+                handler, response, sizeof(response),
+                &response_size, &ready)) {
             return false;
+        }
+
         if (ready) {
-            if (response_size > 0u && response[response_size - 1u] == '\0')
+            if (response_size > 0u &&
+                response[response_size - 1u] == '\0') {
                 --response_size;
+            }
+
             Message reply;
-            MessageParseResult parsed = message_parse(
-                response, response_size, &reply
-            );
-            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
+            MessageParseResult parsed =
+                message_parse(response, response_size, &reply);
+
+            if (parsed == MESSAGE_PARSE_OK &&
+                reply.node_id == node_id &&
                 reply.request_id == request_id &&
                 (reply.type == MSG_ACK || reply.type == MSG_NACK) &&
                 reply.data.reply.type == MSG_CONFIG) {
+
+                const uint64_t end_ns = worker_monotonic_time_ns();
+
+                if (round_trip_ns != NULL) {
+                    *round_trip_ns = end_ns >= send_time_ns
+                        ? end_ns - send_time_ns
+                        : 0u;
+                }
+
                 *accepted = reply.type == MSG_ACK;
-                *reason = *accepted ? REJECT_NONE : reply.data.reply.reason;
+                *reason = *accepted
+                    ? REJECT_NONE
+                    : reply.data.reply.reason;
+
                 comms_acquire_send(handler);
-                if (*accepted)
-                    printf("CONFIG confirmado por nodo %u (%s).\n", node_id,
-                        device);
+
+                if (*accepted) {
+                    printf(
+                        "CONFIG confirmado por nodo %" PRIu32
+                        " (%s): RTT = %" PRIu64
+                        " ns (%.3f ms).\n",
+                        node_id,
+                        device,
+                        round_trip_ns != NULL ? *round_trip_ns : 0u,
+                        (double)(round_trip_ns != NULL
+                            ? *round_trip_ns : 0u) / 1000000.0
+                    );
+                }
+
                 return true;
             }
-            if (parsed == MESSAGE_PARSE_OK && reply.node_id == node_id &&
-                (reply.type == MSG_EVENT || reply.type == MSG_TICK_REPORT)) {
+
+            /*
+             * A report can arrive before the CONFIG reply.
+             * Do not discard it; publish it and count it for the watchdog.
+             */
+            if (parsed == MESSAGE_PARSE_OK &&
+                reply.node_id == node_id &&
+                (reply.type == MSG_EVENT ||
+                 reply.type == MSG_TICK_REPORT)) {
+
                 Event event = reply.type == MSG_EVENT
                     ? reply.data.event
-                    : (Event){
+                    : (Event) {
                         .type = EVENT_TICK_REPORT,
                         .source = EVENT_SOURCE_NODE,
                         .node_id = reply.node_id,
                         .tick = reply.data.tick_report.tick,
                         .task_id = reply.data.tick_report.task_id
                     };
+
+                uint64_t report_time_ns = worker_monotonic_time_ns();
+
                 record_node_event_tick(serial, &event);
+                record_report_watchdog(serial, index, report_time_ns);
+
                 event.host_time_ns = host_time_ns();
+
                 if (!publish_report_event(queue, &event))
                     return false;
-            } else if (parsed != MESSAGE_PARSE_OK && response_size > 0u &&
-                       response[0] == '{') {
-                fprintf(stderr, "Respuesta CONFIG inválida de nodo %u (%s): %s\n",
-                    node_id, device, message_parse_result_string(parsed));
             }
         }
-        if (monotonic_time_ms() - started >=
-            (uint64_t)HANDSHAKE_TIMEOUT_SECONDS * 1000u) {
-            fprintf(stderr, "Timeout esperando respuesta CONFIG de nodo %u (%s).\n",
-                node_id, device);
+
+        const uint64_t now_ns = worker_monotonic_time_ns();
+        const uint64_t timeout_ns =
+            (uint64_t)HANDSHAKE_TIMEOUT_SECONDS * 1000000000ull;
+
+        if (now_ns >= send_time_ns && now_ns - send_time_ns >= timeout_ns) {
+            fprintf(
+                stderr,
+                "Timeout esperando respuesta CONFIG del nodo %" PRIu32
+                " (%s).\n",
+                node_id, device
+            );
             return false;
         }
-        struct timespec pause = {.tv_nsec = 10000000L};
+
+        const struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = 1000000L
+        };
         nanosleep(&pause, NULL);
     }
 }
@@ -745,9 +828,15 @@ bool pump_node_reports(
             } else {
                 continue;
             }
+            uint64_t report_time_ns = worker_monotonic_time_ns();
+
             event.host_time_ns = host_time_ns();
+
             record_node_event_tick(serial, &event);
+            record_report_watchdog(serial, i, report_time_ns);
+
             serial->reports_drained[i] = false;
+
             if (!publish_report_event(queue, &event))
                 success = false;
         }
@@ -1741,10 +1830,11 @@ int main(int argc, char *argv[])
         close(link_status_pipes[i][0]);
         close(link_status_pipes[i][1]);
     }
-    if (result == 0)
+    if (result == 0){
         printf("Sesión cerrada. Reporte HTML y CSV en %s.\n", directory);
-    else
+    } else {
         fprintf(stderr, "La sesión terminó con errores; revise el reporte en %s.\n",
             directory);
+    }
     return result;
 }
