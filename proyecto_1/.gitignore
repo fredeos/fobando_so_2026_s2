@@ -2,6 +2,10 @@
 build/
 output/
 
+# Generated files
+sdkconfig**
+!src/nodes/esp32/sdkconfig.defaults
+
 # Generated reports
 reports/*
 !reports/.gitkeep

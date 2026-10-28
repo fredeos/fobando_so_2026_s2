@@ -129,7 +129,7 @@ bool config_load(
         "port_esp32",
         "port_pico",
         "report_every_ticks",
-        "missed_reports_limit",
+        "connection_timeout_ms",
         "tasks_file"
 
     };
@@ -344,7 +344,7 @@ bool config_load(
 
                 if (!parse_positive_u32(
                         value,
-                        &parsed.missed_reports_limit)) {
+                        &parsed.connection_timeout_ms)) {
 
                     goto invalid_value;
                 }

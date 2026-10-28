@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.16)
+
+option(ESP_LOCAL_TEST "Prueba autonoma de cinco tareas RMS/EDF" OFF)
+set(LOCAL_ALGORITHM "RMS" CACHE STRING "RMS o EDF")
+set_property(CACHE LOCAL_ALGORITHM PROPERTY STRINGS RMS EDF)
+set(LOCAL_TICK_MS "1000" CACHE STRING "Tick local en milisegundos")
+if(ESP_LOCAL_TEST)
+    if(NOT LOCAL_ALGORITHM MATCHES "^(RMS|EDF)$")
+        message(FATAL_ERROR "LOCAL_ALGORITHM debe ser RMS o EDF")
+    endif()
+    if(NOT LOCAL_TICK_MS MATCHES "^[1-9][0-9]*$" OR LOCAL_TICK_MS GREATER 1000)
+        message(FATAL_ERROR "LOCAL_TICK_MS debe estar entre 1 y 1000")
+    endif()
+endif()
+
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(esp32_node)

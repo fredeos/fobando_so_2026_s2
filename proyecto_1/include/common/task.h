@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+/* Límite compartido por el TaskStore y el scheduler de cada MCU. */
+#define TASK_MAX_PER_NODE 8u
+
 /*
  * Tipos de tareas soportados.
  * Los valores coinciden con el formato del CSV.

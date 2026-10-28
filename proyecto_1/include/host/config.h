@@ -24,7 +24,7 @@ typedef struct {
 
     uint32_t tick_ms;
     uint32_t report_every_ticks;
-    uint32_t missed_reports_limit;
+    uint32_t connection_timeout_ms;
 
     char port_esp32[CONFIG_PORT_SIZE];
     char port_pico[CONFIG_PORT_SIZE];
