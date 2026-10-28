@@ -1,0 +1,25 @@
+# Build files
+build/
+output/
+
+# Generated files
+sdkconfig**
+!src/nodes/esp32/sdkconfig.defaults
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+
+# Editor
+.vscode/
+.idea/
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# Debug
+core
+core.*
+*.log

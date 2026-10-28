@@ -1,0 +1,13 @@
+# id,tipo,W,T,D,criticidad
+# W en UT; T y D en ticks. Tareas periodicas, C=1 tick en ambos nodos.
+# Las 30 son factibles con EDF y RMS; el limite actual permite desplegar 8 por nodo.
+1,P,1,16,16,1
+2,P,1,17,17,1
+3,P,1,18,18,1
+4,P,1,19,19,1
+5,P,1,20,20,1
+6,P,1,21,21,1
+7,P,1,22,22,1
+8,P,1,23,23,1
+9,P,1,24,24,1
+
