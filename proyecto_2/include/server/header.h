@@ -1,0 +1,6 @@
+#ifndef SERVER_HEADER_H
+#define SERVER_HEADER_H
+
+#define SERVER_VERSION "1.0.3"
+
+#endif // SERVER_HEADER_H

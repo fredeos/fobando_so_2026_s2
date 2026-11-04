@@ -1,0 +1,6 @@
+#ifndef CLIENT_HEADER_H
+#define CLIENT_HEADER_H
+
+#define CLIENT_VERSION "1.0.0"
+
+#endif // CLIENT_HEADER_H
