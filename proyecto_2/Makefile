@@ -10,7 +10,7 @@ ESP_IDF := idf.py
 # Compiler flags
 # =============================================================================
 CFLAGS := -Wall -Wextra -Wpedantic \
-          -std=c17 \
+          -std=c11 \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
           -Iinclude
@@ -24,7 +24,7 @@ endif
 # =============================================================================
 # Linker
 # =============================================================================
-LDLIBS := -pthread -lm
+LDLIBS := -pthread -lm -lcrypto
 
 # =============================================================================
 # Makefile variables
@@ -169,3 +169,58 @@ esp-flash:
 	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) -p /dev/tty$(DEV) flash'
 	@echo "[DONE]"
 	@echo ""
+
+# ==================================
+# Encrypted TCP entry points in the existing client/server programs
+# ==================================
+TCP_PORT ?= 5000
+TCP_HOST ?= 127.0.0.1
+IMAGE ?= images/fgm-scaling-heat.png
+TCP_CLIENT_BIN := $(CLIENT_OUT)
+TCP_SERVER_BIN := $(SERVER_OUT)
+
+# Pass paths as environment values, preserving spaces and shell metacharacters.
+export DIPS_TCP_IMAGE = $(IMAGE)
+export DIPS_TCP_PORT = $(TCP_PORT)
+export DIPS_TCP_HOST = $(TCP_HOST)
+
+.PHONY: tcp-build tcp-server tcp-client tcp-demo
+
+tcp-build: client-build server-build
+
+# For separate terminals/machines, explicitly supply the same DIPS_AES_KEY.
+tcp-server: server-build
+	@"$(TCP_SERVER_BIN)" "$$DIPS_TCP_PORT"
+
+tcp-client: client-build
+	@"$(TCP_CLIENT_BIN)" "$$DIPS_TCP_HOST" "$$DIPS_TCP_PORT" "$$DIPS_TCP_IMAGE"
+
+# One-terminal local demo. Bash coproc waits for the server's startup message;
+# no fixed startup delay, temporary key file, or extra readiness connection.
+# Example: make tcp-demo IMAGE="/ruta/otra imagen.png" TCP_PORT=5001
+tcp-demo: tcp-build
+	@bash -ec '\
+		if [[ ! -f "$$DIPS_TCP_IMAGE" || ! -r "$$DIPS_TCP_IMAGE" ]]; then \
+			printf "Imagen inexistente o no legible: %s\n" "$$DIPS_TCP_IMAGE" >&2; \
+			exit 1; \
+		fi; \
+		if [[ ! -v DIPS_AES_KEY ]]; then \
+			DIPS_AES_KEY="$$(openssl rand -hex 32)"; \
+			export DIPS_AES_KEY; \
+		fi; \
+		coproc DIPS_SERVER { exec "$(TCP_SERVER_BIN)" "$$DIPS_TCP_PORT"; }; \
+		server_pid=$${DIPS_SERVER_PID:-}; \
+		server_output=$${DIPS_SERVER[0]:-}; \
+		if [[ -z "$$server_pid" ]]; then exit 1; fi; \
+		trap '\''kill "$$server_pid" 2>/dev/null || :; wait "$$server_pid" 2>/dev/null || :'\'' EXIT; \
+		trap '\''exit 130'\'' INT; \
+		trap '\''exit 143'\'' TERM; \
+		if [[ -z "$$server_output" ]] || ! IFS= read -r ready <&"$$server_output"; then \
+			printf "No se pudo iniciar el servidor TCP.\n" >&2; \
+			exit 1; \
+		fi; \
+		printf "%s\n" "$$ready"; \
+		"$(TCP_CLIENT_BIN)" 127.0.0.1 "$$DIPS_TCP_PORT" "$$DIPS_TCP_IMAGE"; \
+		IFS= read -r received <&"$$server_output"; \
+		printf "%s\n" "$$received"; \
+	'
