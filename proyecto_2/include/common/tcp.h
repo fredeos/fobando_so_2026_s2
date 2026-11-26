@@ -7,18 +7,21 @@
 #include "common/crypto.h"
 
 #define TCP_PROTOCOL_VERSION 1u
-#define TCP_HEADER_SIZE 8u
-#define TCP_MAX_PAYLOAD (8u * 1024u * 1024u)
+#define TCP_HEADER_SIZE 8u // Version, tipo y longitud; este encabezado tambien se autentica.
+#define TCP_MAX_PAYLOAD (8u * 1024u * 1024u) // Limite por mensaje para acotar las reservas de memoria.
 
 enum tcp_message_type {
     TCP_MESSAGE_IMAGE = 1,
-    TCP_MESSAGE_ACK = 2
+    TCP_MESSAGE_ACK = 2,
+    TCP_MESSAGE_PROCESS = 3,
+    TCP_MESSAGE_RESULT = 4,
+    TCP_MESSAGE_ERROR = 5
 };
 
 typedef struct {
     uint16_t type;
-    uint32_t payload_size;
-    uint8_t *payload;
+    uint32_t payload_size; // Cantidad de bytes binarios, sin terminador de cadena.
+    uint8_t *payload; // Contenido autenticado; se libera con tcp_message_free().
 } tcp_message;
 
 /* Formato en la red, sin padding:
@@ -27,6 +30,8 @@ typedef struct {
  * Los 8 bytes originales del encabezado son el AAD de AES-256-GCM.
  * Longitud máxima: 8 MiB; el cifrado conserva la longitud del payload.
  * ACK de esta aplicación: dos bytes 0x4f, 0x4b ("OK").
+ * Proceso integrado: PROCESS(image_job) + IMAGE(PNG/JPEG) -> RESULT(PNG)
+ * o ERROR(texto). Cada mensaje se cifra/autentica independientemente.
  * Las funciones devuelven -1 con errno al fallar, salvo tcp_close/free.
  */
 

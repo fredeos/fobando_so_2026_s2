@@ -1,0 +1,212 @@
+# COMANDOS DEL PROYECTO: CLIENTE TCP + CLUSTER MPI
+# Ejecutar en Bash, desde proyecto_2, como tu usuario normal.
+# Esta es una guia: elige la seccion que necesitas; no ejecutes todo el archivo.
+# Flujo: cliente -> TCP cifrado -> resize MPI opcional -> filtro MPI -> cliente.
+# El cliente guarda el resultado PNG en la ruta RESULT.
+
+
+# 1. ENTRAR A LA CARPETA DEL PROYECTO
+
+cd "/home/diego/Principios Operativos/fobando_so_2026_s2/proyecto_2"
+
+
+# 2. USO HABITUAL CON LAS DOS VMs YA PREPARADAS
+# Las VMs deben estar encendidas y output/cluster.env debe existir.
+# Ejecuta estos comandos en LA MISMA TERMINAL.
+
+source output/cluster.env
+make cluster-demo IMAGE="images/imagen.png" RESIZE=original FILTER=blur RESULT=output/resultado.png
+
+# Redimensionar a 128 de ancho por 160 de alto y aplicar Sobel:
+make cluster-demo IMAGE="images/imagen.png" RESIZE=128x160 FILTER=sobel RESULT=output/resultado.png
+
+# Otra resolucion y filtro sharpen:
+make cluster-demo IMAGE="images/imagen.jpeg" RESIZE=320x240 FILTER=sharpen RESULT=output/resultado.png
+
+# Cambiar la cantidad de filas por tarea y el puerto TCP:
+make cluster-demo IMAGE="images/fgm-scaling-heat.png" RESIZE=original FILTER=blur BLOCK_ROWS=8 TCP_PORT=5001 RESULT=output/blur_original.png
+
+# cluster-demo compila, prepara una clave AES temporal compartida, inicia MPI,
+# envia la imagen, compara con el resultado secuencial y termina el cluster.
+# Reutiliza DIPS_AES_KEY si ya esta exportada; debe ser valida (64 hex).
+# Los filtros disponibles son blur, sharpen y sobel.
+# RESIZE=original conserva dimensiones y omite la etapa de resize.
+# RESULT se guarda en el cliente; reutilizar una ruta reemplaza ese resultado.
+# Por defecto: IMAGE=images/fgm-scaling-heat.png, RESIZE=128x160, FILTER=blur,
+# BLOCK_ROWS=16, MPI_NP=4, TCP_PORT=5000 y RESULT=output/processed.png.
+# Las rutas relativas se interpretan desde proyecto_2; las absolutas tambien sirven.
+# tcp-demo es un alias del mismo flujo:
+make tcp-demo IMAGE="images/fgm-scaling-heat.png" RESIZE=original FILTER=blur
+
+
+# 3. EJECUTAR TODO LOCALMENTE, SIN UTILIZAR LAS VMs
+# Quita los valores de red que pudo cargar output/cluster.env.
+# Son cuatro procesos en tu equipo: un coordinador y tres trabajadores.
+
+unset CLUSTER_HOSTS
+unset OMPI_MCA_btl_tcp_if_include OMPI_MCA_btl_tcp_if_exclude
+unset OMPI_MCA_oob_tcp_if_include OMPI_MCA_oob_tcp_if_exclude
+
+make cluster-demo CLUSTER_HOSTS= MPI_NP=4 IMAGE="images/fgm-scaling-heat.png" RESIZE=128x160 FILTER=blur RESULT=output/local.png
+
+# Ejemplo local con cinco trabajadores (seis procesos en total):
+make cluster-demo CLUSTER_HOSTS= MPI_NP=6 IMAGE="images/cgm-scaling-heat-no-smt.png" RESIZE=original FILTER=sobel RESULT=output/local_sobel.png
+
+# Para volver a utilizar las VMs en esta terminal:
+source output/cluster.env
+
+
+# 4. DEPENDENCIAS Y COMPILACION
+# Instalar una sola vez en el equipo:
+
+sudo apt update
+sudo apt install build-essential openmpi-bin libopenmpi-dev libssl-dev openssl libpng-dev libjpeg-dev
+
+# Compilar cliente y servidor, sin ejecutarlos:
+make -j2 cluster-build
+
+# Compilar individualmente:
+make client-build
+make server-build
+
+# Compilar optimizado usando objetos separados de los de debug:
+make -j2 MODE=release BUILD_DIR=build/release cluster-build
+
+# Ejecutables generados: output/client y output/server.
+# Si cambias el codigo del servidor, vuelve a hacer deploy antes de usar las VMs.
+# OpenCV no es necesario para estos ejecutables C11; usan el nucleo C compartido.
+
+
+# 5. ARRANCAR O COMPROBAR LAS VMs EXISTENTES
+
+sudo virsh -c qemu:///system list --all
+sudo virsh -c qemu:///system net-list --all
+
+# Solo si la red default esta apagada:
+sudo virsh -c qemu:///system net-start default
+
+# Solo si las VMs estan apagadas:
+sudo virsh -c qemu:///system start dips-worker-1
+sudo virsh -c qemu:///system start dips-worker-2
+
+# Consultar las IP asignadas; pueden cambiar despues de un reinicio:
+sudo virsh -c qemu:///system domifaddr dips-worker-1 --source lease
+sudo virsh -c qemu:///system domifaddr dips-worker-2 --source lease
+
+# Sustituir estos ejemplos si las consultas anteriores muestran otras IP:
+VM1=192.168.122.183
+VM2=192.168.122.44
+
+# Comprobar acceso SSH. En la primera conexion se solicita aceptar la huella.
+ssh "$USER@$VM1" hostname
+ssh "$USER@$VM2" hostname
+
+# Si tu clave tiene passphrase, cargala para que MPI pueda usar SSH sin preguntar:
+# Ejecuta ssh-agent solo si no tienes un agente activo en esta terminal.
+eval "$(ssh-agent -s)"
+ssh-add "$HOME/.ssh/id_ed25519"
+
+# Compila, copia el servidor a ambas VMs y genera la configuracion actualizada:
+bash scripts/vm-cluster.sh deploy "$VM1" "$VM2"
+source output/cluster.env
+make cluster-demo IMAGE="images/fgm-scaling-heat.png" RESIZE=original FILTER=blur RESULT=output/vms.png
+
+# Distribucion predeterminada: host = coordinador + un trabajador;
+# dips-worker-1 y dips-worker-2 = un trabajador cada una. Total: cuatro ranks.
+# Solo el coordinador decodifica la imagen; las VMs reciben bloques por MPI.
+
+
+# 6. CREAR LAS VMs DESDE CERO (SOLO LA PRIMERA VEZ)
+# Omite esta seccion si dips-worker-1 y dips-worker-2 ya existen.
+
+sudo apt update
+sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients virtinst curl python3
+sudo systemctl enable --now libvirtd
+
+# En este equipo Intel; en un equipo AMD seria kvm_amd:
+sudo modprobe kvm_intel
+bash scripts/vm-cluster.sh check
+
+# SOLO si todavia no existe ~/.ssh/id_ed25519:
+ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519"
+# La clave privada debe permanecer en ~/.ssh, fuera del repositorio.
+# La creacion de VMs utiliza unicamente el archivo PUBLICO terminado en .pub.
+
+sudo bash scripts/vm-cluster.sh create "$USER" "$HOME/.ssh/id_ed25519.pub"
+
+# El script descarga Ubuntu 24.04 y crea dos VMs con 2 vCPU, 2 GiB de RAM
+# y disco virtual de 16 GiB cada una. Espera a que cloud-init instale paquetes.
+# Continua en la seccion 5 para consultar IPs, probar SSH y hacer deploy.
+
+
+# 7. SERVIDOR Y CLIENTE MANUALES EN UNA MISMA TERMINAL
+# Permite ajustar radio, intensidad o numero de bloques con el cliente directo.
+# Previamente: make cluster-build y, si usas VMs, deploy del servidor actualizado.
+# Para usar las VMs:
+source output/cluster.env
+
+# Generar la clave una vez; servidor y cliente la heredan de esta terminal.
+export DIPS_AES_KEY="$(openssl rand -hex 32)"
+
+# Para ejecucion local, primero aplica los unset de la seccion 3.
+MPI_ARGS=(--oversubscribe --map-by slot -np 4 -x DIPS_AES_KEY)
+if [[ -n "${CLUSTER_HOSTS:-}" ]]; then
+    MPI_ARGS+=(--host "$CLUSTER_HOSTS")
+fi
+
+mpirun "${MPI_ARGS[@]}" "$(pwd)/output/server" 5000 --once --verify &
+CLUSTER_PID=$!
+
+# ESPERA a ver "Servidor TCP IPv4 escuchando en el puerto 5000."
+# Despues ejecuta el cliente en esta misma terminal:
+./output/client 127.0.0.1 5000 images/fgm-scaling-heat.png --resize original --filter sharpen --radius 2 --intensity 3 --blocks 12 --output output/manual.png
+
+wait "$CLUSTER_PID"
+unset DIPS_AES_KEY
+
+# --once atiende una conexion y termina coordinadamente los trabajadores.
+# --verify compara el resultado distribuido con el secuencial.
+# --blocks N y --block-rows N son alternativas: no se usan juntos.
+# Radio: 1..4; intensidad: 0..16. El numero de bloques no puede superar la altura.
+# Para usar un cliente desde otro equipo, cambia 127.0.0.1 por la IPv4 del
+# coordinador y configura la MISMA DIPS_AES_KEY en ese cliente.
+
+
+# 8. PRUEBA MPI INDEPENDIENTE, SIN TCP NI ARCHIVOS DE IMAGEN
+# Genera una imagen determinista en el coordinador y compara con el secuencial.
+
+make distributed-build
+export DIPS_AES_KEY="$(openssl rand -hex 32)"
+
+# Esta prueba es LOCAL y no utiliza CLUSTER_HOSTS:
+unset OMPI_MCA_btl_tcp_if_include OMPI_MCA_btl_tcp_if_exclude
+unset OMPI_MCA_oob_tcp_if_include OMPI_MCA_oob_tcp_if_exclude
+
+mpirun --oversubscribe -np 4 -x DIPS_AES_KEY ./output/distributed --filter blur --width 193 --height 129 --block-rows 8
+mpirun --oversubscribe -np 6 -x DIPS_AES_KEY ./output/distributed --filter sobel --width 257 --height 129 --blocks 11 --radius 2
+unset DIPS_AES_KEY
+
+
+# 9. DIAGNOSTICO Y CIERRE
+
+mpicc --version
+mpirun --version
+bash scripts/vm-cluster.sh --help
+sudo virsh -c qemu:///system list --all
+ip -4 -o addr show virbr0
+
+# Si reaparece el error OOB con "Value given: virbr0", recarga la configuracion
+# corregida. virbr0 es del host; dentro de las VMs la interfaz es enp1s0.
+source output/cluster.env
+
+# Apagar las VMs al terminar (no borra sus discos):
+sudo virsh -c qemu:///system shutdown dips-worker-1
+sudo virsh -c qemu:///system shutdown dips-worker-2
+
+# LIMPIEZA OPCIONAL: borra build/ y TODO output/, incluidos resultados PNG y
+# cluster.env. Guarda lo que necesites antes. Los discos de las VMs se conservan.
+make clean
+
+# Tras limpiar: make cluster-build; para VMs vuelve a ejecutar deploy con sus IP.
+# Limites actuales: PNG/JPEG de entrada hasta 8 MiB codificados, imagen BGR
+# hasta 32 MiB en memoria y resultado PNG hasta 8 MiB. Minimo tres trabajadores.

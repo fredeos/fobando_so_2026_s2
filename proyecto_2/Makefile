@@ -2,6 +2,8 @@
 # Makefile tools and build mode
 # =============================================================================
 CC := gcc
+MPICC ?= mpicc
+MPIRUN ?= mpirun
 MODE ?= debug
 
 ESP_IDF := idf.py
@@ -65,10 +67,13 @@ ESP_BUILD := $(BUILD_DIR)/esp32
 SERVER_SRC_DIRS := $(wildcard \
     $(SERVER_SRC) \
     $(COMMON_SRC) \
+	$(SRC_DIR)/distributed \
+	$(SRC_DIR)/image-filters \
 	$(SRC_DIR)/serial)
 
 SERVER_SOURCES := $(foreach dir,$(SERVER_SRC_DIRS),\
     $(shell find $(dir) -type f -name '*.c'))
+SERVER_SOURCES := $(filter-out $(SRC_DIR)/distributed/main.c,$(SERVER_SOURCES))
 
 SERVER_OBJS := $(patsubst \
     $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SERVER_SOURCES))
@@ -82,6 +87,7 @@ SERVER_DEPS := $(sort \
 CLIENT_SRC_DIRS := $(wildcard \
     $(CLIENT_SRC) \
     $(COMMON_SRC) \
+	$(SRC_DIR)/image-filters \
 	$(SRC_DIR)/serial)
 
 CLIENT_SOURCES := $(foreach dir,$(CLIENT_SRC_DIRS),\
@@ -109,6 +115,13 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Server entry points and MPI modules need OpenMPI's compiler/include paths.
+$(SERVER_OBJS): CC := $(MPICC)
+
+$(BUILD_DIR)/distributed/%.o: $(SRC_DIR)/distributed/%.c
+	@mkdir -p $(dir $@)
+	$(MPICC) $(CFLAGS) -c $< -o $@
+
 # =============================================================================
 # Makefile server rules and variables
 # =============================================================================
@@ -117,7 +130,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 server-build: $(SERVER_OBJS)
 	$(MAKE) dirs
 	@mkdir -p $(dir ${SERVER_OUT}) $(dir ${SERVER_BUILD})
-	$(CC) $(CFLAGS) $^ -o $(SERVER_OUT) $(LDLIBS)
+	$(MPICC) $(CFLAGS) $^ -o $(SERVER_OUT) $(LDLIBS) -lpng -ljpeg
 
 server-debug:
 	$(MAKE) MODE=debug server-build
@@ -175,7 +188,7 @@ esp-flash:
 # ==================================
 TCP_PORT ?= 5000
 TCP_HOST ?= 127.0.0.1
-IMAGE ?= images/fgm-scaling-heat.png
+IMAGE ?= images/images.jpeg
 TCP_CLIENT_BIN := $(CLIENT_OUT)
 TCP_SERVER_BIN := $(SERVER_OUT)
 
@@ -188,39 +201,51 @@ export DIPS_TCP_HOST = $(TCP_HOST)
 
 tcp-build: client-build server-build
 
-# For separate terminals/machines, explicitly supply the same DIPS_AES_KEY.
-tcp-server: server-build
-	@"$(TCP_SERVER_BIN)" "$$DIPS_TCP_PORT"
+# Keep the original commands as aliases to the integrated pipeline.
+tcp-server: cluster-server
+tcp-client: cluster-client
+tcp-demo: cluster-demo
 
-tcp-client: client-build
-	@"$(TCP_CLIENT_BIN)" "$$DIPS_TCP_HOST" "$$DIPS_TCP_PORT" "$$DIPS_TCP_IMAGE"
+# TCP -> parallel resize -> parallel filter -> authenticated PNG response.
+MPI_NP ?= 4
+FILTER ?= blur
+# RESIZE=original preserves dimensions and skips the parallel resize stage.
+RESIZE ?= 128x160
+BLOCK_ROWS ?= 16
+RESULT ?= $(OUT_DIR)/processed.png
+CLUSTER_HOSTS ?=
 
-# One-terminal local demo. Bash coproc waits for the server's startup message;
-# no fixed startup delay, temporary key file, or extra readiness connection.
-# Example: make tcp-demo IMAGE="/ruta/otra imagen.png" TCP_PORT=5001
-tcp-demo: tcp-build
-	@bash -ec '\
-		if [[ ! -f "$$DIPS_TCP_IMAGE" || ! -r "$$DIPS_TCP_IMAGE" ]]; then \
-			printf "Imagen inexistente o no legible: %s\n" "$$DIPS_TCP_IMAGE" >&2; \
-			exit 1; \
-		fi; \
-		if [[ ! -v DIPS_AES_KEY ]]; then \
-			DIPS_AES_KEY="$$(openssl rand -hex 32)"; \
-			export DIPS_AES_KEY; \
-		fi; \
-		coproc DIPS_SERVER { exec "$(TCP_SERVER_BIN)" "$$DIPS_TCP_PORT"; }; \
-		server_pid=$${DIPS_SERVER_PID:-}; \
-		server_output=$${DIPS_SERVER[0]:-}; \
-		if [[ -z "$$server_pid" ]]; then exit 1; fi; \
-		trap '\''kill "$$server_pid" 2>/dev/null || :; wait "$$server_pid" 2>/dev/null || :'\'' EXIT; \
-		trap '\''exit 130'\'' INT; \
-		trap '\''exit 143'\'' TERM; \
-		if [[ -z "$$server_output" ]] || ! IFS= read -r ready <&"$$server_output"; then \
-			printf "No se pudo iniciar el servidor TCP.\n" >&2; \
-			exit 1; \
-		fi; \
-		printf "%s\n" "$$ready"; \
-		"$(TCP_CLIENT_BIN)" 127.0.0.1 "$$DIPS_TCP_PORT" "$$DIPS_TCP_IMAGE"; \
-		IFS= read -r received <&"$$server_output"; \
-		printf "%s\n" "$$received"; \
-	'
+export DIPS_CLUSTER_NP = $(MPI_NP)
+export DIPS_CLUSTER_HOSTS = $(CLUSTER_HOSTS)
+export DIPS_CLUSTER_FILTER = $(FILTER)
+export DIPS_CLUSTER_RESIZE = $(RESIZE)
+export DIPS_CLUSTER_ROWS = $(BLOCK_ROWS)
+export DIPS_CLUSTER_RESULT = $(RESULT)
+export DIPS_CLUSTER_MPIRUN = $(MPIRUN)
+export DIPS_CLUSTER_SERVER = $(abspath $(SERVER_OUT))
+export DIPS_CLUSTER_CLIENT = $(abspath $(CLIENT_OUT))
+
+.PHONY: cluster-build cluster-demo cluster-server cluster-client distributed-build
+cluster-build: client-build server-build
+
+cluster-demo: cluster-build
+	@bash scripts/cluster-demo.sh
+
+cluster-server: server-build
+	@$(MPIRUN) --oversubscribe -np "$$DIPS_CLUSTER_NP" --map-by slot \
+		$${DIPS_CLUSTER_HOSTS:+--host "$$DIPS_CLUSTER_HOSTS"} -x DIPS_AES_KEY \
+		"$(abspath $(SERVER_OUT))" "$$DIPS_TCP_PORT"
+
+cluster-client: client-build
+	@"$(CLIENT_OUT)" "$$DIPS_TCP_HOST" "$$DIPS_TCP_PORT" "$$DIPS_TCP_IMAGE" \
+		--filter "$$DIPS_CLUSTER_FILTER" --resize "$$DIPS_CLUSTER_RESIZE" \
+		--block-rows "$$DIPS_CLUSTER_ROWS" --output "$$DIPS_CLUSTER_RESULT"
+
+DISTRIBUTED_OBJS := $(BUILD_DIR)/distributed/main.o $(BUILD_DIR)/distributed/distributed.o \
+    $(BUILD_DIR)/distributed/mpi_transport.o $(BUILD_DIR)/image-filters/filters.o \
+    $(BUILD_DIR)/common/crypto.o $(BUILD_DIR)/common/image_job.o
+-include $(DISTRIBUTED_OBJS:.o=.d)
+distributed-build: $(OUT_DIR)/distributed
+$(OUT_DIR)/distributed: $(DISTRIBUTED_OBJS)
+	@mkdir -p "$(OUT_DIR)"
+	$(MPICC) $(CFLAGS) $^ -o "$@" -lcrypto -lm

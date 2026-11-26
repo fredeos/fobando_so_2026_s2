@@ -3,8 +3,8 @@
 
 #define SERVER_VERSION "1.0.3"
 
-/* Ejecuta el servidor TCP cifrado con <PUERTO> como argumento de main.
- * Atiende clientes secuencialmente hasta encontrar un error fatal. */
-int tcp_server_run(int argc, char **argv);
+/* mpirun -np 4 o mas: rank 0 TCP, resto workers persistentes resize/filtro.
+ * PUERTO [--once] [--verify]. Un solo rank admite la prueba ACK antigua. */
+int tcp_server_run(int argc, char **argv); // Inicia MPI y separa coordinador TCP de trabajadores.
 
 #endif // SERVER_HEADER_H

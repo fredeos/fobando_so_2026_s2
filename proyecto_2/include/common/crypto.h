@@ -4,9 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CRYPTO_KEY_SIZE 32u
-#define CRYPTO_NONCE_SIZE 12u
-#define CRYPTO_TAG_SIZE 16u
+#define CRYPTO_KEY_SIZE 32u // 32 bytes equivalen a la clave de AES-256.
+#define CRYPTO_NONCE_SIZE 12u // Nonce aleatorio de 96 bits para cada mensaje GCM.
+#define CRYPTO_TAG_SIZE 16u // Etiqueta de 128 bits para detectar alteraciones.
 
 /* Las funciones int devuelven 0 al tener éxito y -1 con errno al fallar. */
 
