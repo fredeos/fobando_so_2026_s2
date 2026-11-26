@@ -1,4 +1,4 @@
-// Implementation file of conversion.h
+// Archivo de implementacion para <conversion.h>
 #include "common/conversion.h"
 
 void write_u16_be(

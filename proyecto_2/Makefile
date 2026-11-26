@@ -13,7 +13,8 @@ CFLAGS := -Wall -Wextra -Wpedantic \
           -std=c17 \
           -D_POSIX_C_SOURCE=200809L \
           -MMD -MP \
-          -Iinclude
+          -Iinclude \
+		  -Ithird_party
 
 ifeq ($(MODE),release)
     CFLAGS += -O2
@@ -29,7 +30,7 @@ LDLIBS := -pthread -lm
 # =============================================================================
 # Makefile variables
 # =============================================================================
-DEV ?= USB0
+PORT ?= /dev/ttyUSB0
 
 IDF_ACTIVATE ?= $(HOME)/.espressif/tools/activate_idf_v6.1.sh
 
@@ -42,8 +43,10 @@ export PICO_SDK_PATH
 SRC_DIR := src
 OUT_DIR := output
 BUILD_DIR := build
+INCLUDE_DIR := include
 
 COMMON_SRC := $(SRC_DIR)/common
+3PARTY_SRC := third_party
 
 CLIENT_SRC := $(SRC_DIR)/client
 CLIENT_OUT := $(OUT_DIR)/client
@@ -64,8 +67,7 @@ ESP_BUILD := $(BUILD_DIR)/esp32
 # Compilar únicamente fuente y módulos comunes
 SERVER_SRC_DIRS := $(wildcard \
     $(SERVER_SRC) \
-    $(COMMON_SRC) \
-	$(SRC_DIR)/serial)
+    $(COMMON_SRC) )
 
 SERVER_SOURCES := $(foreach dir,$(SERVER_SRC_DIRS),\
     $(shell find $(dir) -type f -name '*.c'))
@@ -82,13 +84,16 @@ SERVER_DEPS := $(sort \
 CLIENT_SRC_DIRS := $(wildcard \
     $(CLIENT_SRC) \
     $(COMMON_SRC) \
-	$(SRC_DIR)/serial)
+	$(SRC_DIR)/serial \
+	$(3PARTY_SRC) )
 
 CLIENT_SOURCES := $(foreach dir,$(CLIENT_SRC_DIRS),\
     $(shell find $(dir) -type f -name '*.c'))
 
 CLIENT_OBJS := $(patsubst \
-    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(CLIENT_SOURCES))
+    $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(filter $(SRC_DIR)/%.c,$(CLIENT_SOURCES))) \
+    $(patsubst \
+    $(3PARTY_SRC)/%.c,$(BUILD_DIR)/$(3PARTY_SRC)/%.o,$(filter $(3PARTY_SRC)/%.c,$(CLIENT_SOURCES)))
 
 CLIENT_DEPS := $(sort \
     $(CLIENT_OBJS:.o=.d))
@@ -106,6 +111,10 @@ clean:
 	rm -rf $(BUILD_DIR) $(OUT_DIR)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/$(3PARTY_SRC)/%.o: $(3PARTY_SRC)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -166,6 +175,6 @@ esp-build:
 
 esp-flash:
 	@echo "Flashing ESP32..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) -p /dev/tty$(DEV) flash'
+	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) -p $(PORT) flash'
 	@echo "[DONE]"
 	@echo ""
