@@ -1,13 +1,31 @@
 #ifndef COMMON_PROTOCOL_H
 #define COMMON_PROTOCOL_H
-
+/*
+ * <protocol.h>: este archivo empaqueta funcionalidades de comunicación serial
+ * utilizando el protocolo CRC-16. El archivo está organizado en dos componentes:
+ * - Tranmisor (TX): se encarga de transmitir datos
+ * - Receptor (RX: se encarga de la recepción de datos
+ * Notese que este archivo funciona sobre una interfaz de comunicación serial
+ * (la cual cada dispositivo debe implementar) que por si sola ya puede transmitir
+ * datos, pero el objetivo del protocolo es darle a estps datos un estructura. El
+ * protocolo no implementa distincion en el tipo de dato en la carga (payload), para
+ * este simplemente son bytes crudos (raw).
+ * 
+ * Implementacion: 'src/common/protocol'
+*/
+// ===========================================================================
+// Includes
+// ===========================================================================
+// + C libraries
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <string.h>
-
+// + Archivos/modulos del proyecto
 #include "serial/serial.h"
 
+// ===========================================================================
+// Definiciones
+// ===========================================================================
 /* Identificadores del inicio de trama */
 /* El inicio de trama se identifica al encontrar una secuencia de bytes alteranada,
  * todos los bytes leidos antes del inicio son descartados.
@@ -62,42 +80,19 @@
 #define PROTOCOL_NACK_1 0x9Du
 
 #define PROTOCOL_MAX_ATTEMPTS 300
-
-/* NOTA: la identificacion de inicio de trama y confirmacion de protocolo sirven como una sincronizacion
+/* 
+ * NOTA: la identificacion de inicio de trama y confirmacion de protocolo sirven como una sincronizacion
  * entre los dispositivos
 */
-
-/*
- * Tipos de errores para operaciones del protocolo
- *
-*/
-typedef enum {
-    PROTOCOL_OK = 0,
-    // errores generales
-    PROTOCOL_ERROR = -1,
-    PROTOCOL_OUT_RANGE    = -2,
-    PROTOCOL_INVALID_ARG  = -3,
-    PROTOCOL_INVALID_SIZE = -4,
-    PROTOCOL_INVALID_MODE = -5,
-    PROTOCOL_SERIAL_EIO = -6
-} protocol_errno_t;
-
-/*
- * Estados de confirmacion de protocolo
- *
-*/
-typedef enum {
-    PROTOCOL_ACK  = 0,
-    PROTOCOL_NACK,
-    PROTOCOL_ACK_UNKNOWN,
-    PROTOCOL_ACK_TIMEOUT
-} protocol_ack_t;
-
+// ===========================================================================
+// Declaraciones y tipos
+// ===========================================================================
 #ifdef __cplusplus
 extern "C" {
 #endif
+// ---------------------------------------------------------------------------
+// Misc
 
-// ---------------------------------------------------------------------------------------
 /*
  * Calcula el CRC-16/CCITT-FALSE.
  *
@@ -112,11 +107,27 @@ uint16_t protocol_crc16(
 );
 /* NOTA: para el protocolo CRC-16 se valida sobre los bytes de version hasta el payload */
 
-// ---------------------------------------------------------------------------------------
-/*
- * Estructura para representar un frame del protocolo 
- *
-*/
+/* Tipos de errores para operaciones del protocolo */
+typedef enum {
+    PROTOCOL_OK = 0,
+    // errores generales
+    PROTOCOL_ERROR = -1,
+    PROTOCOL_OUT_RANGE    = -2,
+    PROTOCOL_INVALID_ARG  = -3,
+    PROTOCOL_INVALID_SIZE = -4,
+    PROTOCOL_INVALID_MODE = -5,
+    PROTOCOL_SERIAL_EIO = -6
+} protocol_errno_t;
+
+/* Estados de confirmacion de protocolo */
+typedef enum {
+    PROTOCOL_ACK  = 0,
+    PROTOCOL_NACK,
+    PROTOCOL_ACK_UNKNOWN,
+    PROTOCOL_ACK_TIMEOUT
+} protocol_ack_t;
+
+/* Estructura para representar un frame del protocolo */
 typedef struct {
     uint8_t header [PROTOCOL_HEADER_BYTES]; // inicio de trama
     uint8_t version;    // version del protocolo
@@ -159,11 +170,10 @@ protocol_errno_t protocol_set_buffer_to_frame(
     size_t length
 );
 
-// ---------------------------------------------------------------------------------------
-/*
- * Estados de transmision del protocolo
- *
-*/
+// ---------------------------------------------------------------------------
+// + Transmisor (TX)
+
+/* Estados de transmision del protocolo */
 typedef enum {
     PROTOCOL_TX_INIT = 0,
     PROTOCOL_TX_HEADER,
@@ -176,10 +186,7 @@ typedef enum {
     PROTOCOL_TX_DONE
 } protocol_tx_state_t;
 
-/*
- * Estructura de metadatos de transmision
- *
-*/
+/* Estructura de metadatos de transmision */
 typedef struct {
     uint8_t buffer [PROTOCOL_FRAME_BYTES]; // buffer de transmision
     uint8_t ack [PROTOCOL_ACK_BYTES];      // buffer de recepcion de ACK/NACK
@@ -193,10 +200,7 @@ typedef struct {
     size_t count;   // contador de TX para lecturas de ACK
 } protocol_tx_t;
 
-/*
- * Inicializar componentes de transmision
- *
-*/
+/* Inicializar componentes de transmision */
 protocol_errno_t protocol_tx_init(
     protocol_tx_t* tx,
     serial_packet_t* packet
@@ -218,11 +222,10 @@ protocol_errno_t protocol_tx_poll(
     serial_packet_t* packet
 );
 
-// ---------------------------------------------------------------------------------------
-/*
- * Estados de recepcion del protocolo
- *
-*/
+// ---------------------------------------------------------------------------
+// + Receptor (RX)
+
+/* Estados de recepcion del protocolo */
 typedef enum {
     PROTOCOL_RX_INIT = 0,
     PROTOCOL_RX_HEADER,
@@ -235,10 +238,7 @@ typedef enum {
     PROTOCOL_RX_DONE
 } protocol_rx_state_t;
 
-/*
- * Estructura de metadatos de recepcion
- *
-*/
+/* Estructura de metadatos de recepcion */
 typedef struct {
     uint8_t buffer [PROTOCOL_FRAME_BYTES]; // buffer de recepcion
     uint8_t ack [PROTOCOL_ACK_BYTES];      // bytes de confirmacion
@@ -251,15 +251,11 @@ typedef struct {
     size_t offset;  // offset de RX en lectura del encabezado
 } protocol_rx_t;
 
-/*
- * Inicializar componentes de recepcion
- *
-*/
+/* Inicializar componentes de recepcion */
 protocol_errno_t protocol_rx_init(
     protocol_rx_t* rx,
     serial_packet_t* packet
 );
-
 
 /*
  * Solicitar actualizacion de maquina de estados de recepcion. Avanza
@@ -277,9 +273,8 @@ protocol_errno_t protocol_rx_poll(
     serial_packet_t* packet
 );
 
-
 #ifdef __cplusplus
 }
 #endif
-
+// ===========================================================================
 #endif // COMMON_PROTOCOL_H

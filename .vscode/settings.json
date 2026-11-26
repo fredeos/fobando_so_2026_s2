@@ -1,3 +1,4 @@
 {
-    "idf.currentSetup": "/home/frede/.espressif/v6.1/esp-idf"
+    "idf.currentSetup": "/home/frede/.espressif/v6.1/esp-idf",
+    "CodeGPT.apiKey": "CodeGPT Plus Beta"
 }

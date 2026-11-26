@@ -4,7 +4,8 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/local/include/"
+                "/usr/local/include/",
+                "${HOME}/.espressif/v6.1/esp-idf/components/**/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
