@@ -16,12 +16,12 @@ int board_gpio_init(uint32_t _pin, gpio_direction_t _mode){
                 ? GPIO_MODE_OUTPUT
                 : GPIO_MODE_INPUT,
 
-        .pull_up_en =
-            (_mode == GPIO_INPUT)
-                ? GPIO_PULLUP_ENABLE
-                : GPIO_PULLUP_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
 
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_down_en = 
+            (_mode == GPIO_INPUT)
+                ? GPIO_PULLDOWN_ENABLE
+                : GPIO_PULLDOWN_DISABLE,
 
         .intr_type = GPIO_INTR_DISABLE
     };
@@ -49,7 +49,7 @@ int board_gpio_read(uint32_t _pin, gpio_level_t* _level){
 
     int value = gpio_get_level(_pin);
 
-    *_level = value ? GPIO_HIGH : GPIO_LOW;
+    *_level = (value == 1) ? GPIO_HIGH : GPIO_LOW;
 
     return 0;
 }
