@@ -3,11 +3,15 @@
         {
             "name": "Linux",
             "includePath": [
+                "${workspaceFolder}/proyecto_2/include",
                 "${workspaceFolder}/**",
                 "/usr/local/include/",
-                "${HOME}/.espressif/v6.1/esp-idf/components/**/include"
+                "${workspaceFolder}/proyecto_2/third_party",
+                "${HOME}/.espressif/v6.1/esp-idf/components/**/include",
+                "/usr/lib/x86_64-linux-gnu/openmpi/include",
+                "/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi"
             ],
-            "defines": [],
+            "defines": ["_POSIX_C_SOURCE=200809L"],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "gnu23",
             "cppStandard": "gnu++17",

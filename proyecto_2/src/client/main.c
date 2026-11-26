@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "common/json.h"
+#include "client/header.h"
 
 #define BUFFER_SIZE 1024
 
@@ -16,6 +17,10 @@
 } while (0)
 
 int main(int argc, char *argv[]){
+    if (argc > 1 && !(argc == 2 && strcmp(argv[1], "--json-demo") == 0)) {
+        return tcp_client_run(argc, argv); // Integra TCP/MPI conservando la demo JSON de p2.
+    }
+
     /* Estructura del json
      * {
      * "mensaje":"hola",
