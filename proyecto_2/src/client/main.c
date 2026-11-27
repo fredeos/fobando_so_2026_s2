@@ -1,183 +1,177 @@
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "common/json.h"
 
-#define BUFFER_SIZE 1024
+#include "common/protocol.h"
+#include "serial/serial.h"
+#include "serial/posix.h"
+
+#include "client/timing.h"
+
+#define MESSAGE_LENGTH 128u
+#define LIFETIME_MS 15000u  // 15000 ms (15s)
+#define ACTION_MS   500u    // 500 ms (0.5s)
+#define ACCEPT_CRITERIA 1u
 
 #define PARSE(operation) do { \
     JsonParseResult result_ = (operation); \
     if (result_ != JSON_PARSE_OK) { \
         printf("json_parse(): %s\n", parse_error(result_)); \
+        break; \
+    } \
+} while (0)
+
+#define SETUP(operation) do { \
+    if (operation){ \
+        printf("setup_failed()\n"); \
         return 1; \
     } \
 } while (0)
 
 int main(int argc, char *argv[]){
-    /* Estructura del json
-     * {
-     * "mensaje":"hola",
-     * "x": -77,
-     * "y": 3.14789190167,
-     * "flag": false,
-     * "obj": {
-     *      "nombre": "Frederick",
-     *      "edad": 21,
-     *      "strings": ["xy", "xz", "xyz"]
-     *  },
-     *  "arr1": [3, 4, 5, 6, 7],
-     *  "arr2": [2.1, 1.5, 3.4901]
-     * }
-    */
-
-    // =========================================================================
-    // Serializar un objeto JSON
-    // =========================================================================
-    /* Para crear un objecto JSON es necesario crear un los campos desde adentro hacia afuera */
-    char serialized[BUFFER_SIZE];
-    // 1. Crear lista de strings
-    char string1[] = "xy";
-    char string2[] = "xz";
-    char string3[] = "xyz";
-
-    JsonString strings_arr[] = {
-        {.string = string1, .length = strlen(string1)},
-        {.string = string2, .length = strlen(string2)},
-        {.string = string3, .length = strlen(string3)}
-    };
-
-    JsonArray strings = {.data = strings_arr, .count = sizeof(strings_arr), .size = sizeof(strings_arr[0]), .type = JSON_STRING};
-    // 2. Crear objeto anidado
-    const char nombre[] = "Frederick";
-    uint8_t edad = 21;
-
-    JsonString nombre_str = {.string = nombre, .length = strlen(nombre)};
-    JsonPair nested_pairs[] = {
-        {.name = "nombre", .value = &nombre_str, .size = sizeof(nombre_str), .type = JSON_STRING},
-        {.name = "edad", .value = &edad, .size = sizeof(edad), .type = JSON_UNSIGNED},
-        {.name = "strings", .value = &strings, .size = sizeof(strings), .type = JSON_ARRAY}
-    };
-    JsonObject nested = {.pairs = nested_pairs, .count = COUNT(nested_pairs)};
-    // 3. Crear arreglos de datos 1 y 2
-    uint16_t array1[] = {3, 4, 5, 6, 7};
-    JsonArray arr1 = {.data = array1, .count = sizeof(array1), .size = sizeof(array1[0]), .type = JSON_UNSIGNED};
-
-    float array2[] = {2.1, 1.5, 3.4901};
-    JsonArray arr2 = {.data = array2, .count = sizeof(array2), .size = sizeof(array2[0]), .type = JSON_FLOAT};
-    // 4. Crear objecto completo
-    const char mensaje[] = "hola";
-    int32_t x = -77;
-    double y = 3.14789190167;
-    bool flag = false;
-
-    JsonString mensaje_str = {.string = mensaje, .length = strlen(mensaje)};
-    JsonPair pairs[] = {
-        {.name = "mensaje", .value = &mensaje_str, .size = sizeof(mensaje_str), .type = JSON_STRING},
-        {.name = "x", .value = &x, .size = sizeof(x), .type = JSON_INTEGER},
-        {.name = "y", .value = &y, .size = sizeof(y), .type = JSON_FLOAT},
-        {.name = "flag", .value = &flag, .size = sizeof(flag), .type = JSON_BOOL},
-        {.name = "obj", .value = &nested, .size = sizeof(nested), .type = JSON_OBJECT},
-        {.name = "arr1", .value = &arr1, .size = sizeof(arr1), .type = JSON_ARRAY},
-        {.name = "arr2", .value = &arr2, .size = sizeof(arr2), .type = JSON_ARRAY}
-    };
-    JsonObject object = {.pairs = pairs, .count = COUNT(pairs)};
-    // 5. Seralizar objeto y verificar la salida
-    size_t written = 0;
-    JsonSerializeResult serialize = write_object(&object, serialized, sizeof(serialized), &written, true);
-    if (serialize == JSON_SERIALIZE_OK){
-        serialized[written] = '\0';
-        printf("Serializado: %s\n", serialized);
-    } else {
-        printf("json_serialize(): %s\n", serialize_error(serialize));
+    if (argc < 2) {
+        printf("No device provided: /dev/tty**** \n");
+        return 1;
     }
-
-    // =========================================================================
-    // Parseo del objeto JSON creado
-    // =========================================================================
-    /* Para extraer datos de un objeto JSON se hace el parseo de afuera hacia adentro */
-    printf("Parseando mensaje\n");
-    // 1. Instancia todos los datos que se desean extraer
-    char rd_message[10] = { 0 };
-    int16_t rd_x = 0;
-    float rd_y = 0.0f;
-    bool rd_flag = true;
-
-    char rd_nombre[20] = { 0 };
-    uint32_t rd_edad = 0;
-    char rd_string1[5] = { 0 }; char rd_string2[5] = { 0 }; char rd_string3[6] = { 0 };
-    JsonString rd_strings[] = {
-        {.string = rd_string1, .length = sizeof(rd_string1)},
-        {.string = rd_string2, .length = sizeof(rd_string2)},
-        {.string = rd_string3, .length = sizeof(rd_string3)}
+    // -------------------------------------------------
+    // Configuracion de interfaces
+    // -------------------------------------------------
+    // + Interfaz serial
+    int fd = -1; // file descriptor
+    posix_serial_config_t config = {
+        .device = argv[1],
+        .baudrate = SERIAL_BAUDRATE
     };
+    SETUP( serial_configure(&fd, &config) != SERIAL_OK);
+    // + Interfaz de protocolo CRC-16
+    // [TX:output]
+    protocol_frame_t tx_frame;
+    protocol_tx_t tx;
+    serial_packet_t tx_packet;
+    SETUP ( protocol_tx_init(&tx, &tx_packet) != PROTOCOL_OK );
+    // [RX:input]
+    protocol_frame_t rx_frame;
+    protocol_rx_t rx;
+    serial_packet_t rx_packet;
+    SETUP ( protocol_rx_init(&rx, &rx_packet) != PROTOCOL_OK );
+    // -------------------------------------------------
+    // Variables del programa
+    // -------------------------------------------------
+    // + Mensajes genericos
+    const char* ping = "PING";
+    // + Buffers de comunicacion
+    char input[MESSAGE_LENGTH] = { 0 };
+    char output[MESSAGE_LENGTH] = { 0 };
+    // + Campos json recibidos
+    char event [24] = { 0 };
+    char action[24] = { 0 };
+    // -------------------------------------------------
+    // Loop de protocolo
+    // -------------------------------------------------
+    int state = 0; // estado de FSM
+    int value = 0; // accion
+    uint64_t last  = get_time_ms();
+    uint64_t first = last;
+    while (1) {
+        /* (0) Configurar mensaje */
+        /* En esta seccion se configura el mensaje por enviar */
+        if (state == 0){
+            char* message = ping;
+            tx_frame.relevance = 0u;
+            // Obtener estamp de tiempo y validar momento del programa
+            uint64_t now = get_time_ms();
+            if (now - first >= LIFETIME_MS){ // fin del programa
+                break;
+            } else if (now - last >= ACTION_MS){ // enviar comando al ESP32
+                // Definir prioridad
+                tx_frame.relevance = ACCEPT_CRITERIA+1;
+                // Crear objeto
+                const char* command = "led";
+                JsonString command_str = {.string = command, .length = strlen(command)};
 
-    int8_t rd_arr1[5] = { 0 };
-    double rd_arr2[3] = { 0 };
-    // 2. Definir la estructura esperada del objeto exterior
-    JsonField fields[] = {
-        {.name = "mensaje", .pair = { 0 }},
-        {.name = "x", .pair = { 0 }},
-        {.name = "y", .pair = { 0 }},
-        {.name = "flag", .pair = { 0 }},
-        {.name = "obj", .pair = { 0 }},
-        {.name = "arr1", .pair = { 0 }},
-        {.name = "arr2", .pair = { 0 }}
-    };
-
-    PARSE( read_object(serialized, strlen(serialized), fields, COUNT(fields)) );
-    // 3. Obtener para estructuras inmediatas
-    PARSE( read_string(&fields[0], rd_message, sizeof(rd_message)) );
-    PARSE( read_int(&fields[1], &rd_x, sizeof(rd_x)) );
-    PARSE( read_float(&fields[2], &rd_y, sizeof(rd_y)) );
-    PARSE( read_bool(&fields[3], &rd_flag) );
-
-    printf("mensaje = %s\n", rd_message);
-    printf("x = %d\n", rd_x);
-    printf("y = %.8f\n", rd_y);
-    printf("flag = %d\n", rd_flag);
-    // 4. Definir estructura de objecto anidado interno
-    JsonField nested_fields[] = {
-        {.name = "nombre", .pair = { 0 }},
-        {.name = "edad", .pair = { 0 }},
-        {.name = "strings", .pair = { 0 }}
-    };
-
-    PARSE ( read_object(fields[4].pair.value, fields[4].pair.valueLength, nested_fields, COUNT(nested_fields)) );
-    // 5. Obtener valores de estrutura anidada
-    PARSE ( read_string(&nested_fields[0], rd_nombre, sizeof(rd_nombre)));
-    PARSE ( read_uint(&nested_fields[1], &rd_edad, sizeof(rd_edad)));
-    PARSE ( read_array(
-        nested_fields[2].pair.value, 
-        nested_fields[2].pair.valueLength, 
-        rd_strings, 
-        sizeof(rd_strings), 
-        sizeof(rd_strings[0]), 
-        JSON_STRING
-        ) 
-    );
-
-    printf("nombre: %s\n", rd_nombre);
-    printf("edad: %u\n", rd_edad);
-    printf("strings: [1]%s [2]%s [3]%s \n", rd_string1, rd_string2, rd_string3);
-    // 6. Obtener valores de los arreglos
-    PARSE ( read_array(fields[5].pair.value, fields[5].pair.valueLength, rd_arr1, sizeof(rd_arr1), sizeof(rd_arr1[0]), JSON_INTEGER) );
-    PARSE ( read_array(fields[6].pair.value, fields[6].pair.valueLength, rd_arr2, sizeof(rd_arr2), sizeof(rd_arr2[0]), JSON_FLOAT) );
-
-    printf("[");
-    for (int i = 0; i < 5; i++){
-        printf("%d", rd_arr1[i]);
-        if (i < 4) printf(", ");
+                JsonPair pairs[] = {
+                    {.name = "command", .value = &command_str, .size = sizeof(command_str), .type = JSON_STRING},
+                    {.name = "action", .value = &value, .size = sizeof(value), .type = JSON_INTEGER}
+                };
+                JsonObject object = {.pairs = pairs, .count = COUNT(pairs)};
+                // Serializar objeto
+                size_t written = 0;
+                write_object(&object, output, sizeof(output), &written, true);
+                output[written] = '\0';
+                // Copiar objeto completo
+                memcpy(tx_frame.payload, output, strlen(output)+1);
+                tx_frame.length = strlen(output) + 1;
+                // Cambiar accion
+                value++;
+                if (value == 2) value = 0;
+                // Actulizar valor de temporizador
+                last = now;
+                // Limpiar buffer
+                memset(output, 0, sizeof(output));
+            } else { // mensaje default
+                memcpy(tx_frame.payload, message, strlen(message)+1);
+                tx_frame.length = strlen(message) + 1;
+            }
+            protocol_set_frame_to_buffer(&tx_frame, tx.buffer, sizeof(tx.buffer));
+            // Mover a TX
+            state = 1;
+        }
+        /* (1) TX state */
+        /* TX se encarga de enviar mensajes */
+        if (state == 1){
+            // << Poll TX FSM >>
+            protocol_tx_poll(&fd, &tx, &tx_packet);
+            // << Check TX status >>
+            if (tx.complete && tx.valid){
+                memset(tx.buffer, 0, sizeof(tx.buffer));
+                // Mover a RX
+                state = 2;
+            }
+        }
+        /* (2) RX state */
+        /* RX se encarga de recibir mensajes */
+        if (state == 2){
+            // << Poll RX FSM >>
+            protocol_rx_poll(&fd, &rx, &rx_packet);
+            // << Check RX status >>
+            if (rx.complete && rx.valid){
+                protocol_set_buffer_to_frame(&rx_frame, rx.buffer, sizeof(rx.buffer));
+                // Capturar mensajes de prioridad
+                if (rx_frame.relevance >= ACCEPT_CRITERIA){
+                    // Extraer mensaje
+                    memcpy(input, rx_frame.payload, rx_frame.length);
+                    // Definir campos esperados
+                    JsonField fields[] = {
+                        {.name = "event", .pair = { 0 }},
+                        {.name = "action", .pair = { 0 }}
+                    };
+                    // Parseo del objeto
+                    if (read_object(input, strlen(input), fields, COUNT(fields)) == JSON_PARSE_OK){
+                        // Leer valores
+                        read_string(&fields[0], event, sizeof(event));
+                        read_string(&fields[1], action, sizeof(action));
+                        // Mostrar valores leidos
+                        printf("ESP32: <event:%s> <action:%s> \n", event, action);
+                        // Limpiar valores leidos
+                        memset(event, 0, sizeof(event));
+                        memset(action, 0, sizeof(action));
+                    }
+                    memset(input, 0, sizeof(input)); // limpiar buffer
+                }
+                // Mover a configuracion
+                state = 0;
+                memset(rx.buffer, 0, sizeof(rx.buffer));
+            }
+        }
     }
-    printf("]\n");
-
-    printf("[");
-    for (int i = 0; i < 3; i++){
-        printf("%.2f", rd_arr2[i]);
-        if (i < 2) printf(", ");
-    }
-    printf("]\n");
-    // final del programa
+    // -------------------------------------------------
+    // Final del programa
+    // -------------------------------------------------
+    close(fd);
     return 0;
 }
