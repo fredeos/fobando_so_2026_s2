@@ -114,6 +114,46 @@ CLIENT_DEPS := $(sort \
 # =============================================================================
 .PHONY: clean dirs
 
+# =============================================================================
+# Static screen library
+# =============================================================================
+SCREEN_LIB_SRC := $(SRC_DIR)/screen
+SCREEN_LIB_BUILD := $(BUILD_DIR)/screen
+SCREEN_LIB_OUT := $(OUT_DIR)/libscreen.a
+SCREEN_LIB_SOURCES := $(shell find $(SCREEN_LIB_SRC) -type f -name '*.c')
+SCREEN_LIB_OBJECTS := $(patsubst $(SCREEN_LIB_SRC)/%.c,$(SCREEN_LIB_BUILD)/%.o,$(SCREEN_LIB_SOURCES))
+
+$(SCREEN_LIB_BUILD)/%.o: $(SCREEN_LIB_SRC)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: screen-library
+screen-library: $(SCREEN_LIB_OBJECTS)
+	@mkdir -p $(dir $(SCREEN_LIB_OUT))
+	ar rcs $(SCREEN_LIB_OUT) $(SCREEN_LIB_OBJECTS)
+
+# Host-side screen device driver, linked with the existing POSIX serial and
+# framing protocol implementations. The ESP32 firmware is a separate target.
+SCREEN_DRIVER_OUT := $(OUT_DIR)/libscreen_driver.a
+SCREEN_DRIVER_OBJECTS := $(BUILD_DIR)/driver/screen_driver.o \
+	$(BUILD_DIR)/serial/serial.o \
+	$(BUILD_DIR)/common/protocol/protocol_misc.o \
+	$(BUILD_DIR)/common/protocol/protocol_tx.o \
+	$(BUILD_DIR)/common/protocol/protocol_rx.o \
+	$(BUILD_DIR)/common/conversion.o
+
+.PHONY: screen-driver-library
+screen-driver-library: $(SCREEN_DRIVER_OBJECTS)
+	@mkdir -p $(dir $(SCREEN_DRIVER_OUT))
+	ar rcs $(SCREEN_DRIVER_OUT) $(SCREEN_DRIVER_OBJECTS)
+
+SCREEN_DRIVER_DEMO := $(OUT_DIR)/screen-driver-demo
+SCREEN_DRIVER_DEMO_OBJECT := $(BUILD_DIR)/driver/screen_driver_demo.o
+
+.PHONY: screen-driver-demo
+screen-driver-demo: screen-driver-library $(SCREEN_DRIVER_DEMO_OBJECT)
+	$(CC) $(CFLAGS) $(SCREEN_DRIVER_DEMO_OBJECT) -L$(OUT_DIR) -lscreen_driver -o $(SCREEN_DRIVER_DEMO)
+
 dirs:
 	@mkdir -p $(BUILD_DIR) $(OUT_DIR)
 
@@ -130,6 +170,7 @@ $(BUILD_DIR)/$(3PARTY_SRC)/%.o: $(3PARTY_SRC)/%.c
 
 # Server entry points and MPI modules need OpenMPI's compiler/include paths.
 $(SERVER_OBJS): CC := $(MPICC)
+$(SCREEN_DRIVER_OBJECTS): CC := gcc
 
 $(BUILD_DIR)/distributed/%.o: $(SRC_DIR)/distributed/%.c
 	@mkdir -p $(dir $@)
@@ -171,6 +212,7 @@ client-release:
 # Makefile dependency tracking
 # =============================================================================
 -include $(SERVER_DEPS) $(CLIENT_DEPS)
+-include $(SCREEN_DRIVER_OBJECTS:.o=.d)
 
 # =============================================================================
 # Makefile ESP32 rules and variables
