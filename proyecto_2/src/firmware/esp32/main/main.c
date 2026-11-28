@@ -33,7 +33,9 @@
 
 // + Modulos
 #include "common/protocol.h" // protocolo CRC-16
-#include "common/json.h"     // json parser & serializer
+#include "common/json.h"     // JSON parser & serializer
+
+#include "timing/timing.h"   // temporizador ESP
 
 // + Librerias
 #include "freertos/FreeRTOS.h" // FreeRTOS
@@ -86,6 +88,10 @@
 // + Criterios de aceptacion (protocolo)
 #define ACCEPT_CRITERIA  1u
 
+// + Restricciones de tiempo
+#define DEBOUNCE_MS 100u  // 100 ms
+#define TIMEOUT_MS  1000u // 1000 ms (1s)
+
 // =================================================================================
 // Scope global
 // =================================================================================
@@ -93,9 +99,12 @@
 // + Setup de dispositivos
 bool SETUP_FAILURE = false;
 
+// + Temporizadores
+uint64_t last, start;
+
 // + Inputs de botones
-bool buttons[4] = { 0 };
 gpio_level_t btn_in[4] = { 0 };
+bool buttons [4] = { 0 };
 
 // + Objeto de UART serial
 esp32_uart_t uart;
@@ -152,7 +161,7 @@ char command[24] = { 0 };
 // =================================================================================
 
 /* Agregar elemento a la cola */
-static int append(const char* src, size_t length, uint8_t priority, queue_t* queue){
+static int append(const void* src, size_t length, uint8_t priority, queue_t* queue){
     // Negar peticiones con valores nulos o largos mayores al
     if (src == NULL || queue == NULL || length > MESSAGE_LENGTH) 
         return -1;
@@ -168,16 +177,16 @@ static int append(const char* src, size_t length, uint8_t priority, queue_t* que
     queue->priority[last] = priority;
 
     queue->last = last;
-    queue->available = true;
+    queue->available = (queue->last >= 0);
 
     xSemaphoreGive(queue->mutex); // devolver control
     return 0;
 }
 
 /* Consumir elemento de la cola */
-static int consume(char* dst, size_t length, uint8_t* priority, queue_t* queue){
-    // Negar peticiones con valores nulos o largos mayores al
-    if (queue == NULL || length > MESSAGE_LENGTH) 
+static int consume(void* dst, size_t length, uint8_t* priority, queue_t* queue){
+    // Negar peticiones con valores nulos o buffers de menor capacidad al requerido
+    if (queue == NULL || (dst != NULL && length < MESSAGE_LENGTH))
         return -1;
     // Si no hay mensajes disponibles retorna de inmediato
     if (queue->last < 0)
@@ -185,7 +194,7 @@ static int consume(char* dst, size_t length, uint8_t* priority, queue_t* queue){
     
     while (xSemaphoreTake(queue->mutex, 100) != pdTRUE); // blockear hasta recibir control
 
-    if (dst != NULL) memcpy(dst, queue->messages[0], length);
+    if (dst != NULL) memcpy(dst, queue->messages[0], strlen(queue->messages[0]) + 1);
     if (priority != NULL) *priority = queue->priority[0];
     for (int i = 0; i < QUEUE_SIZE; i++){
         if (i < QUEUE_SIZE-1){
@@ -220,17 +229,37 @@ static char* get_key_action(int button){
 
 /* Tarea para gestion de protocolo de comunicacion */
 static void protocol_task(void *arg){
-    int state = 0;  // estado de FSM
+    // << Variables locales del task >>
+    uint64_t local_last = get_time_ms();
+    bool resync = false;    // bandera de sincronizacion
     // << Loop de protocolo >>
+    int state  = 0;  // estado de FSM
     while (1){
+        // ---------------------------------------------------------------
+        /* Intento de sincronizacion */
+        if (resync){
+            state = 0; // esperar un nuevo mensaje
+            // << Reiniciar las FSM >>
+            protocol_tx_init(&tx, &tx_packet); // reset TX FSM
+            protocol_rx_init(&rx, &rx_packet); // reset RX FSM
+            // << Remover condicion >>
+            resync = false;
+        }
+        // ---------------------------------------------------------------
+        /* Determinar LED activo y de control */
+        int active  = (state == 0) ? LED0 : LED1; // activo:  RX o TX
+        int control = (state == 0) ? LED1 : LED0; // control/debug: RX o TX
+        // ---------------------------------------------------------------
         /* (0): RX state */
         /* RX se encarga de recibir mensajes */
         if (state == 0){
             // << Actualizar LEDs de protocolo >>
-            board_gpio_write(LED0, GPIO_HIGH); // RX activo
-            board_gpio_write(LED1, GPIO_LOW);  // TX inactivo
+            board_gpio_write(active, GPIO_HIGH); // RX activo
+            board_gpio_write(control, GPIO_LOW); // control inactivo
             // << Poll RX FSM >>
+            protocol_rx_state_t previous = rx.state;
             protocol_rx_poll(&uart, &rx, &rx_packet);
+            if (rx.state != previous) local_last = get_time_ms(); // medir el tiempo al detectar actividad
             // << Check RX status >>
             if (rx.complete && rx.valid){
                 // Mensaje invalido (respuesta default)
@@ -244,42 +273,49 @@ static void protocol_task(void *arg){
                 // (Revisar mensaje y prioridad)
                 if (rx_frame.relevance == 0u && strcmp(message, "PING") == 0) response = pong; // ping -> pong
                 else if (rx_frame.relevance >= ACCEPT_CRITERIA) { // mensajes prioritarios
+                    board_gpio_write(control, GPIO_HIGH); // señalar mensajes prioritarios
                     while (append(message, rx_frame.length, rx_frame.relevance, &in) > 0);
                 }
                 // Definir respuesta
+                // [Cargar respuesta al frame]
                 int loaded = 0;
-                if (out.available){
-                    char* payload = (char*) tx_frame.payload;
-                    loaded = consume(payload, MESSAGE_LENGTH, &tx_frame.relevance, &out); // copiar mensaje completo
-                    tx_frame.length = strlen(payload) + 1; // incluir '\0'
-                }
-                if (loaded < 1){
-                    memcpy(tx_frame.payload, response, strlen(response)+1); // copiar hasta '\0'
-                    tx_frame.length = strlen(response) + 1; // incluir '\0'
-                }
+                if (out.available)
+                    loaded = consume(tx_frame.payload, sizeof(tx_frame.payload), &tx_frame.relevance, &out); // consumir un mensaje
+                if (loaded < 1)
+                    memcpy(tx_frame.payload, response, strlen(response) + 1);
+                tx_frame.length = strlen((char*) tx_frame.payload) + 1; // incluir '\0'
+                // [Cargar frame al buffer]
                 protocol_set_frame_to_buffer(&tx_frame, tx.buffer, sizeof(tx.buffer));
                 // Transicion a TX
                 state = 1;
-                memset(rx.buffer, 0, sizeof(rx.buffer));
             }
         }
         /* (1): TX state */
         /* TX se encarga de enviar mensajes */
         if (state == 1){
             // << Actualizar LEDs de protocolo >>
-            board_gpio_write(LED0, GPIO_LOW); // RX inactivo
-            board_gpio_write(LED1, GPIO_HIGH);// TX activo
+            board_gpio_write(active, GPIO_HIGH); // TX activo
+            board_gpio_write(control, GPIO_LOW); // control inactivo
             // << Poll TX FSM >>
+            protocol_tx_state_t previous = tx.state;
             protocol_tx_poll(&uart, &tx, &tx_packet);
+            if (tx.state != previous) local_last = get_time_ms(); // medir tiempo al detectar actividad
             // << Check TX status >>
             if (tx.complete && tx.valid) {
-                memset(tx.buffer, 0, sizeof(tx.buffer));
+                board_gpio_write(control, GPIO_HIGH); // señalar mensaje completo y valido
+                // Transicion a RX
                 state = 0;
             }
         }
-        /* delay opcional para mejorar alternancia de procesos */
-        /* se puede comentar en caso de ser necesario */
-        // vTaskDelay(pdMS_TO_TICKS(100));
+        // ---------------------------------------------------------------
+        /* Logica de desicronizacion */
+        uint64_t now = get_time_ms(); // obtener tiempo actual
+        if (now - local_last >= TIMEOUT_MS){
+            // Indicar resincronizacion
+            resync = true;
+            // Actualizar ultimo tiempo de actividad
+            local_last = now;
+        }
     }
 }
 
@@ -341,6 +377,9 @@ void setup(void){
         out.priority[i] = 0u;
         memset(out.messages[i], 0, MESSAGE_LENGTH);
     }
+    // + Temporizadores de alta resolucion
+    start = get_time_ms();
+    last = start;
     // -------------------------------------------------
     // Configuracion de estimulos iniciales
     // -------------------------------------------------
@@ -363,6 +402,10 @@ void setup(void){
 void loop(void){
     /* Add your loop code here */
     // -------------------------------------------------
+    // Obtener tiempo actual
+    // -------------------------------------------------
+    uint64_t now = get_time_ms();
+    // -------------------------------------------------
     // Lectura de inputs
     // -------------------------------------------------
     // + Lectura de niveles logicos
@@ -371,34 +414,49 @@ void loop(void){
     board_gpio_read(BTN2, &btn_in[2]);
     board_gpio_read(BTN3, &btn_in[3]);
     // + Interpretacion de inputs
-    for (int i = 0; i < 4; i++) buttons[i] = (btn_in[i] == GPIO_HIGH);
+    if (now - last >= DEBOUNCE_MS){
+        for (int i = 0; i < 4; i++)
+            buttons[i] = (!buttons[i] && btn_in[i] == GPIO_HIGH);
+        last = now;
+    }
     // -------------------------------------------------
     // Escritura de outputs
     // -------------------------------------------------
     // + Escritura en LEDs
-    board_gpio_write(LED2, GPIO_LOW);
-    board_gpio_write(LED3, GPIO_LOW);
+    // board_gpio_write(LED2, GPIO_LOW);
+    // board_gpio_write(LED3, GPIO_LOW);
     // -------------------------------------------------
     // Lectura de mensajes recibidos
     // -------------------------------------------------
-    if (in.available && consume(input, sizeof(input), NULL, &in) == 1){
-        // Definir campos esperados
-        JsonField fields[] = {
-            {.name = "command", .pair = { 0 }},
-            {.name = "action", .pair = { 0 }}
-        };
-        // Parsear objecto
-        if ( read_object(input, strlen(input), fields, COUNT(fields)) == JSON_PARSE_OK ){
-            // Leer valores
-            read_string(&fields[0], command, sizeof(command));
-            read_uint(&fields[1], &action, sizeof(action));
-            if (strcmp(command, "led") == 0){
-                if      (action == 0) board_gpio_write(LED2, GPIO_HIGH);
-                else if (action == 1) board_gpio_write(LED3, GPIO_HIGH);
+    if (in.available){
+        if (consume(input, sizeof(input), NULL, &in) == 1){
+            // Definir campos esperados
+            JsonField fields[] = {
+                {.name = "command", .pair = { 0 }},
+                {.name = "action", .pair = { 0 }}
+            };
+            // Parsear objecto
+            if ( read_object(input, strlen(input), fields, COUNT(fields)) == JSON_PARSE_OK ){
+                // Leer valores
+                read_string(&fields[0], command, sizeof(command));
+                read_uint(&fields[1], &action, sizeof(action));
+                if (strcmp(command, "led") == 0){
+                    if (action == 0) {
+                        board_gpio_write(LED2, GPIO_HIGH);
+                        board_gpio_write(LED3, GPIO_LOW);
+                    } else if (action == 1) {
+                        board_gpio_write(LED2, GPIO_LOW);
+                        board_gpio_write(LED3, GPIO_HIGH);
+                    } else if (action == 2) {
+                        board_gpio_write(LED2, GPIO_LOW);
+                        board_gpio_write(LED3, GPIO_LOW);
+                    }
+                }
+                memset(command, 0, sizeof(command));
             }
-            memset(command, 0, sizeof(command));
+            // Limpiar buffer
+            memset(input, 0, sizeof(input));
         }
-        memset(input, 0, sizeof(input)); // limpiar buffer
     }
     // -------------------------------------------------
     // Escritura de eventos
@@ -420,14 +478,15 @@ void loop(void){
 
             // Serializar objeto
             size_t written = 0;
-            write_object(&object, output, sizeof(output), &written, true);
-            output[written] = '\0';
-
-            // Enviar objeto
-            while (append(output, strlen(output) + 1, ACCEPT_CRITERIA+1, &out) > 0); // incluir '\0';
-
+            if (write_object(&object, output, sizeof(output), &written, true) == JSON_SERIALIZE_OK){
+                output[written] = '\0';
+                // Enviar objeto
+                while (append(output, strlen(output)+1, ACCEPT_CRITERIA+1, &out) > 0); // incluir '\0';
+            }
             // Limpiar buffer
             memset(output, 0, sizeof(output));
+            // Remover accion
+            buttons[i] = false;
         }
     }
 }

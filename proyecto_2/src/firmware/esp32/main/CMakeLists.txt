@@ -15,6 +15,7 @@ idf_component_register(
         ${COMMON_SOURCES}
         "gpio/gpio.c"
         "serial/serial.c"
+        "timing/timing.c"
         # Third party
         "${THIRD_PARTY}/coreJSON/core_json.c"
         
@@ -27,4 +28,5 @@ idf_component_register(
     REQUIRES 
         esp_driver_uart
         esp_driver_gpio
+        esp_timer
 )

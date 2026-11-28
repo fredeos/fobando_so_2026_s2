@@ -29,6 +29,7 @@ protocol_errno_t protocol_tx_init(
     tx->wd_busy = false;
     tx->offset = 0;
     tx->count = 0;
+    memset(tx->buffer, 0, sizeof(tx->buffer));
     // << Retorno >>
     return PROTOCOL_OK;
 }

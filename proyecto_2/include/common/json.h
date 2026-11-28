@@ -227,6 +227,7 @@ const char* parse_error(JsonParseResult result);
 /* Obtener informacion de debug del error de serializacion */
 const char* serialize_error(JsonSerializeResult result);
 
+// ---------------------------------------------------------------------------
 #ifdef __cplusplus
 }
 #endif
