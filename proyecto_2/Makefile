@@ -60,6 +60,7 @@ SERVER_BUILD := $(BUILD_DIR)/server
 
 ESP_SRC := $(SRC_DIR)/firmware/esp32
 ESP_BUILD := $(BUILD_DIR)/esp32
+ESP_DEMO_BUILD := $(BUILD_DIR)/esp32-screen-demo
 
 # =============================================================================
 # Sources, objects and dependencies
@@ -212,29 +213,44 @@ client-release:
 # Makefile dependency tracking
 # =============================================================================
 -include $(SERVER_DEPS) $(CLIENT_DEPS)
--include $(SCREEN_DRIVER_OBJECTS:.o=.d)
+-include $(SCREEN_DRIVER_OBJECTS:.o=.d) $(SCREEN_DRIVER_DEMO_OBJECT:.o=.d)
 
 # =============================================================================
 # Makefile ESP32 rules and variables
 # =============================================================================
-.PHONY: esp-config esp-build esp-flash
+.PHONY: esp-config esp-build esp-flash esp-demo-build esp-demo-flash
 
 esp-config: dirs
 	@mkdir -p $(dir ${ESP_BUILD})
 	@echo "Setting up ESP device..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) set-target esp32'
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "ESP-IDF no está activo. Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) set-target esp32'
 	@echo ""
 
 esp-build:
 	@mkdir -p $(dir ${ESP_BUILD})
 	@echo "Building ESP32 project files..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) build'
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "ESP-IDF no está activo. Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) build'
 	@echo "[DONE]"
 	@echo ""
 
 esp-flash:
 	@echo "Flashing ESP32..."
-	bash -c 'source "$(IDF_ACTIVATE)" && $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) -p $(PORT) flash'
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "ESP-IDF no está activo. Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_BUILD) -p "$(PORT)" flash'
+	@echo "[DONE]"
+	@echo ""
+
+# Build and flash the screen communication demo with the three status LEDs.
+# It uses a separate build directory so it does not change the normal ESP32 build.
+esp-demo-build:
+	@mkdir -p $(dir $(ESP_DEMO_BUILD))
+	@echo "Building ESP32 screen communication demo..."
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "ESP-IDF no está activo. Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_DEMO_BUILD) -DSCREEN_COMM_DEMO=ON build'
+	@echo "[DONE]"
+	@echo ""
+
+esp-demo-flash: esp-demo-build
+	@echo "Flashing ESP32 screen communication demo to $(PORT)..."
+	bash -c 'if [ -f "$(IDF_ACTIVATE)" ]; then source "$(IDF_ACTIVATE)" || exit; fi; if ! command -v "$(ESP_IDF)" >/dev/null 2>&1; then echo "ESP-IDF no está activo. Active ESP-IDF o indique IDF_ACTIVATE=/ruta/al/export.sh"; exit 1; fi; $(ESP_IDF) -C $(ESP_SRC) -B $(ESP_DEMO_BUILD) -p "$(PORT)" flash'
 	@echo "[DONE]"
 	@echo ""
 

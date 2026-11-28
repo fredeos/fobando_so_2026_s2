@@ -52,22 +52,22 @@ el ESP32 debe descartar o reiniciar una recepción incompleta si llega otro `id`
 antes de completar la actual. Los bytes hexadecimales se decodifican en orden y
 se concatenan según el índice de fragmento.
 
-El protocolo existente fija `PROTOCOL_PAYLOAD_BYTES` en 256 bytes. El driver
+El protocolo existente fija `PROTOCOL_PAYLOAD_BYTES` en 512 bytes. El driver
 calcula el espacio restante después de serializar los metadatos y la cadena
 hexadecimal; cada byte de imagen ocupa dos bytes JSON. El tamaño útil varía con
 los dígitos de `id`, `chunk` y `total_chunks`; por eso el número de fragmentos
 se calcula internamente y no se configura desde el usuario. Con el formato JSON
-actual caben aproximadamente 60 bytes de píxel por trama para `BGR888` (unas
-1 024 tramas por imagen) y cerca de 61 bytes por trama para `GRAY8` (unas 336
-tramas). El cálculo exacto se realiza en tiempo de ejecución según los dígitos
-del identificador e índices. El payload final puede ser menor que 256 bytes.
+actual caben aproximadamente 188 bytes de píxel por trama tanto para `BGR888`
+(unas 327 tramas por imagen) como para `GRAY8` (unas 109 tramas). El cálculo
+exacto se realiza en tiempo de ejecución según los dígitos
+del identificador e índices. El payload final puede ser menor que 512 bytes.
 
 Cada JSON se transporta en una trama del protocolo binario existente:
 
 1. Prefijo de sincronización: `A5 5A`.
 2. Versión: `1`.
 3. Relevancia.
-4. Longitud efectiva del JSON (big-endian, máximo 256).
+4. Longitud efectiva del JSON (big-endian, máximo 512).
 5. Payload: JSON UTF-8 y bytes no usados rellenados con cero en la trama fija.
 6. CRC-16/CCITT-FALSE calculado sobre versión, relevancia, longitud y payload.
 
@@ -94,16 +94,45 @@ exitosa; el manejo de respuestas de error detalladas puede ampliarse después.
 ## Conexión serial
 
 El driver del anfitrión abre el dispositivo POSIX indicado por el llamador (por
-ejemplo `/dev/ttyUSB0`) a 115200 baudios por defecto, 8 bits, sin paridad y un
+ejemplo `/dev/ttyUSB0`) a 921600 baudios, 8 bits, sin paridad y un
 bit de parada. TX/RX son full-duplex lógico sobre UART; el firmware debe
 configurar los mismos parámetros y conectar TX del anfitrión a RX del ESP32,
 RX del anfitrión a TX del ESP32 y compartir GND. Los niveles eléctricos deben
 ser compatibles con UART TTL de 3.3 V; no conectar RS-232 directamente al ESP32.
 
-La implementación ESP32 actual solo tiene operaciones UART de bajo nivel y GPIO;
-no contiene todavía el receptor del protocolo, el ensamblador de chunks, el
-parser JSON ni el controlador de la pantalla LED. Esas son las piezas pendientes
-del firmware para cumplir este contrato.
+La aplicación habitual del ESP32 no procesa todavía este contrato ni controla
+la pantalla LED con las imágenes recibidas. El firmware de demostración
+descrito a continuación añade la recepción y validación necesarias para
+verificar la comunicación, pero deliberadamente no dibuja los píxeles.
+
+## Demo de recepción en ESP32
+
+El firmware de demostración está separado del programa normal en
+`src/firmware/esp32/main/main_demo_screen_comm.c`. Se selecciona al configurar
+ESP-IDF con `SCREEN_COMM_DEMO=ON`; si la opción no se activa, se conserva
+`main.c` como punto de entrada habitual. El demo recibe el mismo protocolo,
+valida CRC y versión, comprueba que cada payload sea JSON `request/send`, y
+verifica resolución, formato, secuencia de índices y cantidad total de bytes.
+No decodifica ni dibuja los píxeles.
+
+El significado de sus tres LEDs activos en alto es:
+
+| LED | GPIO | Indicación |
+|---|---:|---|
+| Inicio | 25 | Primer chunk válido de una transferencia |
+| Paquete | 26 | Pulso de 40 ms por cada chunk válido recibido |
+| Finalización | 27 | Todos los chunks y bytes esperados fueron recibidos; respuesta `ok` enviada |
+
+El UART de datos de este demo usa UART0 a 921600 baudios, 8N1, mediante el
+puente USB-UART integrado de la placa (normalmente aparece como `/dev/ttyUSB0`).
+No conectar un adaptador UART externo a GPIO1/GPIO3 mientras se use ese puente.
+La consola de depuración comparte UART0, por lo que sus mensajes pueden
+interferir con el protocolo durante la transferencia. Los tres LEDs externos
+requieren resistencias limitadoras y GND común.
+
+Para seleccionar el demo, pasar `-D SCREEN_COMM_DEMO=ON` al configure/build de
+ESP-IDF (por ejemplo, `idf.py -D SCREEN_COMM_DEMO=ON build`). El firmware normal
+se mantiene seleccionando la opción como `OFF`.
 
 ## Ejemplo C del anfitrión
 

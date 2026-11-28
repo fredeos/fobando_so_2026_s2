@@ -15,11 +15,16 @@
 #define DRIVER_RESPONSE_TIMEOUT_MS 5000u
 #define DRIVER_HEX_PREFIX_CAPACITY 192u
 
+/* Pausa breve para evitar consulta activa al esperar datos de respuesta/ACK. */
 static void poll_delay(void) {
     const struct timespec delay = {0, DRIVER_POLL_DELAY_NS};
     nanosleep(&delay, NULL);
 }
 
+/*
+ * Encapsula un payload de aplicación en una trama del protocolo existente y
+ * avanza su máquina TX hasta recibir ACK/NACK o agotar los intentos.
+ */
 static screen_driver_status_t send_protocol_payload(screen_driver_t *driver,
                                                     const uint8_t *payload,
                                                     size_t payload_size) {
@@ -33,6 +38,7 @@ static screen_driver_status_t send_protocol_payload(screen_driver_t *driver,
     frame.relevance = 1u;
     frame.length = (uint32_t)payload_size;
     memcpy(frame.payload, payload, payload_size);
+    /* protocol_tx_init clears tx.buffer; serialize the frame only after init. */
     if (protocol_tx_init(&tx, &packet) != PROTOCOL_OK ||
         protocol_set_frame_to_buffer(&frame, tx.buffer, sizeof(tx.buffer)) != PROTOCOL_OK)
         return SCREEN_DRIVER_PROTOCOL_ERROR;
@@ -40,12 +46,18 @@ static screen_driver_status_t send_protocol_payload(screen_driver_t *driver,
     for (unsigned attempt = 0; attempt < PROTOCOL_MAX_ATTEMPTS && !tx.complete; ++attempt) {
         if (protocol_tx_poll(&driver->serial_fd, &tx, &packet) != PROTOCOL_OK)
             return SCREEN_DRIVER_PROTOCOL_ERROR;
-        if (!tx.complete)
+        /* State transitions and UART writes are immediate; only ACK polling needs pacing. */
+        if (!tx.complete && tx.state == PROTOCOL_TX_ACK)
             poll_delay();
     }
     return tx.complete && tx.valid ? SCREEN_DRIVER_OK : SCREEN_DRIVER_PROTOCOL_ERROR;
 }
 
+/*
+ * Espera la respuesta de aplicación al terminar todos los chunks. A diferencia
+ * del ACK binario (por trama), esta respuesta confirma que el ESP32 aceptó la
+ * transferencia completa y debe incluir el mismo ID de mensaje.
+ */
 static screen_driver_status_t receive_application_response(screen_driver_t *driver,
                                                            uint32_t message_id) {
     protocol_rx_t rx = {0};
@@ -66,7 +78,8 @@ static screen_driver_status_t receive_application_response(screen_driver_t *driv
 
     protocol_frame_t response = {0};
     if (protocol_set_buffer_to_frame(&response, rx.buffer, sizeof(rx.buffer)) != PROTOCOL_OK ||
-        response.length == 0 || response.length > PROTOCOL_PAYLOAD_BYTES)
+        response.version != PROTOCOL_VERSION || response.length == 0 ||
+        response.length > PROTOCOL_PAYLOAD_BYTES)
         return SCREEN_DRIVER_PROTOCOL_ERROR;
 
     /* Application response contract: same id, response/send, data.status=ok. */
@@ -82,7 +95,11 @@ static screen_driver_status_t receive_application_response(screen_driver_t *driv
     return SCREEN_DRIVER_OK;
 }
 
-/* Returns bytes of source pixel data that fit into one JSON protocol payload. */
+/*
+ * Calcula cuántos bytes originales de píxeles caben en un payload JSON,
+ * descontando prefijo/sufijo y considerando que cada byte se expande a dos
+ * caracteres hexadecimales. Retorna cero si los metadatos no caben.
+ */
 static size_t chunk_capacity(uint32_t message_id, uint32_t total_chunks,
                              uint32_t chunk_index, const char *format) {
     char prefix[DRIVER_HEX_PREFIX_CAPACITY];
@@ -98,6 +115,7 @@ static size_t chunk_capacity(uint32_t message_id, uint32_t total_chunks,
     return (PROTOCOL_PAYLOAD_BYTES - (size_t)prefix_size - suffix_size) / 2u;
 }
 
+/* Construye el JSON de un chunk y lo entrega al encapsulador del protocolo. */
 static screen_driver_status_t send_image_chunk(screen_driver_t *driver, uint32_t message_id,
                                                uint32_t chunk_index, uint32_t total_chunks,
                                                const uint8_t *pixels, size_t byte_count,
@@ -126,6 +144,7 @@ static screen_driver_status_t send_image_chunk(screen_driver_t *driver, uint32_t
     return send_protocol_payload(driver, (const uint8_t *)payload, offset);
 }
 
+/* Inicializa el contexto y configura el descriptor serial del anfitrión. */
 screen_driver_status_t screen_driver_open(screen_driver_t *driver,
                                           const char *serial_device,
                                           unsigned int baudrate) {
@@ -142,12 +161,16 @@ screen_driver_status_t screen_driver_open(screen_driver_t *driver,
     return SCREEN_DRIVER_OK;
 }
 
-screen_driver_status_t screen_driver_send_image(screen_driver_t *driver,
-                                               const uint8_t *pixels,
-                                               size_t size,
-                                               uint32_t width,
-                                               uint32_t height,
-                                               uint8_t channels) {
+/*
+ * Implementación principal del envío. Valida imagen/contexto, asigna un ID,
+ * converge el conteo de chunks con el tamaño real de sus metadatos, envía cada
+ * fragmento de forma secuencial y notifica el callback tras su ACK. Finalmente
+ * espera la respuesta JSON de aceptación del ESP32.
+ */
+screen_driver_status_t screen_driver_send_image_with_progress(
+    screen_driver_t *driver, const uint8_t *pixels, size_t size,
+    uint32_t width, uint32_t height, uint8_t channels,
+    screen_driver_progress_fn progress, void *context) {
     if (driver == NULL || pixels == NULL || !driver->initialized)
         return SCREEN_DRIVER_NOT_INITIALIZED;
     if (width != SCREEN_DRIVER_WIDTH || height != SCREEN_DRIVER_HEIGHT ||
@@ -201,11 +224,25 @@ screen_driver_status_t screen_driver_send_image(screen_driver_t *driver,
                                                        count, format);
         if (sent != SCREEN_DRIVER_OK)
             return sent;
+        if (progress != NULL)
+            progress(chunk + 1u, total_chunks, context);
     }
 
     return receive_application_response(driver, message_id);
 }
 
+/* Variante sin callback para consumidores que no requieren progreso. */
+screen_driver_status_t screen_driver_send_image(screen_driver_t *driver,
+                                               const uint8_t *pixels,
+                                               size_t size,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint8_t channels) {
+    return screen_driver_send_image_with_progress(driver, pixels, size, width,
+                                                 height, channels, NULL, NULL);
+}
+
+/* Cierra el descriptor y limpia los campos de estado del contexto. */
 screen_driver_status_t screen_driver_close(screen_driver_t *driver) {
     if (driver == NULL)
         return SCREEN_DRIVER_INVALID_ARGUMENT;

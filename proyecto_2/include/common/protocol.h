@@ -44,7 +44,7 @@
 #define PROTOCOL_VERSION_BYTES   1u
 #define PROTOCOL_RELEVANCE_BYTES 1u
 #define PROTOCOL_LENGTH_BYTES    4u
-#define PROTOCOL_PAYLOAD_BYTES   256u
+#define PROTOCOL_PAYLOAD_BYTES   512u
 #define PROTOCOL_CRC_BYTES       2u
 
 /* Offsets de los componentes de la trama */

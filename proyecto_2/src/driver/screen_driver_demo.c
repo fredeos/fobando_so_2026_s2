@@ -5,6 +5,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define DEFAULT_TEST_IMAGE "images/screen_driver_test.raw"
+
+/* Muestra una única línea de estado; el callback ocurre tras cada ACK de chunk. */
+static void print_transfer_progress(uint32_t completed, uint32_t total, void *context) {
+    (void)context;
+    unsigned percentage = total == 0u ? 0u : (unsigned)((uint64_t)completed * 100u / total);
+    printf("\rProgreso: %3u%% (%u/%u chunks)", percentage, completed, total);
+    fflush(stdout);
+    if (completed == total)
+        putchar('\n');
+}
+
+/* Acepta únicamente los formatos RAW de un canal o tres canales. */
 static int parse_channels(const char *text, uint8_t *channels) {
     if (strcmp(text, "1") == 0) {
         *channels = 1u;
@@ -17,6 +30,7 @@ static int parse_channels(const char *text, uint8_t *channels) {
     return -1;
 }
 
+/* Lee exactamente el tamaño esperado y rechaza tanto truncamiento como sobrantes. */
 static int read_raw_image(const char *path, uint8_t *pixels, size_t expected_size) {
     FILE *file = fopen(path, "rb");
     if (file == NULL)
@@ -37,13 +51,16 @@ static int read_raw_image(const char *path, uint8_t *pixels, size_t expected_siz
     return 0;
 }
 
+/* Demo de extremo a extremo: cargar RAW, abrir UART, transmitir y cerrar. */
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Uso: %s DISPOSITIVO_SERIAL IMAGEN_RAW [CANALES: 1|3]\n", argv[0]);
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "Uso: %s DISPOSITIVO_SERIAL [IMAGEN_RAW [CANALES: 1|3]]\n", argv[0]);
+        fprintf(stderr, "Si no se indica IMAGEN_RAW, se usa %s.\n", DEFAULT_TEST_IMAGE);
         fprintf(stderr, "La imagen debe ser 128x160, sin cabecera; canales por defecto: 3 (BGR888).\n");
         return EXIT_FAILURE;
     }
 
+    const char *image_path = argc >= 3 ? argv[2] : DEFAULT_TEST_IMAGE;
     uint8_t channels = 3u;
     if (argc == 4 && parse_channels(argv[3], &channels) < 0) {
         fprintf(stderr, "Cantidad de canales invalida; use 1 (GRAY8) o 3 (BGR888).\n");
@@ -57,8 +74,8 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    if (read_raw_image(argv[2], pixels, image_size) < 0) {
-        fprintf(stderr, "No se pudo leer %s como imagen raw de %zu bytes: %s\n", argv[2],
+    if (read_raw_image(image_path, pixels, image_size) < 0) {
+        fprintf(stderr, "No se pudo leer %s como imagen raw de %zu bytes: %s\n", image_path,
                 image_size, strerror(errno));
         free(pixels);
         return EXIT_FAILURE;
@@ -73,10 +90,12 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    printf("UART abierto: %s a %u baudios. Enviando imagen 128x160 (%s, %zu bytes)...\n",
-           argv[1], SCREEN_DRIVER_BAUDRATE, channels == 1u ? "GRAY8" : "BGR888", image_size);
-    status = screen_driver_send_image(&driver, pixels, image_size, SCREEN_DRIVER_WIDTH,
-                                      SCREEN_DRIVER_HEIGHT, channels);
+    printf("UART abierto: %s a %u baudios. Enviando %s (128x160, %s, %zu bytes)...\n",
+           argv[1], SCREEN_DRIVER_BAUDRATE, image_path,
+           channels == 1u ? "GRAY8" : "BGR888", image_size);
+    status = screen_driver_send_image_with_progress(
+        &driver, pixels, image_size, SCREEN_DRIVER_WIDTH, SCREEN_DRIVER_HEIGHT,
+        channels, print_transfer_progress, NULL);
     if (status == SCREEN_DRIVER_OK)
         puts("Imagen aceptada por el ESP32.");
     else
