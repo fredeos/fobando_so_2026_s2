@@ -1,3 +1,8 @@
+// =======================================================================
+// Includes
+// =======================================================================
+
+// + Librerias C
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -5,22 +10,36 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+// + Modulos
 #include "common/json.h"
 
 #include "client/protocol/worker.h"
+
 #include "common/protocol.h"
 #include "serial/serial.h"
 #include "serial/posix.h"
 
 #include "client/timing.h"
 
+// =======================================================================
+// Constantes
+// =======================================================================
+
+// + Buffers
 #define MESSAGE_LENGTH 128u
 
+// + Restricciones de tiempo
 #define LIFETIME_MS 15000u  // 15000 ms (15s)
 #define ACTION_MS   200u    // 200 ms (0.2s)
 
+// + Configuracion del protocolo
 #define TIMEOUT_MS  1000u   // 1000 ms (1s)
 #define ACCEPT_CRITERIA 1u  // prioridad 1
+
+
+// =======================================================================
+// Helpers
+// =======================================================================
 
 #define PARSE(operation) do { \
     JsonParseResult result_ = (operation); \
