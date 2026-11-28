@@ -34,7 +34,7 @@ static size_t check_int_digits(const void* value, size_t bytes){
         }
     }
 
-    return snprintf(NULL, 0, "%ld", number);
+    return snprintf(NULL, 0, "%lld", number);
 }
 
 /* Contar los digitos de un entero sin signo (usando la maxima capacidad posible) */
@@ -64,7 +64,7 @@ static size_t check_uint_digits(const void* value, size_t bytes){
         }
     }
     
-    return snprintf(NULL, 0, "%lu", number);
+    return snprintf(NULL, 0, "%llu", number);
 }
 
 /* Contar los digitos de un flotante (usando la maxima capacidad posible) */
@@ -179,7 +179,7 @@ static int write_int(const void* value, size_t bytes, char* buffer, size_t n){
         }
     }
 
-    return snprintf(buffer, n, "%ld", number);
+    return snprintf(buffer, n, "%lld", number);
 }
 
 /* Escribir un numero entero sin signo segun su cantidad de bytes*/
@@ -209,7 +209,7 @@ static int write_uint(const void* value, size_t bytes, char* buffer, size_t n){
         }
     }
 
-    return snprintf(buffer, n, "%lu", number);
+    return snprintf(buffer, n, "%llu", number);
 }
 
 /* Escribir un numero flotante segun su cantidad de bytes para precision simple y precision doble */

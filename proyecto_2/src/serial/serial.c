@@ -37,6 +37,7 @@ serial_errno_t serial_configure(void* _obj, void* _config){
     if (tcgetattr(fd, &tty) != 0) {
         //perror("tcgetattr");
         close(fd);
+        fd = -1;
         return SERIAL_FAILURE;
     }
 
@@ -57,6 +58,7 @@ serial_errno_t serial_configure(void* _obj, void* _config){
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
         //perror("tcsetattr");
         close(fd);
+        fd = -1;
         return SERIAL_FAILURE;
     }
     // << Set the open file >>
